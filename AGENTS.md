@@ -85,6 +85,26 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 ---
 
+## Cluster Node Availability (before any multi-node run)
+
+Check that the nodes are actually free — see `/home/fdd/workspace/bin/find_empty_nodes.sh`:
+
+```bash
+bash /home/fdd/workspace/bin/find_empty_nodes.sh <ip_list_file>   # e.g. my_workspace/ip_train.txt
+```
+
+- Probes every node in the list in parallel over SSH and classifies a node as **empty** only when
+  every NPU device reports `No running processes found in NPU`. Writes `empty_ip.txt` (free) and
+  `busy_ip.txt` (occupied) to the current directory, and prints an empty/busy/failed summary.
+- Do **not** infer "free" from the absence of our own launcher processes: other teams' jobs on this
+  cluster are often not `torchrun` (dataturbo / msrun / plain `python`), so cards can be occupied
+  while a process-count probe reports them idle — our job then dies with an OOM at an implausibly
+  low allocation.
+- Occupy only nodes reported empty. ~3 GB residual HBM per chip with no running process is the
+  cluster baseline, not occupancy; the usable ceiling is ~61 GB/card (of 64 GB).
+
+---
+
 ## Key Implementation Notes
 
 > Canonical detail: `.agent/rules/distributed.md`. Review examples: `.agent/skills/code-review/distributed-guidelines.md` (not a second SoT).
