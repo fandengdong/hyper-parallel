@@ -44,6 +44,9 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
         self._step_start_time = 0.0
         self._local_step_tokens = 0
+        # All sequence slots in the step, padding included: the hardware runs
+        # dense ops over the padded batch, so this is the TFLOPS/MFU basis.
+        self._local_step_padded_tokens = 0
         self._local_step_samples = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
@@ -130,6 +133,20 @@ class EnvironMeterCallback(Callback):
         if input_numel is not None:
             return input_numel
         return 0
+
+    @classmethod
+    def _batch_padded_tokens(cls, batch: Mapping[str, Any]) -> int:
+        """Count every sequence slot in one micro-batch, padding included.
+
+        The hardware executes the dense ops over the full padded batch, so
+        this is the denominator for TFLOPS/MFU; the non-padding count from
+        ``_batch_tokens`` stays the useful-token (data) metric.
+        """
+        input_ids = batch.get("input_ids")
+        numel = cls._tensor_numel(input_ids)
+        if numel is not None:
+            return numel
+        return cls._batch_tokens(batch)
 
     @staticmethod
     def _batch_samples(batch: Mapping[str, Any]) -> int:
@@ -268,6 +285,7 @@ class EnvironMeterCallback(Callback):
         if self._seq_len is None:
             self._seq_len = batch_seq_len(batches)
         self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
+        self._local_step_padded_tokens = sum(self._batch_padded_tokens(batch) for batch in batches)
         self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
         self._step_start_time = time.perf_counter()
 
@@ -291,6 +309,7 @@ class EnvironMeterCallback(Callback):
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
         global_tokens = int(self._reduce(self._local_step_tokens, op="sum"))
+        global_padded_tokens = int(self._reduce(self._local_step_padded_tokens, op="sum"))
         global_samples = int(self._reduce(self._local_step_samples, op="sum"))
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
@@ -305,21 +324,29 @@ class EnvironMeterCallback(Callback):
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
 
         tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
+        padded_tokens_per_second = (
+            global_padded_tokens / global_step_time if global_step_time > 0 else 0.0
+        )
         env_metrics = {
             **train_metrics,
             "performance/step_time": global_step_time,
             "performance/tokens_per_second": tokens_per_second,
+            "performance/tokens_per_second_padded": padded_tokens_per_second,
             "data/step_tokens": float(global_tokens),
+            "data/step_tokens_padded": float(global_padded_tokens),
             "data/consumed_tokens": float(self._consumed_tokens),
             "data/step_samples": float(global_samples),
             "data/consumed_samples": float(self._consumed_samples),
             **self._memory_metrics(),
         }
         if self._resolve_flops_per_token():
-            # Observed TFLOPS = tokens/sec x flops/token / 1e12 (6N convention;
-            # activation-checkpoint recompute is not useful FLOPs).
+            # Observed TFLOPS = padded tokens/sec x flops/token / 1e12 (6N
+            # convention).  The hardware executes dense ops over the padded
+            # batch, so dividing by only the non-padding tokens would understate
+            # throughput by the padding ratio (severely so for VLM data);
+            # activation-checkpoint recompute is still not useful FLOPs.
             env_metrics["performance/tflops"] = (
-                tokens_per_second * self._flops_per_token / 1e12
+                padded_tokens_per_second * self._flops_per_token / 1e12
             )
             if self._peak_tflops:
                 env_metrics["performance/mfu"] = env_metrics["performance/tflops"] / (

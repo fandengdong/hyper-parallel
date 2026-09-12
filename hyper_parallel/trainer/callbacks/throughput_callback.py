@@ -14,15 +14,18 @@
 # ============================================================================
 """Standalone step-throughput / TFLOPS / MFU probe callback.
 
-``EnvironMeterCallback`` already publishes ``performance/tokens_per_second``
-(and ``performance/tflops`` / ``performance/mfu`` when the FLOPs geometry is
-resolvable) into ``trainer.step_env_metrics`` for the shared log line.  This
-callback is the explicit, separately-registerable probe for users who want a
-dedicated metric record — register it via
+``EnvironMeterCallback`` already publishes
+``performance/tokens_per_second_padded`` (padded sequence slots per second,
+the basis for TFLOPS/MFU) alongside the useful-token
+``performance/tokens_per_second`` (and ``performance/tflops`` /
+``performance/mfu`` when the FLOPs geometry is resolvable) into
+``trainer.step_env_metrics`` for the shared log line.  This callback is the
+explicit, separately-registerable probe for users who want a dedicated metric
+record — register it via
 ``trainer.add_callback(ThroughputMFUCallback(trainer))`` or set
 ``HP_THROUGHPUT_MFU=1`` in the environment (the trainer auto-registers it
-then).  It reads the metrics EnvironMeterCallback produced earlier in the
-dispatch order and only measures timing itself when those are absent.
+then).  It reads the padded metrics EnvironMeterCallback produced earlier in
+the dispatch order and only measures timing itself when those are absent.
 
 ``flops_per_token`` is never passed in; it is derived from the model and
 training configuration via
@@ -134,10 +137,16 @@ class ThroughputMFUCallback(Callback):
         return self._flops_per_token
 
     def _resolve_throughput(self, state: TrainerState) -> tuple[float, float]:
-        """Return ``(tokens_per_sec, step_time)``, preferring shared metrics."""
+        """Return ``(padded_tokens_per_sec, step_time)``, preferring shared metrics.
+
+        The count is padded sequence slots — the dense work the hardware
+        actually executes — matching the ``gb s x seq_len`` fallback below.
+        """
         del state
         env_metrics = getattr(self.trainer, "step_env_metrics", None) or {}
-        tokens_per_sec = env_metrics.get("performance/tokens_per_second")
+        tokens_per_sec = env_metrics.get("performance/tokens_per_second_padded")
+        if tokens_per_sec is None:
+            tokens_per_sec = env_metrics.get("performance/tokens_per_second")
         step_time = env_metrics.get("performance/step_time")
         if tokens_per_sec is not None and step_time is not None:
             return float(tokens_per_sec), float(step_time)
