@@ -138,11 +138,25 @@ def _mlp_active_params(config: Any, layers: int, hidden: float) -> Optional[floa
     return total
 
 
+def _geometry_config(config: Any) -> Any:
+    """Return the config that carries the geometry.
+
+    Multimodal wrappers (e.g. ``kimi_k25``) keep the language-model geometry
+    under ``text_config``, leaving only wrapper fields at the top level; fall
+    back to that sub-config so the estimator sees the real dimensions.
+    """
+    if _read(config, *_LAYER_FIELDS) and _read(config, *_HIDDEN_FIELDS):
+        return config
+    nested = _read(config, "text_config")
+    return nested if nested is not None else config
+
+
 def estimate_flops_per_token(config: Any, seq_len: Optional[int] = None) -> Optional[float]:
     """Estimate training FLOPs per token (6N convention) from config geometry.
 
     Args:
-        config: HF-style model config; attribute access or plain mapping.
+        config: HF-style model config; attribute access or plain mapping. A
+            composite multimodal config is resolved via ``_geometry_config``.
         seq_len: Sequence length used to add the attention score/weight
             quadratic term; ``None`` reports the linear 6N part only.
 
@@ -150,6 +164,7 @@ def estimate_flops_per_token(config: Any, seq_len: Optional[int] = None) -> Opti
         Estimated FLOPs per token, or ``None`` when the config lacks the
         geometry fields needed for an honest estimate.
     """
+    config = _geometry_config(config)
     layers = _read_float(config, *_LAYER_FIELDS)
     hidden = _read_float(config, *_HIDDEN_FIELDS)
     if not layers or not hidden:
