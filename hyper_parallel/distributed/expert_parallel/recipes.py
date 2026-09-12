@@ -293,6 +293,7 @@ def deepseekv3_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
+    use_grouped_gemm: bool = False,
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -303,6 +304,10 @@ def deepseekv3_ep_compute_fn(
 
     ``module.shared_experts(...)`` is a planned nested TP boundary — its
     exit already performs the TP reduction (nested-boundary call contract).
+
+    ``use_grouped_gemm=True`` runs the local experts through the packed
+    ``gate_up_proj`` grouped GEMM path (``npu_grouped_swiglu``) instead of
+    the eager per-expert loop; the default keeps the eager path.
     """
     del mesh, tp_mesh, cp_mesh
 
@@ -321,6 +326,7 @@ def deepseekv3_ep_compute_fn(
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,
+        use_grouped_gemm=use_grouped_gemm,
     )
 
 
