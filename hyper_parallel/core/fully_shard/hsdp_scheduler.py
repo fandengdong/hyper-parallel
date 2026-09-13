@@ -136,6 +136,21 @@ class HSDPSchedulerV2:
         """Return deduplicated parameters from all managed modules."""
         return get_managed_modules_parameters(self.modules, self.ignored_params)
 
+    def unit_params(self) -> List[Any]:
+        """Return the parameters this fully_shard unit owns.
+
+        The returned objects are the sharded parameters the module tree holds,
+        which are the objects the optimizer updates. They come in registration
+        order, so a caller that splits an optimizer step by unit visits them in
+        the same order the optimizer would.
+
+        Returns:
+            One entry per managed parameter, empty when the unit is uninitialized.
+        """
+        if self.hsdp_state is None:
+            return []
+        return [hsdp_param.sharded_param for hsdp_param in self.hsdp_state.hsdp_params]
+
     def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
         """Set reshard_after_forward flag.
 

@@ -26,6 +26,7 @@ from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime.device import synchronize
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
@@ -249,10 +250,19 @@ class TextTrainer:
                 config.training.max_grad_norm,
             )
 
-        for optimizer in optimizers:
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
-                optimizer.step()
-            optimizer.zero_grad()
+        # The unit-pipelined variant is opt-in and falls back to the plain loop
+        # below when it is disabled or unsupported by the optimizer and model.
+        # It reuses this call site's dispatch context so the lazy optimizer
+        # state is created through the same path as in a full step().
+        if not fsdp_runtime.run_unit_pipelined_step(
+                optimizers,
+                self.base.model,
+                dispatch_no_skip={torch.zeros_like},
+        ):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+                    optimizer.step()
+                optimizer.zero_grad()
 
         schedulers = (
             self.base.lr_scheduler

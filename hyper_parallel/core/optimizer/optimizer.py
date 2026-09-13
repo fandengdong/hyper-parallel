@@ -19,7 +19,7 @@
 from collections import defaultdict
 from contextlib import contextmanager
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -174,6 +174,41 @@ class ChainedOptimizer:
         """
         for opt in self.chained_optimizers:
             opt.zero_grad(set_to_none=set_to_none)
+
+    def supports_step_subset(self) -> bool:
+        """Whether every leaf optimizer can be stepped over an explicit subset.
+
+        Returns:
+            True when each leaf implements both ``step_subset`` and
+            ``advance_step_counters``, so one logical optimizer step may be
+            split into several parameter-subset steps.
+        """
+        return all(
+            callable(getattr(optimizer, "step_subset", None))
+            and callable(getattr(optimizer, "advance_step_counters", None))
+            for optimizer in self.chained_optimizers
+        )
+
+    def advance_step_counters(self) -> None:
+        """Advance every leaf optimizer's step counters by one.
+
+        Call this once per logical optimizer step that is split into
+        :meth:`step_subset` calls, so the split does not change the step value
+        each leaf uses for bias correction.
+        """
+        for optimizer in self.chained_optimizers:
+            optimizer.advance_step_counters()
+
+    def step_subset(self, params: Iterable[Any], closure: Any = None) -> None:
+        """Call each sub-optimizer's subset step in order.
+
+        Args:
+            params: Parameters to update. Parameters a leaf does not own are
+                skipped by that leaf.
+            closure: Optional callable forwarded to every sub-optimizer.
+        """
+        for optimizer in self.chained_optimizers:
+            optimizer.step_subset(params, closure=closure)
 
     @property
     def optimizer(self) -> torch.optim.Optimizer:

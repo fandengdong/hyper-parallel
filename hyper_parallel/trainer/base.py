@@ -719,12 +719,14 @@ class BaseTrainer(Stateful, ABC):
             config.training.max_grad_norm,
         )
 
-        # Optimizer and scheduler step
+        # Optimizer and scheduler step. The unit-pipelined variant is opt-in and
+        # falls back to the plain loop below when it is disabled or unsupported.
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
-        for optimizer in optimizers:
-            with SkipDTensorDispatch():
-                optimizer.step()
-            optimizer.zero_grad()
+        if not fsdp_runtime.run_unit_pipelined_step(optimizers, self.model):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch():
+                    optimizer.step()
+                optimizer.zero_grad()
 
         schedulers = (
             self.lr_scheduler

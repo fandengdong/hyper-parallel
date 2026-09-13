@@ -24,6 +24,7 @@ from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
@@ -220,10 +221,13 @@ class VLMTrainer:
             if isinstance(self.base.optimizer, list)
             else [self.base.optimizer]
         )
-        for optimizer in optimizers:
-            with SkipDTensorDispatch():
-                optimizer.step()
-            optimizer.zero_grad()
+        # The unit-pipelined variant is opt-in and falls back to the plain loop
+        # below when it is disabled or unsupported by the optimizer and model.
+        if not fsdp_runtime.run_unit_pipelined_step(optimizers, self.base.model):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch():
+                    optimizer.step()
+                optimizer.zero_grad()
 
         schedulers = (
             self.base.lr_scheduler

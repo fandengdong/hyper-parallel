@@ -122,6 +122,77 @@ class _UnshardHandle:
             self._hsdp_state = None
 
 
+class FSDPUnit:
+    """One fully_shard unit, as seen by the optimizer-side unshard pipeline.
+
+    Attributes:
+        name: Name of the wrapped module in the inspected module tree.
+        params: Sharded parameters the optimizer updates for this unit.
+    """
+
+    def __init__(self, name: str, scheduler: Any) -> None:
+        """
+        Bind one unit name to the scheduler that holds its state.
+
+        Args:
+            name (str): Name of the wrapped module in the inspected module tree.
+            scheduler (HSDPSchedulerV2): Scheduler owning this unit's state.
+        """
+        self.name = name
+        self.params = tuple(scheduler.unit_params())
+        self._hsdp_state = scheduler.hsdp_state
+
+    @property
+    def is_sharded(self) -> bool:
+        """Whether the unit currently holds only its local shards.
+
+        A unit that is not sharded has nothing left to gather, so prefetching
+        it neither moves data nor reserves device memory.
+        """
+        return bool(self._hsdp_state.is_shard)
+
+    def prefetch(self) -> None:
+        """Start the unit's asynchronous copy-in and all-gather."""
+        self._hsdp_state.prefetch()
+
+    def wait_for_unshard(self) -> None:
+        """Block until the unit's in-flight prefetch completed."""
+        self._hsdp_state.wait_for_unshard()
+
+    def __repr__(self) -> str:
+        """Return the unit name and its parameter count."""
+        return f"FSDPUnit(name={self.name!r}, params={len(self.params)})"
+
+
+def get_fully_shard_units(model: ModuleClass) -> List[FSDPUnit]:
+    """Return the fully_shard units of ``model`` in module-traversal order.
+
+    The order is the one the platform's module traversal yields (module
+    registration order), which is the order this library already uses to order
+    FSDP units and to select prefetch targets, and matches forward execution
+    order for the models the trainer builds. Units are deduplicated by scheduler
+    because ``fully_shard`` may be given a module list whose members share one
+    scheduler.
+
+    Args:
+        model (ModuleClass): Root of the module tree to inspect.
+
+    Returns:
+        List[FSDPUnit]: One entry per fully_shard unit, in traversal order.
+    """
+    units: List[FSDPUnit] = []
+    seen_schedulers: set = set()
+    for module_name, module in platform.get_cells_and_names(model):
+        scheduler = getattr(module, "hsdp_scheduler", None)
+        if scheduler is None or id(scheduler) in seen_schedulers:
+            continue
+        if getattr(scheduler, "hsdp_state", None) is None:
+            continue
+        seen_schedulers.add(id(scheduler))
+        units.append(FSDPUnit(module_name, scheduler))
+    return units
+
+
 class HSDPModule:
     """
     The hsdp block of neural networks with hsdp interface.
