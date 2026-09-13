@@ -17,8 +17,9 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
+import os
 from dataclasses import dataclass
-from typing import Callable, List, Optional, cast
+from typing import Any, Callable, List, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -45,6 +46,102 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     SourceShardMetaInfo,
 )
+from hyper_parallel.platform import get_platform
+
+
+# Overlap the CPU-offload shard H2D with current-stream compute: the copy runs
+# on a dedicated copy stream and the current stream waits on an event before
+# any consumer -- the all-gather included -- reads the copied shard. With the
+# switch off the copy stays on the current stream and behavior is unchanged.
+#
+# WIP / KNOWN FAILING: on the Ascend stack the second stream is rejected in this
+# hot path -- both a fresh event per call and a cached event per parameter end
+# with device-side launch failures at step 0 (aclrtLaunchKernelWithHostArgs
+# 507018, AICPU Index inner error, AclQueryEventRecordedStatus). Kept behind the
+# flag (default 0) for whoever debugs the runtime interaction; see
+# my_workspace/ for the failing run logs.
+_OFFLOAD_ASYNC_H2D = os.environ.get("HP_OFFLOAD_ASYNC_H2D", "0") == "1"
+
+_OFFLOAD_COPY_STREAM: Optional[Any] = None
+_OFFLOAD_COPY_EVENT: Optional[Any] = None
+_OFFLOAD_ASYNC_COUNT = 0
+
+# Copy size gate for the async path. NOTE: gating large copies out of the side
+# stream does NOT avoid the failure (measured: still dies at step 0 with the
+# same AICPU exception), so this knob is kept only for further experiments.
+_OFFLOAD_ASYNC_MAX_NUMEL = int(
+    os.environ.get("HP_OFFLOAD_ASYNC_MAX_NUMEL", "1048576")
+)
+
+
+def _get_offload_copy_event() -> Any:
+    """Return the single event reused by every offloaded copy.
+
+    A fresh event per unshard -- or even one per parameter -- exhausts the
+    runtime's event pool after a few hundred copies: the run then dies in
+    ``AclQueryEventRecordedStatus`` (observed at copy #526 at two layers).
+    One event is enough: it is recorded after each copy on the copy stream and
+    waited on the current stream, and since that stream is FIFO a wait always
+    covers at least the copy it follows.
+    """
+    global _OFFLOAD_COPY_EVENT  # pylint: disable=global-statement
+    if _OFFLOAD_COPY_EVENT is None:
+        _OFFLOAD_COPY_EVENT = get_platform().new_event()
+    return _OFFLOAD_COPY_EVENT
+
+
+def _get_offload_copy_stream() -> Any:
+    """Return the lazily created copy stream used for offloaded shard H2D copies."""
+    global _OFFLOAD_COPY_STREAM  # pylint: disable=global-statement
+    if _OFFLOAD_COPY_STREAM is None:
+        _OFFLOAD_COPY_STREAM = get_platform().new_stream()
+    return _OFFLOAD_COPY_STREAM
+
+
+def _copy_offloaded_shard_to_device(
+    sharded_param_data: torch.Tensor,
+    device: torch.device,
+    event: Optional[Any] = None,
+) -> torch.Tensor:
+    """Copy a CPU-offloaded shard to ``device`` on the copy stream.
+
+    The destination is allocated on the current stream -- the stream that
+    consumes it -- and only the copy itself runs on the copy stream. An event
+    recorded after the copy makes the current stream wait, so every operation
+    enqueued later on the current stream, the all-gather included, is ordered
+    after the copy completed.
+
+    Args:
+        sharded_param_data (torch.Tensor): CPU-resident shard to copy.
+        device (torch.device): Destination device of the shard.
+        event (Any, optional): Reusable event to record the copy on. Callers in
+            the per-parameter unshard loop pass their own cached event: a fresh
+            device event per unshard exhausts the runtime's event pool over a
+            step.
+
+    Returns:
+        torch.Tensor: Device-resident shard, safe to consume on the current stream.
+    """
+    platform = get_platform()
+    current_stream = platform.get_current_stream()
+    copy_stream = _get_offload_copy_stream()
+    global _OFFLOAD_ASYNC_COUNT  # pylint: disable=global-statement
+    _OFFLOAD_ASYNC_COUNT += 1
+    if _OFFLOAD_ASYNC_COUNT % 25 == 1:
+        # Diagnostic breadcrumb (async-H2D mode only): shows how far the copy
+        # sequence got before a device-side failure.
+        print(f"[offload-async-h2d] copy #{_OFFLOAD_ASYNC_COUNT} "
+              f"shape={tuple(sharded_param_data.shape)}", flush=True)
+    device_data = torch.empty_like(sharded_param_data, device=device)
+    copy_event = event if event is not None else _get_offload_copy_event()
+    with platform.get_stream_context()(copy_stream):
+        device_data.copy_(sharded_param_data, non_blocking=True)
+        copy_event.record(copy_stream)
+    # Tell the caching allocator that the copy stream writes this storage, so
+    # it is not recycled while the copy is still in flight.
+    device_data.record_stream(copy_stream)
+    copy_event.wait(current_stream)
+    return device_data
 
 
 def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -159,6 +256,9 @@ class TorchHSDPParamV2(HSDPParamV2):
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self._parameter_hook_migrator = ParameterHookMigrator()
+        # Reused across unshards so the async-H2D path does not allocate a device
+        # event per parameter per step (see ``_copy_offloaded_shard_to_device``).
+        self._offload_copy_event = None
         # ``source_shard_info`` is built and validated by the owning state
         # (``_build_param_source_shard_info``): for a native DTensor parameter it always
         # describes that parameter's own mesh/placements. Only the agreement
@@ -838,9 +938,20 @@ class TorchHSDPParamV2(HSDPParamV2):
         self._assert_in_states(ShardedState.SHARDED)
         sharded_param_data = self._sharded_param_data
         if self.offload_to_cpu:
-            sharded_param_data = sharded_param_data.to(
-                self.device, non_blocking=True
-            )
+            if _OFFLOAD_ASYNC_H2D and sharded_param_data.numel() <= _OFFLOAD_ASYNC_MAX_NUMEL:
+                # The helper records the shared copy event on the copy stream and
+                # makes the current stream wait for it, so the cast below and
+                # every later consumer -- the all-gather included -- see the
+                # copied shard. One event for the whole process: a fresh event
+                # per parameter exhausts the runtime's event pool (the run dies
+                # in AclQueryEventRecordedStatus after a few hundred copies).
+                sharded_param_data = _copy_offloaded_shard_to_device(
+                    sharded_param_data, self.device
+                )
+            else:
+                sharded_param_data = sharded_param_data.to(
+                    self.device, non_blocking=True
+                )
         if self.param_dtype is not None and self.param_dtype != sharded_param_data.dtype:
             return [sharded_param_data.to(self.param_dtype)]
         return [sharded_param_data]
