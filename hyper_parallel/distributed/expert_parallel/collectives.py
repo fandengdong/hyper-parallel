@@ -28,6 +28,10 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.platform import get_platform
+
+
+platform = get_platform()
 
 _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
 
@@ -153,4 +157,38 @@ def ep_all_to_all(
     """
     if _backend_supports_uneven_a2a(group):
         return _EPAllToAllUneven.apply(x, send_counts, recv_counts, group)
+    return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
+
+
+def ep_all_to_all_async(
+    x: torch.Tensor,
+    send_counts: list[int],
+    recv_counts: list[int],
+    group: Any,
+) -> torch.Tensor:
+    """Non-blocking variant of :func:`ep_all_to_all` (lazy wait).
+
+    On backends whose ``all_to_all_single`` accepts unequal splits the exchange
+    is issued through ``differentiable_all_to_all_single_async``, which returns
+    an ``AsyncCollectiveTensor``: the ``wait_tensor`` op is only enqueued when a
+    non-view op first consumes the result.  Issuing independent work between the
+    exchange and that first read therefore overlaps with the in-flight transfer
+    (forward and backward alike).
+
+    Backends without that support fall back to the blocking path, so the result
+    always carries the same values — only the schedule differs.
+
+    Args:
+        x: Input tensor, split along dim 0 by ``send_counts``.
+        send_counts: Rows sent to each EP rank.
+        recv_counts: Rows received from each EP rank.
+        group: EP process group.
+
+    Returns:
+        The exchanged rows, materialized lazily on the async path.
+    """
+    if _backend_supports_uneven_a2a(group):
+        return platform.differentiable_all_to_all_single_async(
+            x, send_counts, recv_counts, group,
+        )
     return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)

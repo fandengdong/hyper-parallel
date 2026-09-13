@@ -32,7 +32,7 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -44,6 +44,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import (
 )
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
+    ep_all_to_all_async,
 )
 
 
@@ -366,6 +367,125 @@ def ep_routed_forward(
         source_token_indices,
         dispatch_order,
         (batch_size, sequence_length, hidden_size),
+    )
+
+
+class EPRoutedState(NamedTuple):
+    """Pending routed-experts state between dispatch and experts+combine.
+
+    Produced by :func:`ep_routed_dispatch` and consumed by
+    :func:`ep_routed_experts_and_combine`.  ``received_states`` /
+    ``received_indices`` may still be in flight (the exchange is issued
+    asynchronously); they materialize on first non-view use.
+    """
+
+    source_token_indices: torch.Tensor
+    flattened_expert_weights: torch.Tensor
+    dispatch_order: torch.Tensor
+    received_states: torch.Tensor
+    received_indices: torch.Tensor
+    send_counts: list
+    receive_counts: list
+    output_shape: tuple
+
+
+def ep_routed_dispatch(
+    module: Any,
+    hidden_states: torch.Tensor,
+    *,
+    router_fn: Callable,
+    ep_group: Any,
+) -> EPRoutedState:
+    """Route locally and **launch** the token exchange without waiting.
+
+    Same routing/dispatch preparation as :func:`ep_routed_forward`, but the two
+    token exchanges are issued through :func:`ep_all_to_all_async`, whose wait
+    is deferred to the first non-view consumer.  A caller that runs independent
+    work between this call and :func:`ep_routed_experts_and_combine` (for
+    DeepSeek-V3 style blocks: the shared-expert MLP, which depends only on
+    ``hidden_states``) therefore overlaps that work with the in-flight
+    exchange instead of serializing behind it.
+
+    Args:
+        module: MoE block exposing ``experts`` (with ``local_expert_count``).
+        hidden_states: Local sequence chunk, shape ``[B, S, H]``.
+        router_fn: Router adapter, called as ``router_fn(module, hidden_states)``.
+        ep_group: Extended EP process group.
+
+    Returns:
+        The pending :class:`EPRoutedState` to hand to
+        :func:`ep_routed_experts_and_combine`.
+    """
+    ep_size = ep_group.size()
+    local_expert_count = module.experts.local_expert_count
+    global_expert_count = local_expert_count * ep_size
+
+    batch_size, sequence_length, hidden_size = hidden_states.shape
+    topk_indices, topk_weights = router_fn(module, hidden_states)
+    (
+        source_token_indices,
+        flattened_expert_weights,
+        dispatch_order,
+        dispatched_states,
+        dispatched_expert_indices,
+        send_counts,
+        receive_counts,
+    ) = _prepare_ep_dispatch(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        local_expert_count=local_expert_count,
+        global_expert_count=global_expert_count,
+        ep_size=ep_size,
+        ep_group=ep_group,
+    )
+    received_states = ep_all_to_all_async(
+        dispatched_states, send_counts, receive_counts, ep_group)
+    # squeeze is a view, so the wait stays deferred until the experts read it.
+    received_indices = ep_all_to_all_async(
+        dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
+    return EPRoutedState(
+        source_token_indices,
+        flattened_expert_weights,
+        dispatch_order,
+        received_states,
+        received_indices,
+        send_counts,
+        receive_counts,
+        (batch_size, sequence_length, hidden_size),
+    )
+
+
+def ep_routed_experts_and_combine(
+    module: Any,
+    state: EPRoutedState,
+    ep_group: Any,
+) -> torch.Tensor:
+    """Run the local experts on a dispatched state and exchange the outputs back.
+
+    The first expert read materializes the pending dispatch exchange; the
+    combine exchange is issued asynchronously as well, so its wait lands on the
+    weighted aggregation instead of blocking right after the local experts.
+
+    Args:
+        module: MoE block exposing ``experts`` (with ``local_expert_count``).
+        state: State returned by :func:`ep_routed_dispatch`.
+        ep_group: Extended EP process group.
+
+    Returns:
+        The routed branch output, shape ``state.output_shape``.
+    """
+    expert_offset = dist.get_rank(group=ep_group) * module.experts.local_expert_count
+    local_outputs = module.experts(
+        state.received_states, state.received_indices - expert_offset)
+    combined_expert_outputs = ep_all_to_all_async(
+        local_outputs.contiguous(), state.receive_counts, state.send_counts, ep_group)
+    return _aggregate_ep_outputs(
+        combined_expert_outputs,
+        state.flattened_expert_weights,
+        state.source_token_indices,
+        state.dispatch_order,
+        state.output_shape,
     )
 
 
