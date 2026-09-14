@@ -26,6 +26,7 @@ from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.expert_parallel.recipes import routed_only_ep_compute_fn
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
+    _balanced_router,
     _sigmoid_group_router,
     _softmax_topk_router,
     _topk_router_module,
@@ -1149,6 +1150,88 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_adapter"
     torch.testing.assert_close(w, ref_w.to(w.dtype),
                                msg="case: sigmoid_group_router_adapter")
+
+
+def test_fix_router_balanced_load(monkeypatch):
+    """``fix_router`` variant: round-robin assignment keeps the real top-k
+    weights but hands every destination rank exactly T*K/EP tokens."""
+    # ── case: balanced_router_even_load ──
+    # 12 tokens x top_k 2 = 24 slots over 8 experts -> 3 slots per expert,
+    # against a gate whose own preference would be anything but uniform.
+    class Gate(nn.Module):
+        def __init__(self, e, h):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(e, h) * 0.02)
+            self.register_buffer("e_score_correction_bias", torch.randn(e) * 0.01)
+
+        def forward(self, x):
+            return F.linear(  # pylint: disable=not-callable
+                x.view(-1, x.shape[-1]).float(), self.weight.float()
+            )
+
+    class MoE(nn.Module):  # pylint: disable=abstract-method
+        def __init__(self):
+            super().__init__()
+            self.gate = Gate(8, 16)
+            self.num_experts = 8
+            self.top_k = 2
+
+    torch.manual_seed(7)
+    moe = MoE()
+    hidden = torch.randn(12, 16)
+    idx, w = _balanced_router(moe, hidden)
+    assert idx.shape == (12, 2), "case: balanced_router_even_load"
+    counts = torch.bincount(idx.reshape(-1), minlength=8)
+    assert counts.tolist() == [3] * 8, "case: balanced_router_even_load"
+    assert torch.equal(idx, (torch.arange(24) % 8).view(12, 2)), \
+        "case: balanced_router_even_load"
+
+    # ── case: balanced_router_even_destination_load ──
+    # EP shape: 4 destinations x 2 local experts. 10 tokens x top_k 2 = 20
+    # slots -> exactly 5 per destination. A per-expert round robin (i % 8)
+    # replays the same residues on every rank instead, so the leftover piles
+    # onto the first destinations: 6, 6, 4, 4 -- and it is the busiest
+    # destination that sets the step time.
+    ep_moe = MoE()
+    ep_moe.experts = nn.Module()
+    ep_moe.experts.local_expert_count = 2
+    ep_hidden = torch.randn(10, 16)
+    idx, _ = _balanced_router(ep_moe, ep_hidden)
+    per_destination = torch.bincount(idx.reshape(-1) // 2, minlength=4)
+    assert per_destination.tolist() == [5, 5, 5, 5], \
+        "case: balanced_router_even_destination_load"
+    naive = torch.bincount(
+        (torch.arange(20) % 8) // 2, minlength=4)
+    assert naive.tolist() == [6, 6, 4, 4], \
+        "case: balanced_router_even_destination_load"
+
+    # Only the assignment is replaced: the true top-k weights are kept, so
+    # the gate keeps its gradient and the router GEMM stays in the profile.
+    _, ref_w = _sigmoid_group_router(moe, hidden)
+    torch.testing.assert_close(w, ref_w, msg="case: balanced_router_even_load")
+    assert MOE_ROUTER_ADAPTERS["deepseekv3_fixed"] is _balanced_router, \
+        "case: balanced_router_even_load"
+
+    # ── case: fix_router_selects_adapter ──
+    # The switch is the ONLY difference in the factory: off keeps the real
+    # sigmoid-group router, on swaps in the balanced one.
+    module = _TinyMoeMod()
+    module.shared_experts = nn.Identity()
+    captured = _capture_ep_primitives(monkeypatch)
+    compute_fn = ep_compute.deepseekv3_ep_compute_fn(
+        module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+        ep_mesh=_FakeEpMesh())
+    compute_fn(module, torch.randn(2, 4))
+    assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["deepseekv3"], \
+        "case: fix_router_selects_adapter"
+
+    captured = _capture_ep_primitives(monkeypatch)
+    compute_fn = ep_compute.deepseekv3_ep_compute_fn(
+        module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+        ep_mesh=_FakeEpMesh(), fix_router=True)
+    compute_fn(module, torch.randn(2, 4))
+    assert captured["router_fn"] is _balanced_router, \
+        "case: fix_router_selects_adapter"
 
 
 # ==========================================================================

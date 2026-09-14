@@ -314,6 +314,7 @@ def deepseekv3_ep_compute_fn(
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
     overlap_shared_expert: bool = False,
+    fix_router: bool = False,
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -333,6 +334,14 @@ def deepseekv3_ep_compute_fn(
     and evaluates ``shared_experts`` while it is in flight — the shared branch
     reads only ``hidden_states``, so it hides communication instead of
     serializing behind the routed branch. The math is unchanged either way.
+
+    ``fix_router=True`` swaps the adapter for ``deepseekv3_fixed``, a
+    BENCHMARK-ONLY variant that hands every rank the same token count
+    (round-robin over the K slots by destination rank instead of the gate's
+    top-k) so that per-rank step time stops depending on how the data
+    happened to route. Loss / grad_norm / expert-load metrics are meaningless
+    in that mode and it must not be used to report an efficiency number —
+    see ``routing._balanced_router``. Correctness runs keep it off.
     """
     del mesh, tp_mesh, cp_mesh
 
@@ -353,7 +362,8 @@ def deepseekv3_ep_compute_fn(
     return build_ep_compute(
         module,
         ep_mesh,
-        router_fn=MOE_ROUTER_ADAPTERS["deepseekv3"],
+        router_fn=MOE_ROUTER_ADAPTERS[
+            "deepseekv3_fixed" if fix_router else "deepseekv3"],
         archetype_key="deepseekv3_sigmoid_group_shared",
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,

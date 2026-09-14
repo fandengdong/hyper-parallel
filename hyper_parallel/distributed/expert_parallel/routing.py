@@ -126,6 +126,88 @@ def _sigmoid_group_router(module, hidden_states):
     return topk_idx, topk_w
 
 
+def _global_expert_count(module):
+    """Model-level routed expert count (mirrors ``experts._get_global_expert_count``).
+
+    Kept local so this module stays a torch-only leaf (it is imported by
+    model adapters that do not want the expert compute machinery).
+    """
+    for owner in (getattr(module, "experts", None), module):
+        count = getattr(owner, "num_experts", None)
+        if count is not None:
+            return int(count)
+    cfg = getattr(module, "config", None)
+    for name in ("num_experts", "n_routed_experts"):
+        count = getattr(cfg, name, None)
+        if count is not None:
+            return int(count)
+    raise ValueError(
+        f"{type(module).__name__}: cannot determine the global routed expert count"
+    )
+
+
+def _balanced_router(module, hidden_states):
+    """deepseekv3 adapter variant with a deliberately uniform expert load.
+
+    Real sigmoid-group routing, but the chosen experts are replaced by a
+    round-robin assignment that spreads the local slots over the **destination
+    ranks**: local slot ``i`` goes to one of the ``L`` experts owned by
+    destination ``i mod Q``, where ``Q = E/L`` and ``L`` is the per-rank expert
+    count (``module.experts.local_expert_count``). Every rank therefore
+    receives exactly ``T*K/EP`` tokens instead of a data-dependent count.
+
+    Spreading by *rank* rather than by expert is what makes this exact: the
+    per-expert token count cannot be made uniform at all when ``E`` does not
+    divide ``T*K``, and a per-expert round robin (``i mod E``) replays the same
+    residue pattern on every rank, so the leftover slots pile onto the same
+    fixed group of ranks (measured: 0.8% above the mean on the busiest rank,
+    2.4% spread between rank groups). Going through the destination first
+    absorbs that leftover per rank instead.
+
+    Why: unbalanced routing is the dominant source of step-time jitter on MoE
+    training runs — the slowest rank in a step is the one whose experts drew
+    the most tokens, so identical configurations can differ by tens of percent
+    step to step. Measured on the 293B/18-layer config, the real router put
+    **6.3x** the mean token count on the busiest rank (leaving some experts
+    empty) while the balanced one stayed at 1.00x. Flattening the load makes a
+    step-to-step comparison converge in 2-3 steps instead of needing a dozen,
+    which is what makes small (1-3%) kernel-level effects measurable at all.
+
+    **Benchmark-only.** The assignment ignores the gate scores, so:
+    - ``loss`` / ``grad_norm`` / any convergence signal is meaningless here;
+    - expert hit distributions and "effective MFU" are optimistic (the load
+      is artificially flat), so numbers from this mode must not be reported
+      as an efficiency result.
+
+    Correctness must be validated with the switch OFF (``fix_router:
+    False``), where the real ``_sigmoid_group_router`` runs unchanged. The
+    true ``topk_w`` are kept so the gate still receives gradient and the
+    router GEMM stays in the step's compute profile.
+    """
+    topk_idx, topk_w = _sigmoid_group_router(module, hidden_states)
+    token_count, experts_per_token = topk_idx.shape
+    expert_count = _global_expert_count(module)
+    # Set by the EP binder (bind_local_expert_forward) before any forward; a
+    # missing value degrades to a plain per-expert round robin.
+    local_count = getattr(
+        getattr(module, "experts", None), "local_expert_count", None) or 1
+    if expert_count % local_count != 0:
+        raise ValueError(
+            f"num_experts ({expert_count}) must be divisible by the local "
+            f"expert count ({local_count})"
+        )
+    # Spread the slots over DESTINATION RANKS first (slot % destinations), then
+    # over that rank's local experts: every rank receives exactly one out of
+    # every `destinations` slots.
+    destinations = expert_count // local_count
+    slots = torch.arange(
+        token_count * experts_per_token, device=topk_idx.device)
+    balanced_idx = ((slots % destinations) * local_count
+                    + (slots // destinations) % local_count)
+    return balanced_idx.view(
+        token_count, experts_per_token).to(topk_idx.dtype), topk_w
+
+
 MOE_ROUTER_ADAPTERS = {
     "default": _softmax_topk_router,
     "qwen2moe": _topk_router_module,
@@ -135,6 +217,8 @@ MOE_ROUTER_ADAPTERS = {
     "mixtral": _topk_router_module,
     "deepseekv3": _sigmoid_group_router,
     "deepseek_v3": _sigmoid_group_router,
+    "deepseekv3_fixed": _balanced_router,
+    "deepseek_v3_fixed": _balanced_router,
     "glm4moe": _sigmoid_group_router,
     "glm4_moe": _sigmoid_group_router,
 }
