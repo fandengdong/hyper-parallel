@@ -101,6 +101,7 @@ def create_profiler(
     with_stack: bool,
     with_modules: bool,
     global_rank: int,
+    offline_parse: bool = False,
 ) -> Any:
     """
     Creates a profiler to record the CPU and CUDA activities. Default export to trace.json.
@@ -115,6 +116,17 @@ def create_profiler(
         record_shapes (bool): Whether to record the shapes of the tensors.
         profile_memory (bool): Whether to profile the memory usage.
         with_stack (bool): Whether to include the stack trace.
+        global_rank (int): The rank the trace belongs to.
+        offline_parse (bool): On NPU, skip the synchronous in-process parse that
+            ``tensorboard_trace_handler`` performs from ``on_trace_ready``. That parse runs
+            inside ``profiler.step()``, so the host process is blocked for its whole duration
+            while the other ranks wait for it inside a collective -- a large capture takes
+            tens of minutes and the collective then dies on the communication timeout. With
+            this enabled the raw trace is still written during collection, untouched, and is
+            parsed only after training finishes (other ranks' data is incomplete until then)
+            with ``msprof --export=on --output=<trace_dir>``. This removes the *blocking*
+            only: it neither reduces the trace size nor the eventual parse cost (a
+            ``with_stack=True`` capture produced an 11.8 GB ``trace_view.json``).
     """
     copy = None
     if trace_dir.startswith("hdfs://"):
@@ -145,21 +157,37 @@ def create_profiler(
 
         if IS_NPU_AVAILABLE:
             nonlocal npu_trace_handler
-            npu_trace_handler(p)
-            trace_file = p.prof_if.prof_path
+            if offline_parse:
+                # The handler is still built above (its construction is what registers the
+                # output directory with torch_npu), but not invoked: invoking it is the
+                # synchronous parse this mode exists to skip.
+                logger.info(
+                    f"Profiling parse skipped (profiling.offline_parse=true). The raw trace of "
+                    f"rank {global_rank} is left under {trace_dir} -- one *_ascend_pt directory "
+                    f"per rank, holding its PROF_* data -- and must be parsed only after training "
+                    f"finishes (other ranks' data is incomplete until then) with: "
+                    f"msprof --export=on --output={trace_dir}"
+                )
+            else:
+                npu_trace_handler(p)
+                trace_file = p.prof_if.prof_path
+                logger.info(f"Profiling result saved at {trace_file}.")
         elif IS_CUDA_AVAILABLE:
             p.export_chrome_trace(trace_file)
-        logger.info(f"Profiling result saved at {trace_file}.")
+            logger.info(f"Profiling result saved at {trace_file}.")
 
         if profile_memory:
             get_torch_device().memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
-            if copy is None:
+            if offline_parse:
+                logger.info(f"Profiling result not uploaded to {trace_dir}: offline parse leaves it local.")
+            elif copy is None:
                 raise ValueError("hdfs_io.copy is required for an HDFS profiling trace directory")
-            copy(trace_file, trace_dir)
-            logger.info(f"Profiling result uploaded to {trace_dir}.")
+            else:
+                copy(trace_file, trace_dir)
+                logger.info(f"Profiling result uploaded to {trace_dir}.")
 
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler

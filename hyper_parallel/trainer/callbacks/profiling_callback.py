@@ -63,6 +63,7 @@ class ProfilingCallback(Callback):
             with_stack=self.config.with_stack,
             with_modules=self.config.with_modules,
             global_rank=self.trainer.global_rank,
+            offline_parse=self.config.offline_parse,
         )
         self.profiler.start()
 

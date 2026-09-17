@@ -87,3 +87,10 @@ class ProfilingConfig:
     with_stack: bool = False
     with_modules: bool = False
     rank: int = 0
+    # Skip the synchronous in-process parse that torch_npu's trace handler runs when the
+    # profiling window closes. That parse happens inside ``profiler.step()``, blocks the
+    # host process for its whole duration, and stalls the peers waiting in a collective
+    # (HCCL_EXEC_TIMEOUT). With this on, the raw trace is still collected untouched and
+    # must be parsed afterwards with ``msprof --export=on --output=<trace_dir>``.
+    # It removes the blocking only -- not the trace size or the eventual parse cost.
+    offline_parse: bool = False
