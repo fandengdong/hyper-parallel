@@ -8,7 +8,10 @@
 #         --model.pretrained_model_name_or_path=/path/to/Kimi-K2.6
 #
 # The batch is replicated across TP ranks, so tp_size>1 is supported for the
-# text tower; CP/PP remain unsupported by the temporary VLM batch path.
+# text tower. CP uses a "replicated vision, sharded text" split — see
+# my_workspace/train_kimi_vlm_18l_1sn_cp2_ep128_seq8192_nooffload_fixrouter.yaml
+# for the required `when: cp` inner-wrapper entry; PP remains unsupported by
+# this batch path.
 
 model:
   _target_: examples.training_demo.cropped_kimi_vlm.build_cropped_kimi_vlm

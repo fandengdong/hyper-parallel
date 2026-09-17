@@ -40,6 +40,8 @@ def build_cropped_kimi_vlm(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_swap: str = "none",
+        swap_inputs: bool = False,
+        freeze_patterns: list[str] | None = None,
 ) -> PreTrainedModel:
     """Create a randomly initialized Kimi-K2.5/K2.6 VLM with a cropped text tower.
 
@@ -75,6 +77,16 @@ def build_cropped_kimi_vlm(
         compile_config: Optional Trainer-provided compile configuration.
         activation_checkpoint: Activation checkpoint mode.
         activation_swap: Activation swap mode.
+        swap_inputs: Offload each checkpointed block's boundary activation to
+            host memory during the forward pass. Independent of
+            ``activation_swap``; requires ``activation_checkpoint`` to be
+            ``"full"`` or ``"selective"``.
+        freeze_patterns: Module-name globs whose parameters are frozen
+            (``requires_grad = False``) before plan/FSDP derivation, applied with
+            ``fnmatch`` against each module's fully qualified name. Freezing the
+            media tower, e.g. ``["model.vision_tower*"]``, also removes its
+            backward pass and saved activations, which is what makes a
+            like-for-like comparison against a pipeline that freezes it.
 
     Returns:
         A parallelized, randomly initialized ``KimiK25ForConditionalGeneration``.
@@ -151,7 +163,17 @@ def build_cropped_kimi_vlm(
             compile_config=compile_config,
             activation_checkpoint=activation_checkpoint,
             activation_swap=activation_swap,
+            swap_inputs=swap_inputs,
+            freeze_config=freeze_patterns,
         )
     finally:
         _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _orig_init_weights
+
+    mesh_context = getattr(distributed_setup, "mesh_context", None)
+    if mesh_context is not None and int(getattr(mesh_context, "cp_size", 1)) > 1:
+        from hyper_parallel.models.kimi_k25.adapter.distributed.context_parallel import (  # pylint: disable=C0415
+            bind_context_parallel,
+        )
+
+        bind_context_parallel(model, mesh_context)
     return model
