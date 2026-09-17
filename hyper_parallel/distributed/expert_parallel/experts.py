@@ -32,6 +32,8 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+import math
+import os
 from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.distributed as dist
@@ -83,6 +85,63 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+# ``ArgSort`` has no int32/int64 AICore kernel and silently falls back to
+# AI_CPU (runtime warning), which is expensive on the EP dispatch path where it
+# sits before the all-to-all.  Every key sorted here is a small non-negative
+# integer and float32 represents integers up to 2**24 exactly, so sorting a
+# float32 key preserves the order and lets the kernel run on AICore.  Opt-in
+# while it is being measured (HP_EP_SORT_FP32=1).
+_SORT_KEY_FP32_LIMIT = 2 ** 24
+_SORT_FP32_ENABLED = os.environ.get("HP_EP_SORT_FP32", "0") == "1"
+
+# The routed dispatch issues two ragged all-to-all exchanges per pass (hidden
+# states, then expert indices) whose token counts are identical and whose
+# payloads differ only in width.  A profile of the 256-card step shows the
+# exchanges strictly serialized (zero overlapping pairs across 1799 pairs), so
+# carrying both payloads in ONE exchange shortens a serial chain instead of
+# adding a third one.  Opt-in while it is being measured
+# (HP_EP_FUSED_DISPATCH=1).
+_FUSED_DISPATCH_ENABLED = os.environ.get("HP_EP_FUSED_DISPATCH", "0") == "1"
+
+
+def _argsort_keys(keys: torch.Tensor, *, bound: int) -> torch.Tensor:
+    """Sort non-negative integer keys, on AICore when the range allows.
+
+    Args:
+        keys: Non-negative integer sort keys.
+        bound: Exclusive upper bound on every key, known statically by the
+            caller so no device sync is needed to check the float32 range.
+
+    Returns:
+        The int64 permutation that sorts ``keys``.
+    """
+    if _SORT_FP32_ENABLED and 0 < bound <= _SORT_KEY_FP32_LIMIT:
+        return keys.to(torch.float32).argsort()
+    return keys.argsort()
+
+
+def _expert_token_counts(indices: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Count routed tokens per expert with device ops only.
+
+    ``torch.bincount`` on NPU reads the input's min and max back to the host
+    (input validation and output sizing), so every call drains the device queue
+    and blocks the host. The counts here are consumed either fully on device
+    (grouped GEMM group list) or -- where the ragged all-to-all genuinely needs
+    them -- as a single host list, so accumulating them with ``scatter_add_``
+    keeps the same values at one device kernel and no host stall.
+
+    Args:
+        indices: Expert indices, any shape; values must be in ``[0, num_experts)``.
+        num_experts: Length of the returned histogram (``minlength``).
+
+    Returns:
+        int64 counts of shape ``[num_experts]`` on ``indices.device``.
+    """
+    flat = indices.to(torch.int64).reshape(-1)
+    counts = torch.zeros(num_experts, dtype=torch.int64, device=flat.device)
+    return counts.scatter_add_(0, flat, torch.ones_like(flat))
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -91,12 +150,11 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
-    token_order = local_expert_indices.argsort()
+    token_order = _argsort_keys(
+        local_expert_indices, bound=experts.local_expert_count)
     sorted_states = dispatched_states[token_order]
-    local_expert_counts = torch.bincount(
-        local_expert_indices,
-        minlength=experts.local_expert_count,
-    )
+    local_expert_counts = _expert_token_counts(
+        local_expert_indices, experts.local_expert_count)
     if getattr(experts, "_ep_use_grouped_gemm", False):
         grouped_forward = getattr(experts, "forward_expert_major", None)
         if callable(grouped_forward):
@@ -118,10 +176,13 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
         return output
 
     gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
+    # The eager path needs host ints: read them in one transfer rather than
+    # draining the queue once per local expert.
+    expert_token_counts = local_expert_counts.tolist()
     sorted_outputs = []
     token_start = 0
     for local_expert_index in range(experts.local_expert_count):
-        expert_token_count = int(local_expert_counts[local_expert_index])
+        expert_token_count = expert_token_counts[local_expert_index]
         expert_states = sorted_states[token_start:token_start + expert_token_count]
         if up_weight is None:
             gate_states, up_states = F.linear(  # pylint: disable=not-callable
@@ -224,10 +285,13 @@ def _prepare_ep_dispatch(
     expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
     source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+    dispatch_order = _argsort_keys(
+        destination_ranks * global_expert_count + expert_indices,
+        bound=ep_size * global_expert_count,
+    )
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
-    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
+    send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
     receive_counts_tensor = torch.empty_like(send_counts_tensor)
     dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
     return (
@@ -257,6 +321,122 @@ def _run_ep_local_experts(
     ).squeeze(-1)
     local_outputs = module.experts(received_states, received_indices - expert_offset)
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
+
+
+def _fused_row_layout(
+    hidden_size: int,
+    state_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+) -> tuple[int, int]:
+    """Slot geometry of one fused dispatch row.
+
+    The row is ``[hidden states | head pad | index bytes]`` read in the states'
+    dtype: ``index_slots`` trailing state elements carry the index, and the head
+    pad moves that region to a byte offset which is a multiple of the index
+    element size -- the alignment ``Tensor.view(dtype)`` needs to reinterpret it
+    without a copy.
+
+    Args:
+        hidden_size: Width of the hidden states in the row.
+        state_dtype: Dtype of the hidden states (the row's storage dtype).
+        index_dtype: Dtype of the expert indices carried in the tail slots.
+
+    Returns:
+        ``(head_slots, index_slots)`` in state elements; the row is
+        ``hidden_size + head_slots + index_slots`` state elements wide.
+    """
+    index_slots = math.lcm(state_dtype.itemsize, index_dtype.itemsize) // state_dtype.itemsize
+    return (-hidden_size) % index_slots, index_slots
+
+
+def _pack_fused_dispatch(
+    dispatched_states: torch.Tensor,
+    dispatched_expert_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Pack the hidden states and the expert indices of a token into one row.
+
+    Byte-view packing: the index bytes sit in the tail slots reinterpreted in
+    the states' dtype, so nothing is converted numerically and both payloads
+    stay bit-exact (a bf16 buffer cannot hold an expert index above 256
+    exactly, so the index must travel as bytes).  The row is one tensor, so the
+    whole fused exchange stays a differentiable ``cat`` on the send side and a
+    pair of views on the receive side.
+
+    Args:
+        dispatched_states: Expert-major hidden states, shape ``[tokens, H]``.
+        dispatched_expert_indices: Matching indices, shape ``[tokens, 1]``.
+
+    Returns:
+        ``[tokens, H + head_slots + index_slots]`` in the states' dtype.
+    """
+    token_count, hidden_size = dispatched_states.shape
+    head_slots, index_slots = _fused_row_layout(
+        hidden_size, dispatched_states.dtype, dispatched_expert_indices.dtype)
+    index_bytes = dispatched_expert_indices.reshape(token_count, 1).view(torch.uint8)
+    index_slots_buffer = F.pad(
+        index_bytes, (0, index_slots * dispatched_states.element_size() - index_bytes.shape[1]))
+    head_buffer = torch.zeros(
+        token_count, head_slots, dtype=dispatched_states.dtype, device=dispatched_states.device)
+    return torch.cat(
+        [dispatched_states, head_buffer, index_slots_buffer.view(dispatched_states.dtype)],
+        dim=1,
+    )
+
+
+def _unpack_fused_dispatch(
+    packed: torch.Tensor,
+    *,
+    hidden_size: int,
+    index_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a received fused row back into ``(states, indices)``.
+
+    Both halves are views of the exchanged buffer, so the received bytes are
+    handed over as they arrived -- no decode step can change a value.  The index
+    half is detached: it is payload on its way into integer indexing, while the
+    states half stays the differentiable path that carries the routed gradient.
+    Staying view-only also keeps the exchange's lazy wait intact: a
+    materializing op here would enqueue the wait before the caller reaches its
+    independent work.
+
+    Args:
+        packed: Exchanged rows, shape ``[tokens, row]`` in the states' dtype.
+        hidden_size: Width of the hidden states in the row.
+        index_dtype: Dtype of the expert indices carried in the tail slots.
+
+    Returns:
+        ``(states [tokens, H], indices [tokens])``, both views of ``packed``.
+    """
+    head_slots, index_slots = _fused_row_layout(hidden_size, packed.dtype, index_dtype)
+    index_start = hidden_size + head_slots
+    index_bytes = packed.detach()[:, index_start:index_start + index_slots].view(torch.uint8)
+    return (
+        packed[:, :hidden_size],
+        index_bytes[:, :index_dtype.itemsize].view(index_dtype).squeeze(-1),
+    )
+
+
+def _fused_dispatch_exchange(
+    dispatched_states: torch.Tensor,
+    dispatched_expert_indices: torch.Tensor,
+    send_counts: list[int],
+    receive_counts: list[int],
+    ep_group: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch the hidden states and the expert indices in ONE all-to-all.
+
+    Same handle/wait contract as the two exchanges it replaces: the exchange is
+    issued through :func:`ep_all_to_all_async` and both returned tensors are
+    views of it, so the wait still lands on their first non-view consumer (the
+    shared-expert overlap window is untouched).
+    """
+    packed = _pack_fused_dispatch(dispatched_states, dispatched_expert_indices)
+    exchanged = ep_all_to_all_async(packed, send_counts, receive_counts, ep_group)
+    return _unpack_fused_dispatch(
+        exchanged,
+        hidden_size=dispatched_states.shape[-1],
+        index_dtype=dispatched_expert_indices.dtype,
+    )
 
 
 def _aggregate_ep_outputs(
@@ -406,6 +586,10 @@ def ep_routed_dispatch(
     ``hidden_states``) therefore overlaps that work with the in-flight
     exchange instead of serializing behind it.
 
+    With ``HP_EP_FUSED_DISPATCH=1`` the states and the indices travel in one
+    packed exchange instead of two (see :func:`_fused_dispatch_exchange`); the
+    pending state and the wait point are the same either way.
+
     Args:
         module: MoE block exposing ``experts`` (with ``local_expert_count``).
         hidden_states: Local sequence chunk, shape ``[B, S, H]``.
@@ -439,11 +623,20 @@ def ep_routed_dispatch(
         ep_size=ep_size,
         ep_group=ep_group,
     )
-    received_states = ep_all_to_all_async(
-        dispatched_states, send_counts, receive_counts, ep_group)
-    # squeeze is a view, so the wait stays deferred until the experts read it.
-    received_indices = ep_all_to_all_async(
-        dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
+    if _FUSED_DISPATCH_ENABLED:
+        received_states, received_indices = _fused_dispatch_exchange(
+            dispatched_states,
+            dispatched_expert_indices,
+            send_counts,
+            receive_counts,
+            ep_group,
+        )
+    else:
+        received_states = ep_all_to_all_async(
+            dispatched_states, send_counts, receive_counts, ep_group)
+        # squeeze is a view, so the wait stays deferred until the experts read it.
+        received_indices = ep_all_to_all_async(
+            dispatched_expert_indices, send_counts, receive_counts, ep_group).squeeze(-1)
     return EPRoutedState(
         source_token_indices,
         flattened_expert_weights,
