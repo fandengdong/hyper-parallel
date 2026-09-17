@@ -1,0 +1,162 @@
+# Trainer end-to-end demo.
+#
+# This example loads Qwen3-30B-A3B and the WikiText-2 raw training split from
+# Hugging Face Hub to validate the full Trainer path with real text data.
+#
+# Run on eight Ascend NPUs with:
+#   bash examples/training_demo/run.sh
+
+model:
+  _target_: hyper_models._transformers.HyperAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: "/home/fdd/workspace/models/Qwen/Qwen3-30B-A3B" # tiny-random-LlamaForCausalLMB # 
+  ignore_mismatched_sizes: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  force_hf: true
+
+training:
+  train_steps: 60
+  train_samples: null
+  # WikiText-2 yields about 37 global steps at 4096 tokens and 16 ranks, so a
+  # second pass lets the default 60-step performance run reach its limit.
+  num_train_epochs: 2
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true # false
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 1
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: false
+  defer_fsdp_grad_sync: true
+  enable_fsdp2_prefetch: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+                                                                                                                                                      
+  - match: "*.mlp"                # HF MoE 模块 FQN，通常是 *.mlp                                                                                                    
+    when: ep                      # 仅 ep_size>1 时生效                                                                                                              
+    region_dispatch: false        # EP compute 内含 all-to-all，不可 dispatch                                                                                        
+    local_compute_fn:                                                                                                                                                
+      _target_: hyper_models.components.distributed.ep_compute.qwen3moe_ep_compute_fn   
+
+  - match:
+      - "*.input_layernorm"
+      - "*.post_attention_layernorm"
+      - "model.norm"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
+    replace_module:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_rms_norm
+  - match: "*.self_attn"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
+    replace_module:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_flash_attention
+  - match: "*.mlp"
+    module_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock
+    replace_module:
+      _target_: hyper_models.components.models.qwen3_moe_fusions.replace_qwen3_moe_sparse_moe
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+# Minimal WikiText-2 path: tokenize raw text, concatenate documents with EOS,
+# and group tokens into fixed 4096-token samples. The transform deliberately
+# emits labels identical to input_ids; causal label shifting is model-owned.
+dataset:
+  model_assets:
+    datasets_type: plaintext
+    chat_template: null
+    tokenizer:
+      _target_: hyper_models.components.datasets.llm.build_tokenizer.AutoTokenizer.from_pretrained
+      use_fast: true
+      trust_remote_code: true
+
+  data_transform:
+    _target_: examples.training_demo.data.PlainTextDataTransform
+    text_column: article_text
+    seq_len: 4096
+    append_eos: true
+
+  data_config:
+    create_attention_mask_in_dataloader: false
+
+  _target_: examples.training_demo.data.load_tokenized_text_dataset
+  path: /home/fdd/workspace/datasets/enwiki_tokenizers/part_00_demo.jsonl
+  name: default
+  split: train
+
+dataloader:
+  # StatefulDataLoader adapter; sampling order is controlled by dataloader_type,
+  # so do not configure torch DataLoader's shuffle option here.
+  _target_: hyper_models.components.datasets.DataLoader
+
+  collate_fn:
+    _target_: hyper_models.components.datasets.llm.build_llm_collator
+    packing: false
+
+  get_batch:
+    _target_: hyper_models.components.datasets.llm.build_llm_get_batch
+
+  # single: sequential/rearranged; cyclic: deterministic shuffled epochs.
+  dataloader_type: single # cyclic # 
+
+  # Defaults.
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_models.components.optim.optimizer.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.95]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_models.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 0
+    min_lr: 1.0e-6
+
+checkpoint:
+  enabled: false
+  checkpoint_dir: '' #./outputs/training_demo/checkpoints
+
+debug:
+  check_nan_inf: false
+  check_dataset: false
