@@ -62,6 +62,17 @@ from hyper_parallel.platform import get_platform
 # my_workspace/ for the failing run logs.
 _OFFLOAD_ASYNC_H2D = os.environ.get("HP_OFFLOAD_ASYNC_H2D", "0") == "1"
 
+# Pinning costs a fixed amount of host memory per tensor (measured ~0.2-0.5 MB,
+# i.e. a 14x amplification for 2000 x 32 KB shards) while only large shards gain
+# from DMA instead of bounce-buffer copies. Shards smaller than this many bytes
+# stay unpinned; 0 pins everything (the historical behaviour).
+_OFFLOAD_PIN_MIN_BYTES = int(os.environ.get("HP_OFFLOAD_PIN_MIN_BYTES", "0"))
+
+
+def _should_pin_tensor(tensor: torch.Tensor) -> bool:
+    """Whether this tensor is large enough to justify pinned host memory."""
+    return tensor.numel() * tensor.element_size() >= _OFFLOAD_PIN_MIN_BYTES
+
 _OFFLOAD_COPY_STREAM: Optional[Any] = None
 _OFFLOAD_COPY_EVENT: Optional[Any] = None
 _OFFLOAD_ASYNC_COUNT = 0
@@ -713,15 +724,23 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.padded_sharded_param_size = chunks[0].size()
         if self.offload_to_cpu and not sharded_param.is_meta:
             sharded_param = sharded_param.cpu()
-            if self.pin_memory:
+            if self.pin_memory and _should_pin_tensor(sharded_param):
                 sharded_param = sharded_param.pin_memory()
 
         if self.sharded_size == self.padded_sharded_param_size:
             self._sharded_param_data = sharded_param.view(-1)
         else:
-            padded_sharded_param = sharded_param.new_zeros(self.padded_sharded_param_size)
-            if self.pin_memory and not padded_sharded_param.is_meta:
-                padded_sharded_param = padded_sharded_param.pin_memory()
+            # Allocate the padded communication buffer straight in pinned memory:
+            # new_zeros() + pin_memory() keeps an unpinned twin alive at the peak
+            # (measured 3.4x the payload for the pair, 2.5x for the pinned copy).
+            padded_sharded_param = sharded_param.new_zeros(
+                self.padded_sharded_param_size,
+                pin_memory=(
+                    self.pin_memory
+                    and not sharded_param.is_meta
+                    and _should_pin_tensor(sharded_param)
+                ),
+            )
             if sharded_param.numel() > 0:
                 padded_sharded_param.narrow(
                     shard_dim,
@@ -1039,7 +1058,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         local_tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, bool]:
         """Move reset storage to pinned CPU memory when the policy requires it."""
-        if self.pin_memory and not local_tensor.is_pinned():
+        if (
+            self.pin_memory
+            and not local_tensor.is_pinned()
+            and _should_pin_tensor(local_tensor)
+        ):
             return local_tensor.cpu().pin_memory(), True
         return local_tensor, False
 
@@ -1055,9 +1078,10 @@ class TorchHSDPParamV2(HSDPParamV2):
             self._sharded_param_data = local_tensor.view(-1)
             local_view = local_tensor.detach()
         else:
-            padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
-            if self.pin_memory:
-                padded_local_tensor = padded_local_tensor.pin_memory()
+            padded_local_tensor = local_tensor.new_zeros(
+                self.padded_sharded_param_size,
+                pin_memory=self.pin_memory and _should_pin_tensor(local_tensor),
+            )
             if local_tensor.numel() > 0:
                 padded_local_tensor.narrow(
                     shard_dim,
@@ -1095,10 +1119,25 @@ class TorchHSDPParamV2(HSDPParamV2):
         shard_dim = self.hsdp_placement.dim
         if not same_local_tensor:
             local_tensor = self._validate_reset_local_tensor(local_tensor)
+        # CPU offload keeps the shards on the host, but this reset path used to
+        # move them there only as a side effect of pinning: with pinning disabled
+        # (or skipped for a small shard) nothing moved the freshly loaded,
+        # device-resident local tensor to CPU, so the parameter stayed on the
+        # accelerator and ``state._validate_cpu_offload_params`` rejected it.
+        # Move it explicitly whenever offload is on, and force the refresh below
+        # because the storage changed.
+        moved_to_cpu = False
+        if (
+            self.offload_to_cpu
+            and not local_tensor.is_meta
+            and local_tensor.device.type != "cpu"
+        ):
+            local_tensor = local_tensor.cpu()
+            moved_to_cpu = True
         local_tensor, pinned_local_tensor = self._pin_reset_local_tensor_if_needed(local_tensor)
         if not isinstance(self.sharded_param, DTensor):
             raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
-        if not same_local_tensor or pinned_local_tensor:
+        if not same_local_tensor or pinned_local_tensor or moved_to_cpu:
             self._refresh_sharded_local_tensor(local_tensor, shard_dim)
         self._sharding_spec.set_tensor_meta(
             self._sharding_spec.tensor_shape,

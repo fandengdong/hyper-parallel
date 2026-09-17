@@ -153,6 +153,10 @@ class FSDP2Config:
         default_factory=FSDP2MixedPrecisionConfig
     )
     enable_offload: bool = False
+    # Pin the CPU-resident shards that CPU offload keeps on the host. Pinning
+    # makes the H2D/D2H copies true DMA instead of going through a bounce buffer,
+    # but it costs host memory that cannot be swapped out or reclaimed.
+    offload_pin_memory: bool = True
     reshard_after_forward: bool = True
     reshard_after_backward: bool = True
     requires_grad_sync: bool = True

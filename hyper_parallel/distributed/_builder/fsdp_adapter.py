@@ -198,7 +198,9 @@ class FSDP2Manager:
         """Return CPU offload when enabled, otherwise the default no-offload policy."""
         if not self.config.enable_offload:
             return fully_shard_utils.OffloadPolicy()
-        return fully_shard_utils.CPUOffloadPolicy()
+        return fully_shard_utils.CPUOffloadPolicy(
+            pin_memory=self.config.offload_pin_memory
+        )
 
     def _build_fully_shard_kwargs(
         self,
