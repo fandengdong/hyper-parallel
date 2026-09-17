@@ -33,7 +33,20 @@ _MAPPING_GET_POLYFILL_INSTALLED = False
 # contract comes first, and the generic HF-convention fallback paths below
 # cover every supported family. A family whose container lives elsewhere
 # declares the contract on its model class instead of registering here.
-_GENERIC_LAYER_PATHS = ("layers", "model.layers")
+#
+# VLM families keep the text decoder under a tower attribute, and those paths
+# are tried first for two reasons: a vision tower exposes ``layers`` of its own
+# (Kimi-K2.5 has 27 of them) while the text decoder is the part worth compiling,
+# and a VLM whose top-level object is a thin wrapper adds one ``model.`` level.
+# A pure text model simply misses every tower path and falls through.
+_GENERIC_LAYER_PATHS = (
+    "model.model.language_model.layers",
+    "model.language_model.layers",
+    "language_model.model.layers",
+    "language_model.layers",
+    "layers",
+    "model.layers",
+)
 
 
 def _get_attribute(root: Any, path: str) -> Any:
