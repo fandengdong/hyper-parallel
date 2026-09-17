@@ -196,11 +196,25 @@ class EnvironMeterCallback(Callback):
             return None
         return dp_cp_mesh.get_group()
 
-    def _reduce(self, value: Union[float, int], op: str) -> float:
+    def _sample_group(self) -> Any:
+        """Return the group whose members hold *distinct* samples.
+
+        The CP peers of one DP group receive replicas of the same sample, so
+        summing per-rank sample counts over ``dp_cp`` would report
+        ``cp_size`` times the real batch. Text tokens are not affected: the CP
+        batch path slices the loss targets per rank, so the per-rank token
+        counts already partition the sequence.
+        """
+        dp_mesh = getattr(self.trainer.mesh, "dp_mesh", None)
+        if dp_mesh is None:
+            return self._metric_group()
+        return dp_mesh.get_group()
+
+    def _reduce(self, value: Union[float, int], op: str, group: Any = None) -> float:
         """Reduce one scalar metric, with a single-process no-op fallback."""
         if get_world_size_safe() <= 1:
             return float(value)
-        reduced = all_reduce(value, op=op, group=self._metric_group())
+        reduced = all_reduce(value, op=op, group=self._metric_group() if group is None else group)
         return float(reduced)
 
     def _current_lr(self) -> float:
@@ -310,7 +324,7 @@ class EnvironMeterCallback(Callback):
         global_step_time = self._reduce(step_time, op="max")
         global_tokens = int(self._reduce(self._local_step_tokens, op="sum"))
         global_padded_tokens = int(self._reduce(self._local_step_padded_tokens, op="sum"))
-        global_samples = int(self._reduce(self._local_step_samples, op="sum"))
+        global_samples = int(self._reduce(self._local_step_samples, op="sum", group=self._sample_group()))
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
 

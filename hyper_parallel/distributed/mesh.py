@@ -104,6 +104,36 @@ class MeshContext:
         return sub
 
     @property
+    def dp_mesh(self) -> Any:
+        """DP-only mesh, excluding CP.
+
+        Data is sharded by ``dp_rank`` while the CP peers of one DP group hold
+        replicas of the same sample, so quantities that count *distinct*
+        samples (e.g. ``data/step_samples``) must reduce over this domain
+        rather than over :attr:`dp_cp_mesh`.
+        """
+        if self.device_mesh is None:
+            return None
+        dim_names = self.device_mesh.mesh_dim_names or ()
+        if "dp" in dim_names:
+            return self.device_mesh["dp"]
+        selected_dims = tuple(
+            dim_name
+            for dim_name in ("dp_replicate", "dp_shard")
+            if dim_name in dim_names
+        )
+        if not selected_dims:
+            return None
+        sub = (
+            self.device_mesh[selected_dims[0]]
+            if len(selected_dims) == 1
+            else self.device_mesh[selected_dims]
+        )
+        if sub.ndim > 1:
+            sub = sub.flatten("dp")
+        return sub
+
+    @property
     def cp_mesh(self) -> Any:
         """CP submesh for CP utilities (e.g. shard_batch_for_cp).
 
