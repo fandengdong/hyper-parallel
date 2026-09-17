@@ -19,7 +19,7 @@ class names, fields and defaults are unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from hyper_parallel.components.quantization.config import LowPrecisionConfig
 
@@ -86,7 +86,10 @@ class ProfilingConfig:
     profile_memory: bool = False
     with_stack: bool = False
     with_modules: bool = False
-    rank: int = 0
+    # One rank (int) or several (list of ints). Recording more than one rank is what
+    # separates a straggler from a local barrier: a single rank cannot show whether an
+    # exposed collective is the slowest participant or every participant waiting.
+    rank: Union[int, List[int]] = 0
     # Skip the synchronous in-process parse that torch_npu's trace handler runs when the
     # profiling window closes. That parse happens inside ``profiler.step()``, blocks the
     # host process for its whole duration, and stalls the peers waiting in a collective
