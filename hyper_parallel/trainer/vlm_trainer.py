@@ -211,10 +211,12 @@ class VLMTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = clip_grad_norm_(
-            self.base.model,
-            config.training.max_grad_norm,
-        )
+        grad_norm = 0.0
+        if config.training.max_grad_norm > 0:
+            grad_norm = clip_grad_norm_(
+                self.base.model,
+                config.training.max_grad_norm,
+            )
 
         optimizers = (
             self.base.optimizer
