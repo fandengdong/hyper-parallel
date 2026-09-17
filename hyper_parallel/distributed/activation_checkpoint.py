@@ -15,6 +15,7 @@
 """Activation checkpointing helpers for distributed model components."""
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -158,6 +159,18 @@ def _build_selective_ac_must_save_ops():
 
 
 _SELECTIVE_AC_MUST_SAVE_OPS = _build_selective_ac_must_save_ops()
+
+# Selective recomputation alternates matmul saves one-in-N. The historical
+# behaviour (N=2: save every other matmul) stores a lot of activation memory --
+# on the 61-layer / 512-card shape it does not fit next to the model state, while
+# N=1 (save every matmul) is strictly heavier. Raising N is therefore the knob
+# that trades device memory back for recompute: fewer saved activations, less
+# memory, more compute. HP_AC_SELECTIVE_SAVE_EVERY selects N.
+_SELECTIVE_MATMUL_SAVE_EVERY = max(2, int(os.environ.get("HP_AC_SELECTIVE_SAVE_EVERY", "2")))
+
+# Cap on how many discovered layers use the selective policy (0 = every layer).
+# See the selective branch of ``_apply_activation_checkpointing``.
+_SELECTIVE_LAYER_LIMIT = max(0, int(os.environ.get("HP_AC_SELECTIVE_LAYERS", "0")))
 
 
 @dataclass(frozen=True)
@@ -316,8 +329,13 @@ def ensure_fsdp_ops_sac_ignored() -> None:
     )
 
 
-def _make_selective_checkpoint_policy_fn() -> Callable:
-    """Create an isolated selective activation checkpointing policy."""
+def _make_selective_checkpoint_policy_fn(save_every: int = _SELECTIVE_MATMUL_SAVE_EVERY) -> Callable:
+    """Create an isolated selective activation checkpointing policy.
+
+    Args:
+        save_every: Save one in every ``save_every`` matmul outputs; the rest are
+            recomputed. ``2`` keeps the historical alternating behaviour.
+    """
     matmul_counts = {False: 0, True: 0}
 
     def selective_checkpointing_policy(
@@ -329,8 +347,8 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
         """Decide whether ``func``'s output is saved or recomputed.
 
         Follows the selective-activation-checkpointing policy contract: matmuls
-        alternate between save and recompute, expensive/communication ops are
-        always saved, and everything else is recomputed.
+        alternate between save and recompute (one in ``save_every``), expensive
+        and communication ops are always saved, and everything else is recomputed.
 
         Args:
             ctx: Checkpoint context carrying the ``is_recompute`` phase flag.
@@ -346,7 +364,7 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MATMUL_OPS:
             matmul_counts[ctx.is_recompute] += 1
-            if matmul_counts[ctx.is_recompute] % 2:
+            if matmul_counts[ctx.is_recompute] % save_every == 1:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MUST_SAVE_OPS:
@@ -356,13 +374,18 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
     return selective_checkpointing_policy
 
 
-def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]]:
+def make_selective_checkpoint_context_fn(
+    save_every: int = _SELECTIVE_MATMUL_SAVE_EVERY,
+) -> Callable[[], tuple[object, object]]:
     """Create a per-checkpoint-region selective activation policy context.
 
-    Expensive operations are saved, ordinary operations are recomputed, and
-    matmul operations alternate between the two decisions. A new counter is
-    created every time the returned factory is invoked, matching the
-    ``context_fn`` contract of non-reentrant checkpointing.
+    Expensive operations are saved, ordinary operations are recomputed, and one
+    in every ``save_every`` matmul outputs is saved. A new counter is created
+    every time the returned factory is invoked, matching the ``context_fn``
+    contract of non-reentrant checkpointing.
+
+    Args:
+        save_every: Matmul save cadence; ``2`` is the historical default.
 
     Returns:
         A no-argument factory that creates the forward and recompute contexts.
@@ -378,7 +401,7 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
             non-reentrant checkpointing ``context_fn`` contract.
         """
         return platform.create_selective_checkpoint_contexts(
-            _make_selective_checkpoint_policy_fn()
+            _make_selective_checkpoint_policy_fn(save_every)
         )
 
     return selective_checkpoint_context_fn
@@ -720,13 +743,27 @@ def _apply_activation_checkpointing(
                     compile_checkpoint_wrapper,
                 )
             else:
+                # ``HP_AC_SELECTIVE_LAYERS`` caps how many layers use the selective
+                # policy; the rest fall back to plain full recomputation. Selective
+                # on every layer does not fit next to the model state on the
+                # 61-layer / 512-card shape (it needs ~1.9 GB more than the card
+                # has), while it is exactly the saved exchange outputs that buy
+                # back backward recompute -- so the cap is the knob that bounds
+                # the device memory this policy costs. 0 (the default) keeps every
+                # layer selective.
+                remaining_selective = _SELECTIVE_LAYER_LIMIT or len(ac_layers)
+
                 def eager_checkpoint_wrapper(layer: nn.Module, **checkpoint_kwargs: Any) -> nn.Module:
-                    """Wrap one layer with eager selective checkpointing."""
-                    return checkpoint_wrapper(
-                        layer,
-                        swap_inputs=swap_inputs,
-                        **checkpoint_kwargs,
-                    )
+                    """Wrap one layer, selective first and full once the cap is spent."""
+                    nonlocal remaining_selective
+                    if remaining_selective > 0:
+                        remaining_selective -= 1
+                        return checkpoint_wrapper(
+                            layer,
+                            swap_inputs=swap_inputs,
+                            **checkpoint_kwargs,
+                        )
+                    return checkpoint_wrapper(layer, swap_inputs=swap_inputs)
 
                 wrapped_count = _wrap_layer_containers(
                     containers,
