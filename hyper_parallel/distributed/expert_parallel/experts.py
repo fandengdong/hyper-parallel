@@ -103,6 +103,24 @@ _SORT_FP32_ENABLED = os.environ.get("HP_EP_SORT_FP32", "0") == "1"
 # (HP_EP_FUSED_DISPATCH=1).
 _FUSED_DISPATCH_ENABLED = os.environ.get("HP_EP_FUSED_DISPATCH", "0") == "1"
 
+# The dispatch tags every routed slot with its source token as
+# ``arange(token_count).repeat_interleave(top_k)``.  That eager call lowers to a
+# *single-block* vector kernel: on one NPU it costs 9.25 ms per call at
+# T=8192 / K=8 (one vector core out of 48, ~58 MB/s of writes), i.e. 36 x 9.25 ms
+# = 0.33 s per step on the 18-layer testbed (16% of a 2.05 s step) and 1.07 s per
+# step on the 256-card shape.
+#
+# ``expand`` (broadcast copy) and ``div`` (integer floor division) build the
+# numerically identical int64 tensor in 0.034 / 0.041 ms -- 270x cheaper, all
+# cores.  Measured end to end on the 18-layer testbed, 3 interleaved rounds each
+# (min-of-run step time, order rotated): legacy 2.049 / 2.057 / 2.065 s vs
+# expand 2.016 / 2.016 / 2.026 s, i.e. -1.6% step time and +2.4% throughput.
+# The gap between the kernel's 0.33 s and the 0.04 s actually recovered is the
+# usual one: a device kernel span is not the same as recoverable step time, and
+# the eager kernel spent ~half of its span overlapped with communication.
+_SOURCE_INDEX_MODES = ("legacy", "expand", "div")
+_SOURCE_INDEX_MODE = os.environ.get("HP_EP_SOURCE_INDEX", "expand").lower()
+
 
 def _argsort_keys(keys: torch.Tensor, *, bound: int) -> torch.Tensor:
     """Sort non-negative integer keys, on AICore when the range allows.
@@ -267,6 +285,45 @@ def bind_local_expert_forward(
     _install_bound_forward(module.experts, _local_swiglu_expert_forward)
 
 
+def _routed_slot_token_ids(token_count: int, experts_per_token: int, device: Any) -> torch.Tensor:
+    """Return the source token of every routed slot, as an index tensor.
+
+    ``arange(token_count).repeat_interleave(experts_per_token)`` and both fast
+    paths produce the same int64 tensor: slot ``token * K + i`` holds ``token``.
+
+    Args:
+        token_count: Number of local tokens ``T`` in this dispatch.
+        experts_per_token: Routed experts per token ``K``.
+        device: Device to build the tensor on.
+
+    Returns:
+        Contiguous int64 tensor of shape ``[T * K]``.
+
+    Raises:
+        ValueError: If ``HP_EP_SOURCE_INDEX`` names an unknown mode.
+    """
+    mode = _SOURCE_INDEX_MODE
+    if mode not in _SOURCE_INDEX_MODES:
+        raise ValueError(
+            f"HP_EP_SOURCE_INDEX must be one of {_SOURCE_INDEX_MODES}, but got {mode!r}"
+        )
+    if mode == "expand" and experts_per_token > 0:
+        # ``reshape`` may hand back a stride-0 view when the token dim is 1, so
+        # materialize: the callers index with the result and expect a flat buffer.
+        return (
+            torch.arange(token_count, device=device)
+            .unsqueeze(1)
+            .expand(token_count, experts_per_token)
+            .reshape(-1)
+            .contiguous()
+        )
+    if mode == "div" and experts_per_token > 0:
+        return torch.arange(token_count * experts_per_token, device=device).div(
+            experts_per_token, rounding_mode="floor"
+        )
+    return torch.arange(token_count, device=device).repeat_interleave(experts_per_token)
+
+
 def _prepare_ep_dispatch(
     hidden_states: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -283,7 +340,7 @@ def _prepare_ep_dispatch(
     experts_per_token = topk_indices.shape[1]
     expert_indices = topk_indices.reshape(-1)
     expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
-    source_indices = torch.arange(token_count, device=flattened_states.device).repeat_interleave(experts_per_token)
+    source_indices = _routed_slot_token_ids(token_count, experts_per_token, flattened_states.device)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = _argsort_keys(
         destination_ranks * global_expert_count + expert_indices,
