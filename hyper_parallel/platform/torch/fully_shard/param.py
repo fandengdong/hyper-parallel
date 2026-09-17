@@ -68,6 +68,16 @@ _OFFLOAD_ASYNC_H2D = os.environ.get("HP_OFFLOAD_ASYNC_H2D", "0") == "1"
 # stay unpinned; 0 pins everything (the historical behaviour).
 _OFFLOAD_PIN_MIN_BYTES = int(os.environ.get("HP_OFFLOAD_PIN_MIN_BYTES", "0"))
 
+# ``to_sharded_dtensor`` rebuilds the Layout and deep-copies it to set the tensor
+# meta on every call, which is pure waste when the parameter already owns the
+# identical Layout (``_sharding_spec``). That path measured 488 us per gradient
+# and runs 713 times per step on the 18-layer testbed: 348 ms of host time -- the
+# single largest item in the step, with the device idle throughout, because the
+# value is built inside the root-backward drain. Handing the cached layout over
+# directly removed 14.8% of the step time (2.056 -> 1.751 s, 3 interleaved
+# rounds, bit-identical losses). HP_GRAD_FAST_DTENSOR=0 restores the old path.
+_FAST_SHARDED_DTENSOR = os.environ.get("HP_GRAD_FAST_DTENSOR", "1") == "1"
+
 
 def _should_pin_tensor(tensor: torch.Tensor) -> bool:
     """Whether this tensor is large enough to justify pinned host memory."""
@@ -897,15 +907,20 @@ class TorchHSDPParamV2(HSDPParamV2):
         Converts a local tensor representing either the sharded parameter or
         sharded gradient to DTensor.
         """
+        spec = self._sharding_spec
+        if _FAST_SHARDED_DTENSOR:
+            # The spec *is* the layout the slow path would rebuild and then assign
+            # anyway, so hand it over directly (no _build_layout, no deepcopy).
+            return DTensor.from_local_with_layout(tensor, spec, shape=spec.tensor_shape)
         sharded_dtensor = DTensor.from_local(
             tensor,
-            self._sharding_spec.mesh,
-            self._sharding_spec.placements,
-            shape=self._sharding_spec.tensor_shape,
-            stride=self._sharding_spec.tensor_stride,
+            spec.mesh,
+            spec.placements,
+            shape=spec.tensor_shape,
+            stride=spec.tensor_stride,
         )
-        sharded_dtensor._layout = self._sharding_spec
-        sharded_dtensor._placements = tuple(self._sharding_spec.placements)
+        sharded_dtensor._layout = spec
+        sharded_dtensor._placements = tuple(spec.placements)
         return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:

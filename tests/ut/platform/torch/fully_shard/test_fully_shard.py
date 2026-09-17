@@ -120,15 +120,21 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             cast_forward_inputs=True
         )
 
-    def _create_mock_dtensor(self, mock_dtensor_from_local, sharded_param_data):
-        """Create a mock DTensor instance with common settings."""
+    def _create_mock_dtensor(self, mock_dtensor_from_local, sharded_param_data, *other_constructors):
+        """Create a mock DTensor instance with common settings.
+
+        ``to_sharded_dtensor`` can build the DTensor through either
+        ``DTensor.from_local`` or the cached-layout ``from_local_with_layout``, so
+        every patched constructor is wired to the same instance.
+        """
         mock_dtensor_instance = MagicMock(spec=DTensor)
         mock_dtensor_instance._local_tensor = self.sharded_param_data
         mock_dtensor_instance.untyped_storage.return_value = sharded_param_data.untyped_storage()
         mock_dtensor_instance.detach.return_value = mock_dtensor_instance
         mock_dtensor_instance.requires_grad_.return_value = mock_dtensor_instance
         mock_dtensor_instance.requires_grad = False
-        mock_dtensor_from_local.return_value = mock_dtensor_instance
+        for constructor in (mock_dtensor_from_local, *other_constructors):
+            constructor.return_value = mock_dtensor_instance
 
         return mock_dtensor_instance
 
@@ -407,6 +413,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             self.assertIs(param_v2.all_reduce_comm_ctx.all_reduce_handle, mock_handle)
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
+    @patch.object(DTensor, "from_local_with_layout")
     @patch.object(DTensor, "from_local")
     @patch.object(TorchHSDPParamV2, "_update_shardedparam_storage_forcely")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
@@ -415,6 +422,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         mock_layout,
         mock_update_storage,
         mock_dtensor_from_local,
+        mock_dtensor_from_local_with_layout,
         mock_sharded_local_tensor,
     ):
         """Test resetting sharded parameters.
@@ -429,7 +437,11 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_sharded_local_tensor: Mock for _sharded_local_tensor method
         """
         sharded_param_data = self.sharded_param_data
-        mock_dtensor_instance = self._create_mock_dtensor(mock_dtensor_from_local, sharded_param_data)
+        mock_dtensor_instance = self._create_mock_dtensor(
+            mock_dtensor_from_local,
+            sharded_param_data,
+            mock_dtensor_from_local_with_layout,
+        )
 
         # Create parameter
         param_v2 = self._create_param_v2()

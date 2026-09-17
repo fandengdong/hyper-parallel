@@ -739,5 +739,69 @@ class TestParameterHookMigrator(unittest.TestCase):
         self.assertTrue(frozen_param.migrate_backward_hooks_run_once)
 
 
+class TestShardedDtensorConstruction(unittest.TestCase):
+    """``to_sharded_dtensor`` must build the same DTensor on both paths.
+
+    ``HP_GRAD_FAST_DTENSOR=1`` hands the parameter's cached layout to
+    ``DTensor.from_local_with_layout`` instead of letting ``from_local`` rebuild
+    (and deep-copy) that same layout on every call. The two constructions must
+    stay indistinguishable: same placements, global shape, layout identity, and
+    a local view that still aliases the caller's tensor.
+    """
+
+    @staticmethod
+    def _sharded_param():
+        """Build a real CPU HSDP param sharded two ways along dim 0."""
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.arange(24, dtype=torch.float32).view(6, 4))
+        module_info = ParamModuleInfo(module, "weight", [], [])
+        mesh_info = object.__new__(FSDPMeshInfo)
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
+            mesh_info.mesh = DeviceMesh(
+                "cpu",
+                [0, 1],
+                mesh_dim_names=("fsdp",),
+                _init_backend=False,
+            )
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        mesh_info.shard_mesh_rank = 0
+        mesh_info.shard_mesh_size = 2
+        mesh_info.shard_process_group = None
+        return TorchHSDPParamV2(
+            module.weight,
+            module_info,
+            mesh_info,
+            mp_policy=MixedPrecisionPolicy(),
+            device=torch.device("cpu"),
+        )
+
+    def test_cached_layout_path_matches_the_rebuilding_path(self):
+        """Both paths must agree on placements, global shape and local aliasing."""
+        hsdp_param = self._sharded_param()
+        local = torch.arange(12, dtype=torch.float32).view(3, 4)
+        with patch("hyper_parallel.platform.torch.fully_shard.param._FAST_SHARDED_DTENSOR", False):
+            rebuilt = hsdp_param.to_sharded_dtensor(local)
+        with patch("hyper_parallel.platform.torch.fully_shard.param._FAST_SHARDED_DTENSOR", True):
+            cached = hsdp_param.to_sharded_dtensor(local)
+
+        self.assertEqual(tuple(cached.placements), tuple(rebuilt.placements))
+        self.assertEqual(cached.shape, rebuilt.shape)
+        self.assertIs(cached.device_mesh, rebuilt.device_mesh)
+        self.assertIs(cached._layout, hsdp_param._sharding_spec)
+        self.assertIs(rebuilt._layout, hsdp_param._sharding_spec)
+        torch.testing.assert_close(cached.to_local(), rebuilt.to_local())
+        self.assertEqual(cached.to_local().data_ptr(), local.data_ptr())
+
+    def test_cached_layout_path_keeps_the_global_shape_for_a_full_shard(self):
+        """The fast path still reports the unsharded shape as the global shape."""
+        hsdp_param = self._sharded_param()
+        local = torch.arange(12, dtype=torch.float32).view(3, 4)
+        with patch("hyper_parallel.platform.torch.fully_shard.param._FAST_SHARDED_DTENSOR", True):
+            cached = hsdp_param.to_sharded_dtensor(local)
+        self.assertEqual(cached.shape, torch.Size((6, 4)))
+        self.assertEqual(cached.to_local().shape, torch.Size((3, 4)))
+
+
 if __name__ == "__main__":
     unittest.main()
