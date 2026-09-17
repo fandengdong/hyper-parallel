@@ -69,7 +69,17 @@ class VLMBatchProcessor:
 
 
 class VLMGetBatch:
-    """Prepare VLM batches for the temporary TP=CP=PP=1 training path."""
+    """Prepare VLM batches for the temporary TP=PP=1 training path.
+
+    Context parallelism is supported with the "replicated vision, sharded
+    text" split: the media fields (``input_ids``/``attention_mask``/
+    ``pixel_values``/``image_grid_thw``) stay complete on every CP rank so the
+    vision tower and the full-sequence media scatter stay consistent, while the
+    loss targets (``labels``/``loss_mask``) are sliced to this rank's sequence
+    window to match the text tower's sharded output. The matching input slice
+    and offset mask are installed by
+    ``models/kimi_k25/adapter/distributed/context_parallel.py``.
+    """
 
     def __init__(self, *, mesh_context: Any, device: Any, pp_shared_data: bool = False) -> None:
         """Validate the temporary VLM parallel boundary and store the device.
@@ -80,22 +90,44 @@ class VLMGetBatch:
             pp_shared_data: Whether pipeline stages share the source batch.
 
         Raises:
-            NotImplementedError: If model parallelism or pipeline batch sharing is enabled.
+            NotImplementedError: If pipeline parallelism or pipeline batch sharing is enabled.
         """
-        parallel_sizes = {
-            "cp_size": int(getattr(mesh_context, "cp_size", 1)),
-            "pp_size": int(getattr(mesh_context, "pp_size", 1)),
-        }
-        unsupported_sizes = {name: size for name, size in parallel_sizes.items() if size != 1}
-        if unsupported_sizes:
+        self.cp_size = int(getattr(mesh_context, "cp_size", 1))
+        self.cp_rank = int(getattr(mesh_context, "cp_rank", 0))
+        pp_size = int(getattr(mesh_context, "pp_size", 1))
+        if pp_size != 1:
             raise NotImplementedError(
-                "The temporary VLM batch path requires CP=PP=1, but got "
-                + ", ".join(f"{name}={size}" for name, size in unsupported_sizes.items())
+                "The temporary VLM batch path requires PP=1, but got "
+                f"pp_size={pp_size}"
             )
         if pp_shared_data:
             raise NotImplementedError("The temporary VLM batch path does not support pp_shared_data")
         self.device = device
         self.processor = VLMBatchProcessor()
+
+    def _shard_targets_for_cp(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Slice loss targets to this CP rank's sequence window."""
+        if self.cp_size <= 1:
+            return batch
+        labels = batch.get("labels")
+        if labels is None:
+            return batch
+        seq_len = labels.shape[-1]
+        if seq_len % self.cp_size:
+            raise ValueError(
+                "VLM CP labels require a sequence length divisible by cp_size: "
+                f"seq_len={seq_len}, cp_size={self.cp_size} "
+                "(the collator pads to data_transform.max_seq_len)"
+            )
+        local_len = seq_len // self.cp_size
+        start = self.cp_rank * local_len
+        window = slice(start, start + local_len)
+        batch["labels"] = labels[..., window]
+        for field in ("loss_mask", "stream_loss_mask"):
+            value = batch.get(field)
+            if torch.is_tensor(value) and value.shape[-1] == seq_len:
+                batch[field] = value[..., window]
+        return batch
 
     def __call__(
             self,
@@ -116,6 +148,7 @@ class VLMGetBatch:
         if not isinstance(source_batch, Mapping):
             raise ValueError("VLM DataLoader must yield a mapping batch")
         normalized_batch = self.processor.normalize_source_batch(source_batch)
+        normalized_batch = self._shard_targets_for_cp(normalized_batch)
         device_batch = {
             field: value.to(self.device, non_blocking=True)
             if torch.is_tensor(value) else value
