@@ -78,15 +78,38 @@ class VLMDataset(Dataset):
 class _TransformDataset(Dataset):
     """Apply one Trainer-built transform after source-specific IO.
 
-    Records whose assistant turn was truncated away (all labels masked) are
-    filtered out up front, so each index maps to exactly one valid sample
-    without silently replacing or duplicating records.
+    With ``filter_trainable`` (the default) records whose assistant turn was
+    truncated away (all labels masked) are dropped up front, so each index maps
+    to exactly one sample that carries a non-trivial loss. That filter has to
+    run the full transform on every record during construction, which for
+    media-heavy data is very expensive (it is a pre-training cost paid per
+    rank) -- and for a throughput run it is unwanted, because a record that
+    happens to have no trainable label is still perfectly valid work.
+
+    Turning it off keeps every record and transforms lazily on access, so
+    construction is O(1) instead of O(dataset). A kept record with no trainable
+    label simply contributes nothing to the loss.
     """
 
-    def __init__(self, source: Dataset, transform: Optional[SampleTransform]) -> None:
-        """Build the index of trainable samples from the source dataset."""
+    def __init__(self, source: Dataset, transform: Optional[SampleTransform],
+                 filter_trainable: bool = True) -> None:
+        """Build the index of samples, transforming the source once if filtering.
+
+        Args:
+            source: Underlying record dataset.
+            transform: Per-record transform applied on access.
+            filter_trainable: Drop records whose labels are all ``IGNORE_INDEX``.
+                Requires transforming every record up front; disable to keep
+                every record and pay the transform only on access.
+        """
         self.source = source
         self.transform = transform
+        self.filter_trainable = filter_trainable
+        if not filter_trainable:
+            self.indices = list(range(len(source)))
+            if not self.indices:
+                raise ValueError("VLM dataset is empty")
+            return
         self.indices = []
         for index, record in enumerate(source):
             sample = transform(record) if transform is not None else record
@@ -94,7 +117,11 @@ class _TransformDataset(Dataset):
             if labels is None or self._has_trainable(labels):
                 self.indices.append(index)
         if not self.indices:
-            raise ValueError("VLM dataset contains no samples with trainable labels")
+            raise ValueError(
+                "VLM dataset contains no samples with trainable labels after "
+                "truncation; raise data_transform.max_seq_len so the assistant "
+                "turn survives, or set filter_trainable=false to keep every record"
+            )
 
     @staticmethod
     def _has_trainable(labels: Any) -> bool:
@@ -120,6 +147,7 @@ def build_vlm_dataset(
         tokenizer: Any = None,
         mesh_context: Any = None,
         training_config: Any = None,
+        filter_trainable: bool = True,
         **dataset_options: Any,
 ) -> Any:
     """Build a transform-wrapped VLM dataset from an online source.
@@ -131,6 +159,10 @@ def build_vlm_dataset(
         tokenizer: Tokenizer (accepted for the shared Trainer contract).
         mesh_context: Mesh context (accepted for the shared Trainer contract).
         training_config: Training plan (accepted for the shared Trainer contract).
+        filter_trainable: Drop records whose labels end up all ``IGNORE_INDEX``
+            (assistant turn truncated away). Requires transforming the whole
+            source during construction; set ``false`` for throughput runs to
+            keep every record and transform lazily.
         **dataset_options: Reserved source-specific options.
 
     Returns:
@@ -144,7 +176,8 @@ def build_vlm_dataset(
         raise ValueError(f"Unsupported VLM source type: {data_config.get('source_type')!r}")
     if data_path is None:
         raise ValueError("online VLM dataset requires data_path")
-    return _TransformDataset(VLMDataset(data_path), transform)
+    return _TransformDataset(VLMDataset(data_path), transform,
+                             filter_trainable=filter_trainable)
 
 
 __all__ = ["VLMDataset", "build_vlm_dataset"]
