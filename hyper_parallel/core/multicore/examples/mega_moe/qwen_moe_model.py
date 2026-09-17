@@ -31,15 +31,16 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.auto_models.components.models.qwen3_moe_attention_common import (
-    run_qwen3_moe_flash_attention,
-)
-from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.models.modules import (
+from qwen_moe_layers import (
     RMSNorm,
     RotaryEmbedding,
     SwiGLUMLP,
     apply_rotary_pos_emb,
+)
+
+from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_parallel.models.qwen3_moe.adapter.attention import (
+    run_qwen3_moe_flash_attention,
 )
 
 
