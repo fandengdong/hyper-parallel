@@ -331,8 +331,16 @@ class TestActivationCheckpointSwapInputs(unittest.TestCase):
 
                 swap_manager.set_forward_prefetch_layer.assert_has_calls(
                     [
-                        call(model.text_tower.decoder["2"], model.text_tower.decoder["7"]),
-                        call(model.image_tower.decoder["2"], model.image_tower.decoder["7"]),
+                        call(
+                            model.text_tower.decoder["2"],
+                            model.text_tower.decoder["7"],
+                            tensor_backward_hooks=True,
+                        ),
+                        call(
+                            model.image_tower.decoder["2"],
+                            model.image_tower.decoder["7"],
+                            tensor_backward_hooks=True,
+                        ),
                     ]
                 )
                 self.assertEqual(swap_manager.set_forward_prefetch_layer.call_count, 2)
@@ -360,7 +368,11 @@ class TestActivationCheckpointSwapInputs(unittest.TestCase):
         first_block = model.decoder["2"]
         second_block = model.decoder["7"]
         expected_calls = [
-            call(getattr(first_block, attr_name), getattr(second_block, attr_name))
+            call(
+                getattr(first_block, attr_name),
+                getattr(second_block, attr_name),
+                tensor_backward_hooks=True,
+            )
             for attr_name in (
                 "mlp",
                 "input_layernorm",

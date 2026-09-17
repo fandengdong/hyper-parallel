@@ -927,6 +927,61 @@ class TestSwapGroup(unittest.TestCase):
     def tearDown(self):
         self._plat_patcher.stop()
 
+    def test_sync_copy_full_cycle_without_events(self):
+        """Sync-copy mode runs the whole offload/load cycle with no event object."""
+        import hyper_parallel.core.activation_checkpoint.swap as swap_module
+
+        big = torch.empty(10, dtype=torch.float32, device="meta")
+        t = big[:5]
+        st = SwapTensor(t, "f")
+        cpu_buf = torch.empty(5)
+        cpu_buf.copy_ = MagicMock()
+        self.mock_plat.empty_like = MagicMock(return_value=cpu_buf)
+        s = Storage()
+        s["k"].append(st)
+        sg = SwapGroup("sync_group")
+        sg.add(s)
+
+        with patch.object(swap_module, "_SWAP_SYNC_COPY", True):
+            sg.launch_offload(MagicMock())
+            self.assertIsNone(sg._offload_event)
+            self.assertEqual(st._state, SwapTensor.STATE_D2H)
+            sg.wait_offload()
+            self.assertEqual(st._state, SwapTensor.STATE_HOST)
+
+            st.val_cpu = cpu_buf
+            sg.launch_load(MagicMock())
+            self.assertTrue(sg._sync_load_launched)
+            self.assertIsNone(sg._load_event)
+            sg.wait_load()
+            self.assertFalse(sg._sync_load_launched)
+            self.assertEqual(sg._storages, [])
+
+    def test_sync_launch_load_idempotent(self):
+        """Sync-copy launch_load self-heals once per backward, like the evented path."""
+        import hyper_parallel.core.activation_checkpoint.swap as swap_module
+
+        big = torch.empty(10, dtype=torch.float32, device="meta")
+        t = big[:5]
+        st = SwapTensor(t, "f")
+        st._state = SwapTensor.STATE_HOST
+        st.val_cpu = torch.empty(5)
+        s = Storage()
+        s["k"].append(st)
+        sg = SwapGroup("sync_group_2")
+        sg.add(s)
+
+        with patch.object(swap_module, "_SWAP_SYNC_COPY", True):
+            sg.launch_load(MagicMock())
+            self.assertTrue(sg._sync_load_launched)
+            sg.launch_load(MagicMock())
+            self.assertTrue(sg._sync_load_launched)
+            sg.wait_load()
+            self.assertFalse(sg._sync_load_launched)
+            # Nothing on host any more: a further launch is a no-op.
+            sg.launch_load(MagicMock())
+            self.assertFalse(sg._sync_load_launched)
+
     def test_init(self):
         """Test SwapGroup initialization."""
         sg = SwapGroup("test_group")
@@ -1121,17 +1176,51 @@ class TestSwapGroup(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sg._collect_packable_tensors()
 
-    def test_wait_offload_before_launch_raises(self):
-        """Test wait_offload raises if called before launch_offload."""
+    def test_wait_offload_before_launch_is_noop(self):
+        """wait_offload on a group with nothing in flight must not raise."""
         sg = SwapGroup("test_group")
-        with self.assertRaises(RuntimeError):
-            sg.wait_offload()
+        sg.wait_offload()
+        self.assertIsNone(sg._offload_event)
 
-    def test_wait_load_before_launch_raises(self):
-        """Test wait_load raises if called before launch_load."""
+    def test_wait_load_before_launch_is_noop(self):
+        """wait_load with no load in flight must not raise.
+
+        Backward hooks fire in autograd engine order, not reverse module order,
+        so a partner hook may not have launched the group's load; waiting on
+        nothing is a no-op (and mirrors wait_offload's skipped-block case).
+        """
         sg = SwapGroup("test_group")
-        with self.assertRaises(RuntimeError):
-            sg.wait_load()
+        sg.wait_load()
+        self.assertIsNone(sg._load_event)
+
+    def test_launch_load_is_idempotent_and_skips_when_nothing_on_host(self):
+        """launch_load self-heals out-of-order backward hooks.
+
+        With a host-resident tensor the first call launches and records an
+        event, a second call (the partner prefetch arriving late) is a no-op;
+        with only device-resident tensors nothing is launched at all.
+        """
+        sg = SwapGroup("test_group")
+        host_tensor = SwapTensor(torch.empty(16, dtype=torch.float32, device="meta"), "host_t")
+        host_tensor._state = SwapTensor.STATE_HOST
+        host_tensor.val_cpu = torch.empty(16)
+        storage = Storage()
+        storage["k"].append(host_tensor)
+        sg.add(storage)
+
+        sg.launch_load(MagicMock())
+        self.assertIsNotNone(sg._load_event)
+        first_event = sg._load_event
+        sg.launch_load(MagicMock())
+        self.assertIs(sg._load_event, first_event)
+
+        sg2 = SwapGroup("test_group_2")
+        device_tensor = SwapTensor(torch.empty(16, dtype=torch.float32, device="meta"), "dev_t")
+        storage2 = Storage()
+        storage2["k"].append(device_tensor)
+        sg2.add(storage2)
+        sg2.launch_load(MagicMock())
+        self.assertIsNone(sg2._load_event)
 
     def test_launch_offload_and_wait_offload_full_cycle(self):
         """Test full offload cycle: launch → wait."""
@@ -1771,6 +1860,60 @@ class TestSwapManager(unittest.TestCase):
         hook_fn(layer1, None, None)
         self.assertEqual(layer1._swap_state, "backward")
 
+    def test_tensor_backward_hooks_mode_skips_module_hooks(self):
+        """tensor_backward_hooks=True must not register module-level backward hooks."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2, tensor_backward_hooks=True)
+
+        for layer in (layer1, layer2):
+            self.assertFalse(layer._backward_pre_hooks)
+            self.assertFalse(layer._backward_hooks)
+            self.assertTrue(hasattr(layer, "_swap_tensor_bwd_install_handle"))
+            self.assertTrue(hasattr(layer, "_swap_forward_pre_hook_handle"))
+            self.assertTrue(hasattr(layer, "_swap_forward_hook_handle"))
+
+    def test_tensor_backward_hooks_fire_on_real_backward(self):
+        """Tensor-level hooks drive the same load protocol through a real backward."""
+        class _Layer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+            def forward(self, x):
+                return self.linear(x)
+
+        layer1 = _Layer()
+        layer2 = _Layer()
+        mgr = SwapManager()
+        mgr.set_forward_prefetch_layer(layer1, layer2, tensor_backward_hooks=True)
+
+        x = torch.randn(2, 4, requires_grad=True)
+        with patch.object(mgr, "launch_load") as mock_launch, \
+             patch.object(mgr, "wait_load") as mock_wait, \
+             patch.object(mgr, "release_group_storage") as mock_release:
+            loss = layer2(layer1(x)).sum()
+            loss.backward()
+
+        self.assertEqual(layer1._swap_state, "backward")
+        self.assertEqual(layer2._swap_state, "backward")
+        # layer2's pre-hook prefetches layer1's group; layer1's pre-hook
+        # self-launches its own group before waiting on it.
+        launch_groups = {call.args[0] for call in mock_launch.call_args_list}
+        self.assertIn(layer1._swap_group_name, launch_groups)
+        wait_groups = {call.args[0] for call in mock_wait.call_args_list}
+        self.assertIn(layer1._swap_group_name, wait_groups)
+        release_groups = {call.args[0] for call in mock_release.call_args_list}
+        self.assertEqual(release_groups, {layer1._swap_group_name, layer2._swap_group_name})
+
+
     def test_forward_pre_hook_skip_when_pre_backward(self):
         """Test _forward_pre_hook skips when module is in pre_backward state."""
         class _Layer(torch.nn.Module):
@@ -1790,6 +1933,40 @@ class TestSwapManager(unittest.TestCase):
         with patch.object(mgr, "set_current_group_name") as mock_set:
             hook_fn(layer1, None)
             mock_set.assert_not_called()
+
+    def test_shared_storage_claimants_stay_on_device(self):
+        """A tensor claimed by two groups must not be offloaded by either."""
+        shared = torch.empty(16, dtype=torch.float32, device="meta")
+        first = SwapTensor(shared, "shared_a")
+        second = SwapTensor(shared, "shared_b")
+        storage_a = Storage()
+        storage_a["k"].append(first)
+        storage_b = Storage()
+        storage_b["k"].append(second)
+
+        mgr = SwapManager()
+        mgr.add_storage("shared_group_a", storage_a)
+        mgr.add_storage("shared_group_b", storage_b)
+
+        self.assertTrue(first._keep_on_device)
+        self.assertTrue(second._keep_on_device)
+
+        mgr.release_group_storage("shared_group_a")
+        mgr.release_group_storage("shared_group_b")
+
+    def test_unshared_storage_stays_swappable(self):
+        """A tensor claimed by a single group keeps its offload eligibility."""
+        tensor = torch.empty(16, dtype=torch.float32, device="meta")
+        swap_tensor = SwapTensor(tensor, "single")
+        storage = Storage()
+        storage["k"].append(swap_tensor)
+
+        mgr = SwapManager()
+        mgr.add_storage("single_group", storage)
+
+        self.assertFalse(swap_tensor._keep_on_device)
+
+        mgr.release_group_storage("single_group")
 
 
 if __name__ == "__main__":

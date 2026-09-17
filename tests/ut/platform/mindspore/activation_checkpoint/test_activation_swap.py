@@ -14,11 +14,9 @@
 # ============================================================================
 """Unit tests for MindSpore activation swap platform implementation."""
 import contextlib
-import gc
 import importlib.util
 import os
 import unittest
-import weakref
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -209,14 +207,51 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertTrue(all("_ckpt_wrapped_module" not in name for name, _ in wrapper.parameters_and_names()))
 
 
+class TestNativeSaveOnCpu(unittest.TestCase):
+    """Unit tests for the mindspore NativeSaveOnCpu context."""
+
+    def test_pack_unpack_roundtrip_on_cpu_is_identity(self):
+        """On a CPU-only device the pack is a pass-through pair, unpack restores."""
+        from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import (
+            NativeSaveOnCpu,
+        )
+
+        ctx = NativeSaveOnCpu()
+        x = ms.Tensor(np.array([1.0, 2.0], np.float32))
+        with ctx:
+            (x * x).sum()
+
+    def test_device_tensor_packs_to_cpu_pair(self):
+        """An Ascend-labeled tensor is packed as (device, cpu_tensor) and restored."""
+        from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import (
+            NativeSaveOnCpu,
+        )
+
+        ctx = NativeSaveOnCpu()
+        x = MagicMock(spec=ms.Tensor)
+        x.device = "Ascend:0"
+        cpu_copy = ms.Tensor(np.array([1.0, 2.0], np.float32))
+        x.to.return_value = cpu_copy
+        packed = ctx.pack_hook(x)
+        self.assertEqual(packed, ("Ascend:0", cpu_copy))
+        restored = MagicMock(spec=ms.Tensor)
+        cpu_copy.to = MagicMock(return_value=restored)
+        out = ctx.unpack_hook(packed)
+        cpu_copy.to.assert_called_once_with("Ascend:0")
+        self.assertIs(out, restored)
+
+
 class TestAsyncSaveOnCpu(unittest.TestCase):
     """Unit tests for AsyncSaveOnCpu."""
 
-    def test_packed_tensor_does_not_retain_original_after_storage_clear(self):
-        """Clearing swap storage should release the original while keeping packed data valid."""
+    def test_pack_returns_original_tensor_and_registers_detached_alias(self):
+        """pack must return the original tensor so input gradients reach upstream.
+
+        See the torch counterpart: only the SwapTensor borrows a detached alias
+        (same storage) for offload bookkeeping.
+        """
         expected = np.array([1.0, 2.0], np.float32)
         original = ms.Tensor(expected)
-        original_ref = weakref.ref(original)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
 
@@ -224,16 +259,14 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
             packed = saved_tensors.pack_hook(original)
 
-        self.assertIsNot(packed, original)
-        self.assertIs(saved_tensors.storage[0][0].val, packed)
-        del original
+        self.assertIs(packed, original)
+        swap_val = saved_tensors.storage[0][0].val
+        self.assertIsNot(swap_val, original)
 
         unpacked = saved_tensors.unpack_hook(packed)
-        gc.collect()
 
         self.assertIsNone(saved_tensors.storage)
-        self.assertIsNone(original_ref())
-        self.assertIs(unpacked, packed)
+        self.assertIs(unpacked, original)
         np.testing.assert_array_equal(unpacked.asnumpy(), expected)
 
 

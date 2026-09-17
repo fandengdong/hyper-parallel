@@ -14,11 +14,9 @@
 # ============================================================================
 """Unit tests for PyTorch activation swap platform implementation."""
 import contextlib
-import gc
 import importlib.util
 import os
 import unittest
-import weakref
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -142,11 +140,15 @@ class TestSwapWrapper(unittest.TestCase):
 class TestAsyncSaveOnCpu(unittest.TestCase):
     """Unit tests for AsyncSaveOnCpu."""
 
-    def test_packed_tensor_does_not_retain_original_after_storage_clear(self):
-        """Clearing swap storage should release the original while keeping packed data valid."""
+    def test_pack_returns_original_tensor_and_registers_detached_alias(self):
+        """pack must return the original tensor so input gradients reach upstream.
+
+        The saved tensor is the recompute leaf; returning a detached alias would
+        trap input gradients on the alias.  Only the SwapTensor borrows a
+        detached alias (same storage) for offload bookkeeping.
+        """
         expected = torch.tensor([1.0, 2.0])
         original = expected.clone()
-        original_ref = weakref.ref(original)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
 
@@ -154,16 +156,17 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
             packed = saved_tensors.pack_hook(original)
 
-        self.assertIsNot(packed, original)
-        self.assertIs(saved_tensors.storage[0][0].val, packed)
-        del original
+        self.assertIs(packed, original)
+        swap_val = saved_tensors.storage[0][0].val
+        self.assertIsNot(swap_val, original)
+        self.assertEqual(
+            swap_val.untyped_storage()._cdata,
+            original.untyped_storage()._cdata,
+        )
 
         unpacked = saved_tensors.unpack_hook(packed)
-        gc.collect()
-
         self.assertIsNone(saved_tensors.storage)
-        self.assertIsNone(original_ref())
-        self.assertIs(unpacked, packed)
+        self.assertIs(unpacked, original)
         self.assertTrue(torch.equal(unpacked, expected))
 
     def test_invalid_policy_raises_when_tensor_is_saved(self):
@@ -185,6 +188,63 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_shared_input_across_groups_is_protected_on_device(self):
+        """A tensor packed under two groups must be keep-on-device for both.
+
+        Regression test: pack_to_cpu used to call add_storage() before the
+        SwapTensor was appended, so the manager claimed an empty storage and a
+        shared input (attention q/k/v) was resized to zero by a partner group.
+        """
+        manager = activation_swap.SwapManager()
+        x = torch.empty(4, device="meta")
+
+        with (
+            patch.object(activation_swap, "SwapManager", return_value=manager),
+            patch.object(activation_swap, "base_check_fn", return_value=True),
+        ):
+            manager.set_current_group_name("pack_group_a")
+            ctx_a = AsyncSaveOnCpu()
+            ctx_a.pack_hook(x)
+            manager.set_current_group_name("pack_group_b")
+            ctx_b = AsyncSaveOnCpu()
+            ctx_b.pack_hook(x)
+
+        st_a = ctx_a.storage[0][0]
+        st_b = ctx_b.storage[0][0]
+        self.assertTrue(st_a._keep_on_device)
+        self.assertTrue(st_b._keep_on_device)
+
+        manager.release_group_storage("pack_group_a")
+        manager.release_group_storage("pack_group_b")
+        manager.set_current_group_name("")
+
+    def test_second_pack_in_same_context_is_claimed(self):
+        """Tensors appended after the first pack must still be claimed."""
+        manager = activation_swap.SwapManager()
+        x = torch.empty(4, device="meta")
+        y = torch.empty(4, device="meta")
+
+        with (
+            patch.object(activation_swap, "SwapManager", return_value=manager),
+            patch.object(activation_swap, "base_check_fn", return_value=True),
+        ):
+            manager.set_current_group_name("multi_pack_group_a")
+            ctx_a = AsyncSaveOnCpu()
+            ctx_a.pack_hook(x)
+            ctx_a.pack_hook(y)
+            manager.set_current_group_name("multi_pack_group_b")
+            ctx_b = AsyncSaveOnCpu()
+            ctx_b.pack_hook(y)
+
+        st_y = ctx_a.storage[1][0]
+        st_y_other = ctx_b.storage[0][0]
+        self.assertTrue(st_y._keep_on_device)
+        self.assertTrue(st_y_other._keep_on_device)
+
+        manager.release_group_storage("multi_pack_group_a")
+        manager.release_group_storage("multi_pack_group_b")
+        manager.set_current_group_name("")
 
 
 class TestSwapTensorWrapper(unittest.TestCase):

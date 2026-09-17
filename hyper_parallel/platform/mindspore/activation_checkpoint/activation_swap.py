@@ -341,6 +341,34 @@ def _normalize_device(device: str) -> str:
     return device
 
 
+class NativeSaveOnCpu(ms.saved_tensors_hooks):
+    """save_on_cpu context: saved tensors move to CPU during forward and back
+    to the original device at recompute.
+
+    The device original is released by normal refcount tracking instead of an
+    explicit ``storage.resize_(0)``, so no swap state machine is involved.
+    """
+
+    def __init__(self):
+        def pack_to_cpu(tensor):
+            if isinstance(tensor, ms.Tensor) and "Ascend" in _normalize_device(str(tensor.device)):
+                return (str(tensor.device), tensor.to("CPU"))
+            return tensor
+
+        def unpack_from_cpu(packed):
+            if (
+                isinstance(packed, tuple)
+                and len(packed) == 2
+                and isinstance(packed[0], str)
+                and isinstance(packed[1], ms.Tensor)
+            ):
+                device, tensor = packed
+                return tensor.to(device)
+            return packed
+
+        super().__init__(pack_to_cpu, unpack_from_cpu)
+
+
 class AsyncSaveOnCpu(ms.saved_tensors_hooks):
     """
     Context manager to offload tensors to CPU during forward pass.
@@ -359,26 +387,33 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
         swap_manager = SwapManager()
 
         def pack_to_cpu(tensor: ms.Tensor):
+            # See the torch implementation: every return path hands the
+            # *original* tensor to save_for_backward so input gradients reach
+            # upstream modules; only the SwapTensor borrows a detached alias.
             if not base_check_fn(tensor):
-                return tensor.detach()
+                return tensor
             if policy_fn is not None:
                 if policy_fn(tensor) == CheckpointPolicy.MUST_SAVE:
-                    return tensor.detach()
+                    return tensor
                 if policy_fn(tensor) != CheckpointPolicy.MUST_SWAP:
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
-                return tensor.detach()
+                return tensor
+            funcname = f"{group_name}::{tensor.shape}"
+            self.storage[self.count_idx].append(
+                SwapTensor(tensor.detach(), funcname, group_swap=group_swap)
+            )
+            self.count_idx += 1
+            # Register the storage only after it holds the new SwapTensor: the
+            # manager's shared-claim protection and dedup inspect the storage at
+            # add time, so adding it earlier would leave every tensor unclaimed.
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True
-            funcname = f"{group_name}::{tensor.shape}"
-            detached = tensor.detach()
-            self.storage[self.count_idx].append(
-                SwapTensor(detached, funcname, group_swap=group_swap)
-            )
-            self.count_idx += 1
-            return detached
+            else:
+                swap_manager.protect_shared_claims(group_name, self.storage)
+            return tensor
 
         def unpack_from_cpu(tensor) -> ms.Tensor:
             if self.storage is not None:

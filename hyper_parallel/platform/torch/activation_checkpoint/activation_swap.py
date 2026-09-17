@@ -199,26 +199,39 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
         swap_manager = SwapManager()
 
         def pack_to_cpu(tensor: torch.Tensor):
+            # Every return path hands the *original* tensor to save_for_backward:
+            # the saved tensor is the recompute leaf, and returning a detached
+            # alias would trap input gradients on the alias so upstream modules
+            # (and their FSDP post-backward/reduce) are never reached.  Only the
+            # SwapTensor borrows a detached alias for offload bookkeeping; the
+            # alias shares storage, so offload/resize/restore affect the saved
+            # tensor identically.
             if not base_check_fn(tensor):
-                return tensor.detach()
+                return tensor
             if policy_fn is not None:
                 if policy_fn(tensor) == CheckpointPolicy.MUST_SAVE:
-                    return tensor.detach()
+                    return tensor
                 if policy_fn(tensor) != CheckpointPolicy.MUST_SWAP:
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
-                return tensor.detach()
+                return tensor
+            funcname = f"{group_name}::{tensor.shape}"
+            self.storage[self.count_idx].append(
+                SwapTensor(tensor.detach(), funcname, group_swap=group_swap, cpu_pool=cpu_pool)
+            )
+            self.count_idx += 1
+            # Register the storage only after it holds the new SwapTensor: the
+            # manager's shared-claim protection and dedup inspect the storage at
+            # add time, so adding it earlier would leave every tensor unclaimed
+            # and a cross-group shared input (e.g. attention q/k/v) would be
+            # resized to zero by the first group's wait_offload.
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True
-            funcname = f"{group_name}::{tensor.shape}"
-            detached = tensor.detach()
-            self.storage[self.count_idx].append(
-                SwapTensor(detached, funcname, group_swap=group_swap, cpu_pool=cpu_pool)
-            )
-            self.count_idx += 1
-            return detached
+            else:
+                swap_manager.protect_shared_claims(group_name, self.storage)
+            return tensor
 
         def unpack_from_cpu(tensor) -> torch.Tensor:
             if self.storage is not None:

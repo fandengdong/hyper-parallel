@@ -523,7 +523,12 @@ def _register_forward_prefetch_layers(containers: list[_LayerContainerInfo]) -> 
 
         for wrappers in wrapper_chains.values():
             for current_wrapper, next_wrapper in zip(wrappers, wrappers[1:]):
-                swap_manager.set_forward_prefetch_layer(current_wrapper, next_wrapper)
+                # Tensor-level backward hooks: module-level full backward hooks
+                # wrap outputs in BackwardHookFunction, whose views conflict with
+                # FSDP's PostBackwardFunction in-place updates and corrupt grads.
+                swap_manager.set_forward_prefetch_layer(
+                    current_wrapper, next_wrapper, tensor_backward_hooks=True
+                )
 
 
 def _wrap_first_existing_attr(

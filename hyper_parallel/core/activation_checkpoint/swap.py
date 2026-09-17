@@ -16,6 +16,7 @@
 # pylint: disable=W0212
 
 import functools
+import os
 import threading
 import warnings
 
@@ -28,6 +29,17 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
+
+# Synchronous-copy mode: run every D2H/H2D on the current (compute) stream and
+# skip the side copy stream with its cross-stream event record/wait entirely.
+# On this platform the event machinery itself corrupts the backward pass (the
+# same multi-stream fragility family as HP_OFFLOAD_ASYNC_H2D's 5070 crash);
+# stream-ordered copies on the compute stream need no events at all.  The cost
+# is losing copy/compute overlap; boundary copies are small next to step time.
+_SWAP_SYNC_COPY = os.environ.get("HP_SWAP_SYNC_COPY", "0") == "1"
+# Debug bisect knob: run the full offload/load cycle but never shrink the
+# device storage (no memory is saved; isolates resize_(0) as a side effect).
+_SWAP_NO_RESIZE = os.environ.get("HP_SWAP_NO_RESIZE", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # Module-level buffer pools — process-local, no locking needed for single-
@@ -190,11 +202,15 @@ class SwapTensor:
 
         if self.val_cpu is None:
             raise ValueError("val_cpu must not be None during async_load")
+        # Sync-copy mode blocks the host until the copy completes: the pinned
+        # source buffer is dropped right after this call, and an in-flight copy
+        # reading a freed host buffer would restore garbage.
+        blocking = _SWAP_SYNC_COPY
         with platform.preserve_version_counter(self.val):
             if self.cpu_pool is not None or self.is_slice_tensor:
-                self.val.data.copy_(self.val_cpu, non_blocking=True)
+                self.val.data.copy_(self.val_cpu, non_blocking=not blocking)
             else:
-                self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=True)
+                self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=not blocking)
         self._state = self.STATE_H2D
 
     def async_group_load(self, source):
@@ -215,7 +231,7 @@ class SwapTensor:
                 f"expected size:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
             )
         with platform.preserve_version_counter(self.val):
-            self.val.copy_(source.reshape(self.val.shape), non_blocking=True)
+            self.val.copy_(source.reshape(self.val.shape), non_blocking=not _SWAP_SYNC_COPY)
         self._state = self.STATE_H2D
 
     def release_cpu_buffer(self, event=None):
@@ -284,10 +300,17 @@ class SwapTensor:
                     self.release_cpu_buffer()
                     raise
         try:
+            # Sync-copy mode blocks the host until the copy completes: the
+            # device storage is shrunk right after this in wait_offload, and
+            # freeing it while the copy is still in flight would corrupt the
+            # offloaded bytes (allocator reuse) — the restored tensor becomes
+            # garbage and gradients turn NaN.
             if self.cpu_pool is not None or self.is_slice_tensor:
-                self.val_cpu.copy_(self.val, non_blocking=True)
+                self.val_cpu.copy_(self.val, non_blocking=not _SWAP_SYNC_COPY)
             else:
-                self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+                self.val_cpu.untyped_storage().copy_(
+                    self.val.untyped_storage(), non_blocking=not _SWAP_SYNC_COPY
+                )
         except Exception:
             if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
                 release_event = platform.new_event()
@@ -311,7 +334,7 @@ class SwapTensor:
             )
             return
         storage = self.val.untyped_storage()
-        if storage.size() != 0:
+        if storage.size() != 0 and not _SWAP_NO_RESIZE:
             storage.resize_(0)
         self._state = self.STATE_HOST
 
@@ -319,6 +342,17 @@ class SwapTensor:
     def state(self) -> str:
         """Return the current swap state of this tensor (device, host, d2h, h2d, or non_tensor)."""
         return self._state
+
+    def protect_on_device(self) -> None:
+        """Keep this tensor on device for the rest of the current iteration.
+
+        Used when the same storage is claimed by more than one swap group: the
+        first claimant's offload shrinks the storage to zero, which would break
+        every other block that still reads the shared tensor (for example the
+        query/key/value projections of one attention module, which all consume
+        the same normalized input).
+        """
+        self._keep_on_device = True
 
     def __repr__(self):
         if self._state == self.STATE_NON_TENSOR:
@@ -478,6 +512,8 @@ class SwapGroup:
         self._storages: List[Storage] = []
         self._load_event: Optional[Any] = None
         self._offload_event: Optional[Any] = None
+        # Synchronous-copy mode marker replacing the load event for idempotency.
+        self._sync_load_launched: bool = False
         # Group-level contiguous buffers for non-slice tensors.
         self._packed_tensor_info: List = []   # [(SwapTensor, bucket_key, element_offset), ...]
         self._packed_buckets: Dict[str, Dict[str, Any]] = {}
@@ -623,7 +659,36 @@ class SwapGroup:
                 for bucket_key, swap_tensors in self._packed_by_bucket.items():
                     group_device_bufs[bucket_key] = platform.cat(
                         [st.val.reshape(-1) for st in swap_tensors], dim=0
-                    )
+                        )
+
+        if _SWAP_SYNC_COPY:
+            # Copies are stream-ordered on the compute stream; no side stream,
+            # no cross-stream events.  The group D2H is issued right here, and
+            # wait_offload only needs to shrink the storages afterwards.
+            with platform.no_grad():
+                if total_bytes > 0:
+                    for bucket_key, bucket in self._packed_buckets.items():
+                        dtype_key = bucket["dtype_key"]
+                        numel = bucket["total_numel"]
+                        cpu_pool = bucket["cpu_pool"]
+                        if cpu_pool is None:
+                            cpu_buf = _get_cpu_pinned_buf(dtype_key, numel, bucket["dtype"])
+                        else:
+                            raw_buf = cpu_pool.acquire(bucket["total_bytes"])
+                            try:
+                                cpu_buf = raw_buf.view(bucket["dtype"])
+                            except Exception:
+                                cpu_pool.release(raw_buf)
+                                raise
+                        group_cpu_bufs[bucket_key] = cpu_buf
+                        cpu_buf[:numel].copy_(
+                            group_device_bufs[bucket_key], non_blocking=not _SWAP_SYNC_COPY
+                        )
+                    self._group_device_buf = group_device_bufs
+                    self._group_cpu_buf = group_cpu_bufs
+                for storage in self._storages:
+                    storage.launch_offload()
+            return
 
         compute_event = platform.new_event()
         compute_event.record(platform.get_current_stream())
@@ -670,11 +735,24 @@ class SwapGroup:
             self._offload_event.record(copy_stream)
 
     def wait_offload(self):
-        """Wait for offload to complete for all storages in the group."""
+        """Wait for offload to complete for all storages in the group.
+
+        A prefetch chain can skip a block in a given forward pass (for example a
+        vision tower whose sample carries no image), in which case the partner
+        hook observes a group with nothing in flight. Waiting on nothing is a
+        no-op, not an error: the storages stay on device and their offload is
+        waited by the next hook that runs.
+        """
+        if _SWAP_SYNC_COPY:
+            # Copies already ran stream-ordered on this stream in launch_offload;
+            # shrinking the storages here is correctly ordered after them.
+            with platform.no_grad():
+                for storage in self._storages:
+                    storage.wait_offload()
+            self._group_device_buf = None
+            return
         if self._offload_event is None:
-            raise RuntimeError(
-                f"SwapGroup '{self.group_name}' wait_offload() called before launch_offload()."
-            )
+            return
         compute_stream = platform.get_current_stream()
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(compute_stream):
@@ -685,13 +763,63 @@ class SwapGroup:
         # Release the temporary device packing buffer; _group_cpu_buf persists until launch_load.
         self._group_device_buf = None
 
+    def _has_host_tensors(self) -> bool:
+        """Return whether any swap tensor in the group is currently on host."""
+        for storage in self._storages:
+            for swap_tensor in storage.iter_swap_tensors():
+                if swap_tensor.state == SwapTensor.STATE_HOST:
+                    return True
+        return False
+
     def launch_load(self, copy_stream):
         """Prepare storage and launch async load for all storages in the group.
 
         Non-slice tensors are loaded from pinned CPU memory into bounded
         contiguous device buffers, then copied device-to-device into their
         original storages.  Slice tensors use the existing per-tensor path.
+
+        The call is idempotent within one backward pass and a no-op when the
+        group holds no host-resident tensor.  Backward hooks fire in autograd
+        engine order, which is not the reverse of module order for branched
+        modules (attention q/k/v all read one input), so a group cannot rely on
+        a partner hook having launched its load first; every consumer launches
+        its own group before waiting on it.
         """
+        if _SWAP_SYNC_COPY:
+            if self._sync_load_launched or not self._has_host_tensors():
+                return
+            # Stream-ordered restore on the compute stream; no events needed.
+            with platform.no_grad():
+                for storage in self._storages:
+                    storage.resize_device_storage()
+                if self._packed_tensor_info and self._group_cpu_buf is not None:
+                    group_device_bufs = {}
+                    for bucket_key, bucket in self._packed_buckets.items():
+                        cpu_buf = self._group_cpu_buf.get(bucket_key)
+                        if cpu_buf is None:
+                            continue
+                        numel = bucket["total_numel"]
+                        group_device_bufs[bucket_key] = platform.alloc_tensor_buffer(
+                            numel, bucket["dtype"], bucket["device"]
+                        )
+                        group_device_bufs[bucket_key].copy_(
+                            cpu_buf[:numel], non_blocking=not _SWAP_SYNC_COPY
+                        )
+                    self._group_device_buf = group_device_bufs
+                    for st, bucket_key, element_offset in self._packed_tensor_info:
+                        group_device_buf = group_device_bufs.get(bucket_key)
+                        if group_device_buf is None:
+                            continue
+                        source = group_device_buf[element_offset:element_offset + st.val.numel()]
+                        st.async_group_load(source)
+                for storage in self._storages:
+                    storage.launch_load()    # Only copy, no resize
+            self._sync_load_launched = True
+            return
+        if self._load_event is not None:
+            return
+        if not self._has_host_tensors():
+            return
         # Restore original storages before scheduling copies. Keeping the same
         # storage object is required for autograd-saved views of packed tensors.
         with platform.no_grad():
@@ -747,11 +875,30 @@ class SwapGroup:
         self._group_cpu_buf = None
 
     def wait_load(self):
-        """Wait for grouped H2D and D2D loads to complete."""
+        """Wait for grouped H2D and D2D loads to complete.
+
+        A no-op when no load is in flight: backward hooks fire in autograd
+        engine order rather than reverse module order, so a partner hook may
+        not have launched this group's load, and a block whose tensors never
+        left the device has nothing to wait for.
+        """
+        if _SWAP_SYNC_COPY:
+            if not self._sync_load_launched:
+                return
+            with platform.no_grad():
+                for storage in self._storages:
+                    storage.wait_load(release_event=None)
+            self._sync_load_launched = False
+            self._storages.clear()
+            self.release_cpu_buffers(event=None)
+            self._group_device_buf = None
+            self._packed_tensor_info = []
+            self._packed_buckets = {}
+            self._packed_by_bucket = {}
+            self._seen_dedup_keys = set()
+            return
         if self._load_event is None:
-            raise RuntimeError(
-                f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
-            )
+            return
         compute_stream = platform.get_current_stream()
         load_event = self._load_event
         stream_context = platform.get_stream_context()
@@ -784,6 +931,7 @@ class SwapManager:
         "_swap_forward_hook_handle",
         "_swap_backward_pre_hook_handle",
         "_swap_backward_hook_handle",
+        "_swap_tensor_bwd_install_handle",
     )
 
     def __init__(self) -> None:
@@ -796,6 +944,8 @@ class SwapManager:
         )
         self._layer_count: int = 0
         self._copy_stream: Optional[Any] = None
+        self._claim_by_key: Dict[Any, "SwapTensor"] = {}
+        self._claims_by_group: Dict[str, Set[Any]] = {}
 
     def __new__(cls):
         if cls._instance is None:
@@ -807,7 +957,46 @@ class SwapManager:
     def add_storage(self, group_name: str, storage: Storage) -> None:
         """Add a storage to a specified swap group."""
         self.ensure_group(group_name)
+        self._protect_shared_claims(group_name, storage)
         self._groups[group_name].add(storage)
+
+    def protect_shared_claims(self, group_name: str, storage: Storage) -> None:
+        """Claim tensors appended to a storage that is already in a group.
+
+        ``AsyncSaveOnCpu.pack_to_cpu`` appends SwapTensors to its storage one
+        pack at a time; every newly appended tensor must still be claimed so a
+        storage shared with another group is protected before any partner
+        ``wait_offload`` can shrink it.
+        """
+        self._protect_shared_claims(group_name, storage)
+
+    def _protect_shared_claims(self, group_name: str, storage: Storage) -> None:
+        """Keep storages claimed by more than one group on device.
+
+        A checkpoint container may hand the same activation to several of its
+        blocks (an attention module feeds one input to its query, key and value
+        projections). Each block is its own swap group, so the first group's
+        offload would shrink that shared storage to zero while the later blocks
+        still read it. Marking every claimant keep-on-device leaves the shared
+        tensor where all of its consumers can read it; only that one tensor
+        loses its offload, the rest of each group still swaps.
+        """
+        incoming = {}
+        for swap_tensor in storage.iter_swap_tensors():
+            key = swap_tensor.dedup_key()
+            if key is not None:
+                incoming[key] = swap_tensor
+        if not incoming:
+            return
+
+        for key, swap_tensor in incoming.items():
+            owner = self._claim_by_key.get(key)
+            if owner is None:
+                self._claim_by_key[key] = swap_tensor
+                self._claims_by_group.setdefault(group_name, set()).add(key)
+            elif owner is not swap_tensor:
+                owner.protect_on_device()
+                swap_tensor.protect_on_device()
 
     def ensure_group(self, group_name: str) -> None:
         """Create the swap group if it does not exist yet."""
@@ -858,6 +1047,8 @@ class SwapManager:
         group = self._groups.get(group_name)
         if group is not None:
             group._storages.clear()
+        for key in self._claims_by_group.pop(group_name, ()):
+            self._claim_by_key.pop(key, None)
 
     def abort_group(self, group_name: str) -> None:
         """Synchronize in-flight transfers and remove a failed run's group."""
@@ -921,7 +1112,7 @@ class SwapManager:
             removed_count += 1
         return removed_count
 
-    def set_forward_prefetch_layer(self, first_layer, second_layer):
+    def set_forward_prefetch_layer(self, first_layer, second_layer, tensor_backward_hooks: bool = False):
         """
         Configure prefetching and offloading order between two consecutive layers.
 
@@ -930,6 +1121,16 @@ class SwapManager:
                 set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
         Ensures idempotency: safe to call multiple times on the same layer pair.
+
+        Args:
+            first_layer: The earlier layer in forward order.
+            second_layer: The next layer in forward order.
+            tensor_backward_hooks: When True, deliver the backward load protocol
+                through per-forward ``Tensor.register_hook`` calls instead of
+                module-level full backward hooks.  Module-level hooks wrap the
+                output in ``BackwardHookFunction``; the resulting view tensors
+                conflict with FSDP's ``PostBackwardFunction`` in-place updates,
+                corrupting gradients while leaving forward values intact.
         """
         if first_layer is second_layer:
             warnings.warn(
@@ -1055,11 +1256,70 @@ class SwapManager:
 
             next_name = module._swap_group_order.get('next', None)
             if next_name:
+                # Backward hooks fire in autograd engine order, which is not the
+                # reverse of module order for branched modules (attention q/k/v
+                # all consume one input), so the partner hook cannot be relied
+                # on to launch this group's load first.  Launch it here; the
+                # call is idempotent and degenerates to the prefetched case.
+                SwapManager().launch_load(group_name)
                 SwapManager().wait_load(group_name)
             SwapManager().release_group_storage(group_name)
 
         def _backward_hook(group_name, module, grad_input, grad_output):  # pylint: disable=W0613
             module._swap_state = "backward"
+
+        def _tensor_pre_backward_hook(group_name, module, grad):
+            """Pre-backward hook delivered on an output tensor's gradient.
+
+            Carries the same load protocol as ``_backward_pre_hook`` but fires
+            through ``Tensor.register_hook`` instead of a module-level full
+            backward hook, so the module output is never wrapped in
+            ``BackwardHookFunction`` (whose view tensors conflict with FSDP's
+            PostBackwardFunction in-place updates).
+            """
+            module._swap_state = "pre_backward"
+            prev_name = module._swap_group_order.get('prev', None)
+            if prev_name:
+                SwapManager().launch_load(prev_name)
+
+            next_name = module._swap_group_order.get('next', None)
+            if next_name:
+                SwapManager().launch_load(group_name)
+                SwapManager().wait_load(group_name)
+            SwapManager().release_group_storage(group_name)
+            return grad
+
+        def _tensor_post_backward_hook(group_name, module, grad):
+            """Post-backward hook delivered on an input tensor's gradient."""
+            module._swap_state = "backward"
+            return grad
+
+        def _first_grad_tensor(value):
+            """Return the first requires-grad tensor in a nested structure."""
+            found = []
+
+            def _collect(x):
+                if isinstance(x, platform.Tensor) and x.requires_grad and not found:
+                    found.append(x)
+                return x
+
+            platform.tree_map(_collect, value)
+            return found[0] if found else None
+
+        def _install_tensor_backward_hooks(group_name, module, args, output):
+            """Install per-forward tensor gradient hooks for the load protocol."""
+            if getattr(module, "_swap_state", None) == "pre_backward":
+                return
+            output_tensor = _first_grad_tensor(output)
+            if output_tensor is not None:
+                output_tensor.register_hook(
+                    functools.partial(_tensor_pre_backward_hook, group_name, module)
+                )
+            input_tensor = _first_grad_tensor(args)
+            if input_tensor is not None:
+                input_tensor.register_hook(
+                    functools.partial(_tensor_post_backward_hook, group_name, module)
+                )
 
         def _register_hooks_once(module, group_name):
             hooks = [
@@ -1070,15 +1330,23 @@ class SwapManager:
                 ("_swap_forward_hook_handle",
                  module.register_forward_hook,
                  functools.partial(_forward_hook, group_name)),
-
-                ("_swap_backward_pre_hook_handle",
-                 lambda h: platform.register_full_backward_pre_hook(module, h, prepend=True),
-                 functools.partial(_backward_pre_hook, group_name)),
-
-                ("_swap_backward_hook_handle",
-                 lambda h: platform.register_full_backward_hook(module, h),
-                 functools.partial(_backward_hook, group_name)),
             ]
+            if tensor_backward_hooks:
+                hooks.append(
+                    ("_swap_tensor_bwd_install_handle",
+                     module.register_forward_hook,
+                     functools.partial(_install_tensor_backward_hooks, group_name)),
+                )
+            else:
+                hooks.extend([
+                    ("_swap_backward_pre_hook_handle",
+                     lambda h: platform.register_full_backward_pre_hook(module, h, prepend=True),
+                     functools.partial(_backward_pre_hook, group_name)),
+
+                    ("_swap_backward_hook_handle",
+                     lambda h: platform.register_full_backward_hook(module, h),
+                     functools.partial(_backward_hook, group_name)),
+                ])
 
             for attr_name, register_func, hook in hooks:
                 if not hasattr(module, attr_name):
@@ -1090,6 +1358,10 @@ class SwapManager:
 
     def _get_copy_stream(self):
         """Return a singleton copy stream, created on first access."""
+        if _SWAP_SYNC_COPY:
+            # Sync-copy mode runs everything on the compute stream; the side
+            # stream (and its cross-stream events) is never created.
+            return platform.get_current_stream()
         if self._copy_stream is None:
             self._copy_stream = platform.new_stream()
         return self._copy_stream

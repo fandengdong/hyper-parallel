@@ -186,10 +186,13 @@ def checkpoint(
             composed_context_fn = _compose_context_fns(tuple(factories))
 
     if swap_inputs:
-        async_kwargs = {"group_swap": group_swap}
-        if cpu_pool is not None:
-            async_kwargs["cpu_pool"] = cpu_pool
-        context = partial(plat.async_save_on_cpu, **async_kwargs)
+        # Native save-on-cpu: the boundary input is moved to (pinned) CPU as the
+        # saved object and moved back at recompute; the device original is
+        # released by the allocator's normal refcount tracking.  The previous
+        # SwapManager/async path kept the device tensor and shrank its storage
+        # with resize_(0), which deterministically corrupts the backward pass on
+        # this platform (all parameter grads become NaN).
+        context = partial(plat.native_save_on_cpu)
     else:
         context = contextlib.nullcontext
     with context():

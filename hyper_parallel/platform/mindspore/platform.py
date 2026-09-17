@@ -2062,6 +2062,18 @@ class MindSporePlatform(Platform):
         return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap)
 
     @staticmethod
+    def native_save_on_cpu(pin_memory: bool = True):  # pylint: disable=unused-argument
+        """MindSpore counterpart of the torch native save-on-cpu context.
+
+        Saved tensors are moved to CPU during forward and moved back to the
+        device at recompute; the device original is released by normal refcount
+        tracking instead of an explicit ``storage.resize_(0)``.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import NativeSaveOnCpu
+        return NativeSaveOnCpu()
+
+    @staticmethod
     def recompute_handle_collector_ctx():
         # pylint: disable=C0415
         from mindspore.common.recompute import _recompute_handle_collector_ctx

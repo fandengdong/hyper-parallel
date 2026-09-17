@@ -103,10 +103,10 @@ class TestCheckpointFunction(unittest.TestCase):
         mock_plat.checkpoint_exclude_wrapper.assert_called_once_with(module, save_output=False)
 
     def test_checkpoint_with_swap_inputs(self, mock_plat):
-        """Test checkpoint with swap_inputs=True."""
+        """Test checkpoint with swap_inputs=True uses the native save-on-cpu context."""
         mock_plat.checkpoint.return_value = "result"
         mock_plat.noop_context_fn = "noop_ctx_fn"
-        mock_plat.async_save_on_cpu = MagicMock()
+        mock_plat.native_save_on_cpu = MagicMock()
 
         def dummy_fn(x):
             return x * 2
@@ -114,7 +114,7 @@ class TestCheckpointFunction(unittest.TestCase):
         result = checkpoint(dummy_fn, 3, swap_inputs=True)
 
         self.assertEqual(result, "result")
-        mock_plat.async_save_on_cpu.assert_called_once()
+        mock_plat.native_save_on_cpu.assert_called_once()
 
     def test_checkpoint_with_policy_fn(self, mock_plat):
         """Test checkpoint with a policy function."""
@@ -227,6 +227,37 @@ class TestCheckpointFunction(unittest.TestCase):
                 "exit:user_rec",
             ],
         )
+
+
+class TestNativeSaveOnCpuEndToEnd(unittest.TestCase):
+    """End-to-end: checkpoint(swap_inputs=True) must keep forward values and
+    gradients bitwise identical to the no-swap path (native save-on-cpu)."""
+
+    def test_gradients_match_no_swap(self):
+        """Swap-enabled checkpoint gives identical losses and param grads."""
+
+        def run(swap_inputs):
+            torch.manual_seed(42)
+            m1 = torch.nn.Linear(8, 8)
+            m2 = torch.nn.Linear(8, 8)
+            torch.manual_seed(0)
+            x = torch.randn(4, 8, requires_grad=True)
+            opt = torch.optim.SGD(list(m1.parameters()) + list(m2.parameters()), lr=0.01)
+            losses = []
+            for _ in range(3):
+                opt.zero_grad()
+                y = checkpoint(lambda h: m2(torch.relu(m1(h))), x, swap_inputs=swap_inputs)
+                loss = y.sum()
+                loss.backward()
+                opt.step()
+                losses.append(loss.item())
+            grad = torch.cat([p.grad.view(-1) for p in m1.parameters()])
+            return losses, grad
+
+        losses_no, grad_no = run(False)
+        losses_yes, grad_yes = run(True)
+        self.assertEqual(losses_no, losses_yes)
+        self.assertTrue(torch.equal(grad_no, grad_yes))
 
 
 class TestRecomputeState(unittest.TestCase):

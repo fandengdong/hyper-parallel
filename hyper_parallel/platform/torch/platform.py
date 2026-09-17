@@ -1835,6 +1835,43 @@ class TorchPlatform(Platform):
         return AsyncSaveOnCpu(policy_fn, group_swap=group_swap, cpu_pool=cpu_pool)
 
     @staticmethod
+    def native_save_on_cpu(pin_memory: bool = True):
+        """save_on_cpu context: saved tensors move to (pinned) CPU in forward
+        and back to the original device at recompute.
+
+        Unlike the SwapManager/async path, the device original is released by
+        the allocator's normal refcount/stream tracking instead of an explicit
+        ``storage.resize_(0)``, which deterministically corrupts the backward
+        pass on NPU (all parameter grads become NaN).
+
+        The D2H pack is non-blocking: the pinned destination is retained by the
+        checkpoint frame until backward, and the device source is released by
+        the allocator's stream-aware free path, so the copy overlaps compute
+        safely.  This avoids the host-blocking sync copy that would otherwise
+        stall the host/device pipeline once per checkpointed block.
+        """
+        device_type = "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cuda"
+        device_module = getattr(torch, device_type, torch.cuda)
+
+        def pack_to_cpu(tensor):
+            if not pin_memory:
+                return (tensor.device, tensor.cpu())
+            packed = torch.empty(
+                tensor.size(),
+                dtype=tensor.dtype,
+                layout=tensor.layout,
+                pin_memory=(device_module.is_available() and not tensor.is_sparse),
+            )
+            packed.copy_(tensor, non_blocking=True)
+            return (tensor.device, packed)
+
+        def unpack_from_cpu(packed):
+            device, tensor = packed
+            return tensor.to(device, non_blocking=pin_memory)
+
+        return torch.autograd.graph.saved_tensors_hooks(pack_to_cpu, unpack_from_cpu)
+
+    @staticmethod
     def get_element_size(tensor):
         """Get Tensor Element Size"""
         return tensor.element_size()
