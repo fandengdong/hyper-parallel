@@ -96,12 +96,88 @@ bash /home/fdd/workspace/bin/find_empty_nodes.sh <ip_list_file>   # e.g. my_work
 - Probes every node in the list in parallel over SSH and classifies a node as **empty** only when
   every NPU device reports `No running processes found in NPU`. Writes `empty_ip.txt` (free) and
   `busy_ip.txt` (occupied) to the current directory, and prints an empty/busy/failed summary.
+  Probes that time out, cannot be reached, or return unexpected output go to `failed_ip.txt` (they
+  are **not** counted as empty) and are named with a reason in the `Failed` list. Per-node timeout
+  defaults to 15 s with one retry, and the whole run has a watchdog deadline, so one wedged node
+  (e.g. an sshd that completes key exchange but never answers authentication) can no longer hang
+  the script. Knobs: `-t <sec>` timeout, `-r <n>` retries, `-j <n>` max parallelism (default 64),
+  `-n <n>` NPU count that means fully idle (default 4), `-v` per-node progress on stderr.
 - Do **not** infer "free" from the absence of our own launcher processes: other teams' jobs on this
   cluster are often not `torchrun` (dataturbo / msrun / plain `python`), so cards can be occupied
   while a process-count probe reports them idle — our job then dies with an OOM at an implausibly
   low allocation.
 - Occupy only nodes reported empty. ~3 GB residual HBM per chip with no running process is the
   cluster baseline, not occupancy; the usable ceiling is ~61 GB/card (of 64 GB).
+
+### Killing stray jobs across nodes
+
+Kill leftover ranks with `/home/fdd/workspace/bin/batch_operations.sh <ip_list_file> <command>`,
+which runs one command on every listed node in parallel and aggregates the output. Nodes are wrapped
+in a per-node timeout (default 10 s, `-t N` to change) and every node is accounted for: failures and
+timeouts are labelled (`TIMEOUT` / `SSH_FAIL`) instead of being silently skipped, the last line
+summarises `Done! N targets: X ok, Y failed (…)`, and `--strict` makes a failed node exit non-zero —
+use `--strict` whenever the batch is a gate you intend to act on. `#` comments and blank lines in the
+IP list are skipped, matching `find_empty_nodes.sh`.
+
+```bash
+# canonical form used on this cluster
+/home/fdd/workspace/bin/batch_operations.sh my_workspace/ip_all.txt pkill -f torchrun
+```
+
+**Scope the pattern to your own run.** Other groups launch with `torchrun` too, so a bare
+`pkill -f torchrun` kills *their* training as well. Give every arm/config a distinct name and kill by
+that fingerprint instead:
+
+```bash
+/home/fdd/workspace/bin/batch_operations.sh my_workspace/ip_train.txt pkill -9 -f my_run_tag
+```
+
+Traps, all hit in practice:
+
+- **`pkill -f <pattern>` kills the shell that runs it** whenever that shell's own command line
+  contains the pattern. Over SSH, the remote `bash -c "pkill -f foo"` matches itself, so the node
+  returns no output and rc 255 — which reads like "all nodes unreachable" but is a self-kill.
+  Use a bracketed regex: `pkill -f 'fo[o]'` still matches `foo` while the literal `fo[o]` in the
+  command line does not match:
+  `... my_workspace/ip_train.txt "pkill -9 -f 'my_run_ta[g]'"`
+- **…but the bracketed pattern must still match the target's real command line.** A pattern copied
+  from how you *launch* something can silently match nothing if intermediate arguments sit in
+  between: `pkill -f 'run_when_free.sh mock3s[n]'` never matches a process whose cmdline is
+  `run_when_free.sh my_workspace/ip_train.txt mock3sn <yaml> 300 150` — the kill is a no-op and you
+  can end up with two copies of a long-running job racing to grab the same nodes. Verify with
+  `pgrep -af <pattern>` (expect a hit) and again afterwards (expect none), rather than assuming.
+- **`SIGTERM` frequently does not stop torch/torchrun workers** — they survive and keep holding HBM.
+  Escalate to `-9`.
+
+Then require every node to report `0` remaining and HBM back at the ~3 GB baseline before
+relaunching. Clean up *before* the next run, not after: a leftover rank holds NPUs, and the next run
+then degrades into an OOM, or into a `torchrun` rendezvous hang whose only symptom is that every
+node's log stays at 0 bytes (the elastic agent waits for all `--nnodes` peers before starting, so one
+occupied node stalls the whole job).
+
+**Launch long multi-node runs fully detached.** A multi-node launch takes minutes to hours; if it is
+started as a child of a shell that can be interrupted (an agent tool call hitting its timeout, a
+terminal that gets closed), the launcher dies while the remote workers survive as orphans — still
+holding every NPU, with nothing local to kill them but the per-node `pkill`. Start it with
+`setsid nohup ... </dev/null &` and poll the per-node logs instead, so the launcher's lifetime is not
+tied to the caller's.
+
+### Pre-flight gates worth running before every launch
+
+Two cheap checks that turn "quiet 10-minute hang, then guess" into "instant, specific abort":
+
+```bash
+# 1) every node must actually SEE the repository: a stale shared-filesystem view makes the
+#    launcher's `cd '<repo>'` fail there, so its torchrun never starts and the NNODES
+#    rendezvous waits forever (hit on .63 and .51).
+/home/fdd/workspace/bin/batch_operations.sh <node_file> \
+  "test -d /home/fdd/workspace/projects/hyper-parallel && echo REPO_OK || echo REPO_BAD"
+
+# 2) if a node is missing from the logs of a hung job, that is the node whose start command
+#    never ran -- compare `ls <output_dir>/*.log | wc -l` against the node count.
+```
+
+`my_workspace/run_arm_guarded.sh` performs both the emptiness and the repo visibility gate.
 
 ---
 
