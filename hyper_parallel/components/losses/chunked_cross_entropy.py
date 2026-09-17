@@ -323,12 +323,9 @@ class ChunkedCausalLMLoss(nn.Module):
         if not self._model_is_bound:
             raise RuntimeError("ChunkedCausalLMLoss must be bound before model forward")
         targets = loss_inputs.get("shift_labels")
-        if not isinstance(targets, torch.Tensor):
-            raise ValueError(
-                "ChunkedCausalLMLoss requires pre-shifted shift_labels aligned "
-                "with every local hidden position"
-            )
         loss_mask = loss_inputs.get("loss_mask")
+        if not isinstance(targets, torch.Tensor):
+            targets, loss_mask = self._shift_targets(loss_inputs)
         if loss_mask is not None:
             if not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != targets.shape:
                 raise ValueError("loss_mask must be a Tensor with the same shape as targets")
@@ -349,6 +346,40 @@ class ChunkedCausalLMLoss(nn.Module):
             }
         )
         return prepared
+
+    @staticmethod
+    def _causal_shift(values: torch.Tensor, fill_value: Any) -> torch.Tensor:
+        """Return one next-token target per position, padded at the tail."""
+        return functional.pad(values, (0, 1), value=fill_value)[..., 1:].contiguous()
+
+    def _shift_targets(
+        self,
+        loss_inputs: Mapping[str, Any],
+    ) -> tuple[torch.Tensor, Any]:
+        """Derive shifted targets from a batch that still carries raw labels.
+
+        Batch producers that pre-shift publish ``shift_labels`` directly (see
+        ``data/batching/get_batch.py``). The temporary VLM path keeps raw
+        ``labels``, so the causal next-token shift its own loss applies — drop
+        position 0 and pad the tail with the ignore value — is reproduced here,
+        together with the matching mask alignment. Only the values handed to
+        ``chunked_cross_entropy`` are affected; token accounting keeps reading
+        the untouched ``loss_inputs``.
+        """
+        labels = loss_inputs.get("labels")
+        if not isinstance(labels, torch.Tensor):
+            raise ValueError(
+                "ChunkedCausalLMLoss requires pre-shifted shift_labels or raw "
+                "labels aligned with every local hidden position"
+            )
+        loss_mask = loss_inputs.get("loss_mask")
+        if loss_mask is not None and (
+            not isinstance(loss_mask, torch.Tensor) or loss_mask.shape != labels.shape
+        ):
+            raise ValueError("loss_mask must be a Tensor with the same shape as labels")
+        targets = self._causal_shift(labels, self.ignore_index)
+        mask = None if loss_mask is None else self._causal_shift(loss_mask.to(torch.bool), False)
+        return targets, mask
 
     def forward(  # pylint: disable=unused-argument
         self,

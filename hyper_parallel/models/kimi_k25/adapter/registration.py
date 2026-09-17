@@ -43,10 +43,19 @@ def _load_sharding_rules():
     ]
 
 
+def _load_loss():
+    """Return the family's model-integrated output-loss adapter."""
+    from hyper_parallel.models.kimi_k25.adapter import (  # pylint: disable=C0415
+        chunk_loss,
+    )
+    return chunk_loss
+
+
 KIMI_K25_ADAPTER_SPEC = ModelAdapterSpec(
     architecture="KimiK25ForConditionalGeneration",
     model_type="kimi_k25",
     sharding_rules=_load_sharding_rules,
+    loss=_load_loss,
 )
 
 register_model_adapter(KIMI_K25_ADAPTER_SPEC)
