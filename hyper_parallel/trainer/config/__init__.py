@@ -34,6 +34,7 @@ from hyper_parallel.trainer.config.data import (
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
+    OptimizerSwapConfig,
 )
 from hyper_parallel.trainer.config.parallelism import (
     AcceleratorConfig,
@@ -63,6 +64,7 @@ __all__ = [
     "FSDP2Config",
     "MixedPrecisionConfig",
     "OptimizerConfig",
+    "OptimizerSwapConfig",
     "ProfilingConfig",
     "Target",
     "TrainerConfig",
