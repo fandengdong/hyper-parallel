@@ -1724,7 +1724,8 @@ def _run_routed_dispatch(monkeypatch, case, fused, wrap_async=False):
     world = _FakeEpA2AWorld(case["ep_size"], case["send_plan"], wrap_async=wrap_async)
     exchanges = []
 
-    def fake_async(tensor, send_counts, recv_counts, group):
+    def fake_async(tensor, send_counts, recv_counts, group, **kwargs):
+        del kwargs  # the fused dispatch opts out of pending handles; a tensor is what it needs
         exchanges.append((group.rank, tuple(tensor.shape), tensor.dtype))
         return world.token_exchange(group.rank, tensor, send_counts, recv_counts)
 
@@ -1981,7 +1982,8 @@ def test_fused_dispatch_gradient_matches_split_exchanges(monkeypatch):
         topk = torch.tensor(slots, dtype=torch.int64)
         world = _IdentityEpA2AWorld()
 
-        def fake_async(tensor, send_counts, recv_counts, group):
+        def fake_async(tensor, send_counts, recv_counts, group, **kwargs):
+            del kwargs  # the fused dispatch opts out of pending handles
             return _IdentityA2AFunction.apply(tensor, world)
 
         monkeypatch.setattr(ep_experts, "ep_all_to_all_async", fake_async)

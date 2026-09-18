@@ -23,6 +23,10 @@ ragged path moves, in exactly the same order, so that is what these tests pin:
 * the knob off keeps the ragged path bit-for-bit (forward and backward);
 * the knob on with a uniform plan takes the equal path, and its output *and* its
   backward are bit-identical (``torch.equal``) to the ragged path's;
+* on the async entry the same exchange is *lazy*: it is issued on a
+  communication stream of its own and the caller's stream is ordered on it by
+  ``wait_ep_all_to_all``, where the caller decides -- the split-free kernel must
+  not cost the shared-expert overlap;
 * a non-uniform plan falls back to the ragged path instead of silently
   re-chunking the payload;
 * a plan whose counts are uniform but do not describe the payload falls back as
@@ -34,14 +38,16 @@ this process, in which each rank runs in its own thread.  The world implements
 both collective contracts -- the ragged ``all_to_all`` and the split-free
 ``all_to_all_single`` -- and checks the rows it hands over against the buffer
 sizes the receiver derived, so a wrong layout is a hard failure rather than a
-wrong number.
+wrong number.  The platform's stream/event API is faked by a double that traces
+what was recorded and waited where, so the laziness is checked as a schedule
+rather than inferred from the code.
 """
+import contextlib
 import os
 import threading
 import unittest
-from typing import Any, List, NamedTuple, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 from unittest import mock
-
 import torch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
@@ -247,6 +253,119 @@ class _BackendOnlyDist:
         return self._backend
 
 
+class _FakeStream:
+    """Stand-in for a device stream: names itself in the trace it writes to."""
+
+    def __init__(self, name: str, streams: "_FakeStreams") -> None:
+        """Bind the stream to its name and the trace owner."""
+        self.name = name
+        self._streams = streams
+
+    def record_stream(self, tensor: torch.Tensor) -> None:
+        """Stand in for ``Tensor.record_stream`` on this stream."""
+        del tensor
+        self._streams.mark(f"record_stream@{self.name}")
+
+
+class _FakeEvent:
+    """Stand-in for a device event: records every record and wait it receives."""
+
+    def __init__(self, name: str, streams: "_FakeStreams") -> None:
+        """Bind the event to its name and the trace owner."""
+        self.name = name
+        self._streams = streams
+
+    def record(self, stream: _FakeStream) -> None:
+        """Trace one ``record`` on ``stream``."""
+        self._streams.mark(f"record:{self.name}<-{stream.name}")
+
+    def wait(self, stream: _FakeStream) -> None:
+        """Trace one ``wait`` on ``stream``."""
+        self._streams.mark(f"wait:{self.name}->{stream.name}")
+
+
+class _FakeStreamContext:
+    """The context manager ``platform.get_stream_context()`` hands out."""
+
+    def __init__(self, stream: _FakeStream, streams: "_FakeStreams") -> None:
+        """Hold the stream the caller wants to run on."""
+        self._stream = stream
+        self._streams = streams
+
+    def __enter__(self) -> _FakeStream:
+        """Trace entering the stream."""
+        self._streams.mark(f"enter@{self._stream.name}")
+        return self._stream
+
+    def __exit__(self, *exc: Any) -> bool:
+        """Trace leaving the stream."""
+        self._streams.mark(f"exit@{self._stream.name}")
+        return False
+
+
+class _FakeStreams:
+    """Fake of the platform's stream/event API with a trace and call counters.
+
+    The lazy exchange must reuse one stream and two events for the whole
+    process -- a fresh event per exchange drains the runtime's event pool -- so
+    the counters are the assertion: an implementation that allocates per
+    exchange shows up as more than one ``new_stream`` call.  Every record, wait
+    and stream entry is traced with the rank that caused it, which is how the
+    tests pin the schedule (the exchange must be issued and waited on where the
+    caller wants to wait, not where the collective is issued).
+    """
+
+    def __init__(self) -> None:
+        """Start with no trace, no callers bound and both factories uncalled."""
+        self._comm = _FakeStream("comm", self)
+        self._compute = _FakeStream("compute", self)
+        self._lock = threading.Lock()
+        self._ranks = {}
+        self._trace = []
+        self.new_stream_calls = 0
+        self.new_event_calls = 0
+
+    def bind(self, rank: int) -> None:
+        """Attribute this thread's trace entries to ``rank``."""
+        with self._lock:
+            self._ranks[threading.get_ident()] = rank
+
+    def mark(self, entry: str) -> None:
+        """Append one trace entry under the calling thread's rank."""
+        with self._lock:
+            self._trace.append((self._ranks.get(threading.get_ident(), 0), entry))
+
+    def entries(self, rank: int) -> List[str]:
+        """Return rank ``rank``'s trace entries, in order."""
+        with self._lock:
+            return [entry for entry_rank, entry in self._trace if entry_rank == rank]
+
+    def new_stream(self) -> _FakeStream:
+        """Hand out the comm stream, counting the request."""
+        with self._lock:
+            self.new_stream_calls += 1
+        return self._comm
+
+    def new_event(self) -> _FakeEvent:
+        """Hand out a fresh event, counting the request."""
+        with self._lock:
+            self.new_event_calls += 1
+            name = f"event{self.new_event_calls}"
+        return _FakeEvent(name, self)
+
+    def get_current_stream(self) -> _FakeStream:
+        """Report the stream the calling rank computes on."""
+        return self._compute
+
+    def get_stream_context(self) -> Callable:
+        """Return the factory that enters a given stream."""
+        return lambda stream: _FakeStreamContext(stream, self)
+
+    def record_stream(self, tensor: torch.Tensor, stream: _FakeStream) -> None:
+        """Stand in for ``_record_stream`` (a real one rejects a fake stream)."""
+        stream.record_stream(tensor)
+
+
 class _Run(NamedTuple):
     """One driven exchange: per-rank results plus what each rank issued."""
 
@@ -254,6 +373,7 @@ class _Run(NamedTuple):
     grads: dict
     world: object
     lazy_calls: list
+    pending: dict
 
 
 def _transpose(plan: List[List[int]]) -> List[List[int]]:
@@ -310,8 +430,39 @@ def _expected_grad(send_plan: List[List[int]], recv_plan: List[List[int]], weigh
     return expected
 
 
+@contextlib.contextmanager
+def _equal_a2a_scope(dist_double: Any, knob: str, streams: _FakeStreams):
+    """Install everything the exchange resolves its world and its streams through.
+
+    The lazy exchange reads the platform's stream/event API and the ``dist``
+    module at call time, so both are patched for the duration of a case: the
+    ``dist`` double routes the collectives into the virtual world, and the stream
+    double traces what was enqueued where.  The three resource caches are reset
+    so each case starts from "nothing created yet".
+
+    Args:
+        dist_double: Stand-in for the ``dist`` module ``collectives`` resolves.
+        knob: Value of ``HP_EP_EQUAL_A2A`` for the run.
+        streams: Stream/event double to install.
+    """
+    with mock.patch.object(ep_collectives, "dist", dist_double), \
+            mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", knob), \
+            mock.patch.multiple(ep_collectives,
+                                _record_stream=streams.record_stream,
+                                _LAZY_A2A_STREAM=None,
+                                _LAZY_A2A_READY_EVENT=None,
+                                _LAZY_A2A_DONE_EVENT=None), \
+            mock.patch.multiple(ep_collectives.platform,
+                                new_stream=streams.new_stream,
+                                new_event=streams.new_event,
+                                get_current_stream=streams.get_current_stream,
+                                get_stream_context=streams.get_stream_context):
+        yield
+
+
 def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backward: bool = False,
-           backend: str = _HCCL, world: Optional[_VirtualEpWorld] = None) -> _Run:
+           backend: str = _HCCL, world: Optional[_VirtualEpWorld] = None,
+           streams: Optional[_FakeStreams] = None) -> _Run:
     """Run every virtual rank's exchange once, all ranks in lockstep.
 
     Args:
@@ -322,20 +473,24 @@ def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backwar
         backward: Backpropagate a weighted sum and collect the input gradients.
         backend: Backend the ``dist`` double reports.
         world: World double to drive; a fresh one by default.
+        streams: Stream/event double to install; a fresh one by default.
 
     Returns:
         The :class:`_Run` holding each rank's output, its input gradient when
-        requested, the world double, and the calls the stubbed lazy exchange
-        received (empty unless the async entry fell back to it).
+        requested, the world double, the calls the stubbed lazy exchange
+        received (empty unless the async entry fell back to it), and the raw
+        exchange results -- a pending handle where the lazy equal path was
+        taken -- before the wait.
     """
     ep_size = len(send_plan)
     recv_plan = _transpose(send_plan)
     inputs = _inputs(send_plan, backward)
     weights = _weights(recv_plan)
     world = _VirtualEpWorld(ep_size) if world is None else world
+    streams = _FakeStreams() if streams is None else streams
     dist_double = _VirtualGlooDist(world) if backend == _GLOO else _VirtualEpDist(world)
     exchange = ep_collectives.ep_all_to_all if entry == _SYNC else ep_collectives.ep_all_to_all_async
-    outputs, grads, lazy_calls, failures = {}, {}, [], []
+    outputs, grads, lazy_calls, pending, failures = {}, {}, [], {}, []
 
     def lazy_exchange(x: torch.Tensor, send_counts: List[int], recv_counts: List[int],
                       group: Any) -> torch.Tensor:
@@ -346,8 +501,11 @@ def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backwar
     def run_rank(rank: int) -> None:
         """One virtual rank: issue the exchange and, when asked, backpropagate."""
         try:
-            received = exchange(
+            streams.bind(rank)
+            issued = exchange(
                 inputs[rank], send_plan[rank], recv_plan[rank], _VirtualEpGroup(rank, ep_size))
+            pending[rank] = issued
+            received = ep_collectives.wait_ep_all_to_all(issued)
             outputs[rank] = received
             if backward:
                 (received * weights[rank].unsqueeze(1)).sum().backward()
@@ -355,8 +513,7 @@ def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backwar
         except BaseException as exc:  # pylint: disable=broad-except
             failures.append((rank, exc))
 
-    with mock.patch.object(ep_collectives, "dist", dist_double), \
-            mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", knob), \
+    with _equal_a2a_scope(dist_double, knob, streams), \
             mock.patch.object(ep_collectives.platform,
                               "differentiable_all_to_all_single_async",
                               side_effect=lazy_exchange):
@@ -367,7 +524,7 @@ def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backwar
             thread.join()
     if failures:
         raise failures[0][1]
-    return _Run(outputs, grads, world, lazy_calls)
+    return _Run(outputs, grads, world, lazy_calls, pending)
 
 
 class TestEqualA2ADispatch(unittest.TestCase):
@@ -518,22 +675,99 @@ class TestEqualA2ADispatch(unittest.TestCase):
         self._assert_matches_reference(run.outputs, send_plan, "gloo fallback")
 
     @arg_mark(**_CPU_MARKS)
-    def test_async_entry_takes_the_equal_path_on_a_uniform_plan(self):
-        """The async entry swaps its lazy exchange for the equal one, not the values.
+    def test_async_entry_takes_the_lazy_equal_path_on_a_uniform_plan(self):
+        """The async entry issues the split-free exchange and keeps it pending.
 
-        Feature: ``HP_EP_EQUAL_A2A`` on the async entry.
+        Feature: ``HP_EP_EQUAL_A2A=1`` on the async entry.
         Description: Run ``ep_all_to_all_async`` on a uniform plan with the knob on.
-        Expectation: The lazy exchange is not used and the equal path moves the planned rows.
+        Expectation: The lazy ragged exchange is not used, every rank issues the
+            split-free collective, and what comes back is a pending handle whose wait
+            yields the planned rows.
         """
         send_plan = self._uniform_plan()
-        run = _drive(send_plan, "1", entry=_ASYNC)
+        streams = _FakeStreams()
+        run = _drive(send_plan, "1", entry=_ASYNC, streams=streams)
         for rank in range(_EP_SIZE):
             with self.subTest(rank=rank):
                 self.assertEqual(run.world.calls(rank), ["equal"],
                                  f"rank {rank} issued {run.world.calls(rank)}")
+                self.assertIsInstance(
+                    run.pending[rank], ep_collectives._PendingEqualA2A,  # pylint: disable=W0212
+                    f"rank {rank} must get a pending handle, got {type(run.pending[rank])}")
         self.assertEqual(run.lazy_calls, [],
                          f"the lazy exchange was still used: {run.lazy_calls}")
         self._assert_matches_reference(run.outputs, send_plan, "async equal")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_async_entry_returns_a_tensor_in_eager_mode(self):
+        """``HP_EP_EQUAL_A2A=eager`` keeps the split-free kernel, not the laziness.
+
+        Feature: ``HP_EP_EQUAL_A2A`` eager mode on the async entry.
+        Description: Run ``ep_all_to_all_async`` on a uniform plan with the knob at
+            ``eager`` -- the behaviour ``1`` used to have.
+        Expectation: The split-free collective runs and a materialized tensor comes
+            back, so this mode is the eager arm of the kernel-vs-latency A/B.
+        """
+        send_plan = self._uniform_plan()
+        run = _drive(send_plan, "eager", entry=_ASYNC)
+        for rank in range(_EP_SIZE):
+            with self.subTest(rank=rank):
+                self.assertEqual(run.world.calls(rank), ["equal"],
+                                 f"rank {rank} issued {run.world.calls(rank)}")
+                self.assertIsInstance(
+                    run.pending[rank], torch.Tensor,
+                    f"rank {rank} must get a tensor, got {type(run.pending[rank])}")
+        self._assert_matches_reference(run.outputs, send_plan, "async equal eager")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_a_caller_that_cannot_defer_gets_a_materialized_exchange(self):
+        """``allow_pending=False`` refuses the handle and keeps the eager kernel.
+
+        Feature: pending-handle opt-out (the fused states+indices dispatch).
+        Description: Ask the async entry for a uniform plan with the handle refused.
+        Expectation: The split-free collective runs, its result is a tensor, and the
+            caller's stream was ordered on it before the call returned.
+        """
+        send_plan = self._uniform_plan()
+        world = _VirtualEpWorld(_EP_SIZE)
+        streams = _FakeStreams()
+        results, failures = {}, []
+
+        def issue(rank: int) -> None:
+            """One rank: issue through the real entry with the handle refused."""
+            try:
+                streams.bind(rank)
+                results[rank] = ep_collectives.ep_all_to_all_async(
+                    _inputs(send_plan, backward=False)[rank],
+                    send_plan[rank], _transpose(send_plan)[rank],
+                    _VirtualEpGroup(rank, _EP_SIZE),
+                    allow_pending=False,
+                )
+            except BaseException as exc:  # pylint: disable=broad-except
+                failures.append((rank, exc))
+
+        with mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)), \
+                mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", "1"), \
+                mock.patch.multiple(ep_collectives.platform,
+                                    new_stream=streams.new_stream,
+                                    new_event=streams.new_event,
+                                    get_current_stream=streams.get_current_stream,
+                                    get_stream_context=streams.get_stream_context):
+            threads = [threading.Thread(target=issue, args=(rank,)) for rank in range(_EP_SIZE)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        if failures:
+            raise failures[0][1]
+        for rank in range(_EP_SIZE):
+            with self.subTest(rank=rank):
+                self.assertIsInstance(
+                    results[rank], torch.Tensor,
+                    f"rank {rank} must get a materialized tensor, got {type(results[rank])}")
+        self.assertEqual(streams.new_stream_calls, 0,
+                         f"an eager exchange must not touch the comm stream, "
+                         f"but it was created {streams.new_stream_calls} times")
 
     @arg_mark(**_CPU_MARKS)
     def test_async_entry_keeps_the_lazy_exchange_when_the_knob_is_off(self):
@@ -573,6 +807,177 @@ class TestEqualA2ADispatch(unittest.TestCase):
         issued = {rank: run.world.calls(rank) for rank in range(len(send_plan))}
         self.assertEqual(issued, {rank: [] for rank in range(len(send_plan))},
                          f"the equal path must not be taken, but the ranks issued {issued}")
+
+
+class TestLazyEqualA2A(unittest.TestCase):
+    """The lazy split-free exchange: where it is issued, where it is waited, and
+    the resources it must not allocate per exchange."""
+
+    _ROWS = 3
+
+    def _payload(self, *, width: int = _HIDDEN) -> torch.Tensor:
+        """Payload whose row values identify each row's position."""
+        rows = torch.arange(self._ROWS, dtype=torch.float32) + 1000
+        return rows.unsqueeze(1).repeat(1, width)
+
+    @staticmethod
+    def _issue(payload: torch.Tensor, *, allow_pending: bool = True) -> Any:
+        """Issue one single-rank exchange through the real async entry.
+
+        The ``dist`` double of a single-rank world makes the exchange an
+        identity, so what the case checks is the schedule and the handle, not
+        the routing (that is covered by the multi-rank cases).
+        """
+        return ep_collectives.ep_all_to_all_async(
+            payload, [TestLazyEqualA2A._ROWS], [TestLazyEqualA2A._ROWS],  # pylint: disable=W0212
+            _VirtualEpGroup(0, 1), allow_pending=allow_pending)
+
+    @arg_mark(**_CPU_MARKS)
+    def test_issue_puts_the_exchange_on_the_comm_stream(self):
+        """The split-free call runs on the comm stream, not on the caller's.
+
+        Feature: lazy equal exchange, issue side.
+        Description: Issue one exchange and read the recorded stream/event trace.
+        Expectation: The payload is handed to the comm stream through the ready
+            event, the collective runs inside the comm stream context, and the
+            compute stream is not ordered on the transfer at issue time.
+        """
+        world, streams = _VirtualEpWorld(1), _FakeStreams()
+        with _equal_a2a_scope(_VirtualEpDist(world), "1", streams):
+            issued = self._issue(self._payload())
+            trace = streams.entries(0)
+        self.assertIsInstance(issued, ep_collectives._PendingEqualA2A,  # pylint: disable=W0212
+                              f"the lazy equal path must return a handle, got {type(issued)}")
+        self.assertFalse(issued.completed, "a just-issued exchange must still be pending")
+        self.assertEqual(world.calls(0), ["equal"],
+                         f"rank 0 must issue the split-free collective, got {world.calls(0)}")
+        self.assertEqual(
+            trace,
+            ["record:event1<-compute",   # the payload is handed to the comm stream
+             "enter@comm",
+             "wait:event1->comm",
+             "record_stream@comm",       # the receive buffer survives the stream switch
+             "record_stream@comm",       # ... and so does the payload's storage
+             "record:event2<-comm",      # the exchange is done
+             "exit@comm"],
+            f"unexpected issue trace: {trace}")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_wait_is_the_callers_decision(self):
+        """Independent work fits between the issue and the wait.
+
+        Feature: lazy equal exchange, wait side.
+        Description: Issue the exchange, mark the caller's independent work, then
+            wait and read the result.
+        Expectation: The completion is recorded before the marker and the consumer
+            stream is ordered on it only after the marker; the rows are the payload's.
+        """
+        world, streams = _VirtualEpWorld(1), _FakeStreams()
+        payload = self._payload()
+        with _equal_a2a_scope(_VirtualEpDist(world), "1", streams):
+            issued = self._issue(payload)
+            streams.mark("overlap")  # where the shared-expert MLP would run
+            received = ep_collectives.wait_ep_all_to_all(issued)
+            trace = streams.entries(0)
+        marker = trace.index("overlap")
+        self.assertLess(trace.index("record:event2<-comm"), marker,
+                        f"the exchange must be complete before the overlap: {trace}")
+        self.assertLess(marker, trace.index("wait:event2->compute"),
+                        f"the wait must land after the overlap, not at issue: {trace}")
+        self.assertTrue(issued.completed, "waiting must mark the handle completed")
+        self.assertTrue(torch.equal(received, payload),
+                        f"received={received.flatten().tolist()}, "
+                        f"payload={payload.flatten().tolist()}")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_repeated_waits_order_the_consumer_stream_once(self):
+        """Waiting twice is the same as waiting once (idempotent handle).
+
+        Feature: lazy equal exchange, wait idempotency.
+        Description: Wait the same handle twice.
+        Expectation: The consumer stream is ordered on the exchange exactly once.
+        """
+        world, streams = _VirtualEpWorld(1), _FakeStreams()
+        with _equal_a2a_scope(_VirtualEpDist(world), "1", streams):
+            issued = self._issue(self._payload())
+            first = ep_collectives.wait_ep_all_to_all(issued)
+            second = ep_collectives.wait_ep_all_to_all(issued)
+            trace = streams.entries(0)
+        self.assertIs(first, second, "both waits must return the same buffer")
+        self.assertEqual(trace.count("wait:event2->compute"), 1,
+                         f"the consumer stream was ordered {trace.count('wait:event2->compute')} "
+                         f"times, trace={trace}")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_squeeze_keeps_the_exchange_pending(self):
+        """The expert-index squeeze is a view and must not force the wait.
+
+        Feature: lazy equal exchange, view-only squeeze.
+        Description: Squeeze the trailing dim of a ``[rows, 1]`` payload, then wait.
+        Expectation: No consumer wait is traced before the explicit one, and the
+            squeezed rows are the payload's rows.
+        """
+        world, streams = _VirtualEpWorld(1), _FakeStreams()
+        payload = self._payload(width=1)
+        with _equal_a2a_scope(_VirtualEpDist(world), "1", streams):
+            issued = self._issue(payload).squeeze(-1)
+            squeezed_trace = streams.entries(0)
+            received = ep_collectives.wait_ep_all_to_all(issued)
+        self.assertIsInstance(issued, ep_collectives._PendingEqualA2A,  # pylint: disable=W0212
+                              f"squeeze must stay pending, got {type(issued)}")
+        self.assertNotIn("wait:event2->compute", squeezed_trace,
+                         f"squeeze must not materialize the exchange: {squeezed_trace}")
+        self.assertEqual(tuple(received.shape), (self._ROWS,),
+                         f"the squeezed result must be [{self._ROWS}], "
+                         f"got {tuple(received.shape)}")
+        self.assertTrue(torch.equal(received, payload.squeeze(-1)),
+                        f"received={received.tolist()}, payload={payload.squeeze(-1).tolist()}")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_the_comm_stream_and_events_are_created_once(self):
+        """One stream and two events serve every exchange of the process.
+
+        Feature: lazy equal exchange resource reuse.
+        Description: Run four virtual ranks in lockstep, each issuing one exchange.
+        Expectation: The platform's factories were asked for one stream and two
+            events in total, so no exchange allocates its own.
+        """
+        send_plan = [[_UNIFORM_ROWS] * _EP_SIZE for _ in range(_EP_SIZE)]
+        streams = _FakeStreams()
+        run = _drive(send_plan, "1", entry=_ASYNC, streams=streams)
+        self.assertEqual(streams.new_stream_calls, 1,
+                         f"the comm stream must be created once, "
+                         f"but it was requested {streams.new_stream_calls} times")
+        self.assertEqual(streams.new_event_calls, 2,
+                         f"the two events must be created once each, "
+                         f"but they were requested {streams.new_event_calls} times")
+        self.assertEqual({rank: run.world.calls(rank) for rank in range(_EP_SIZE)},
+                         {rank: ["equal"] for rank in range(_EP_SIZE)},
+                         "every rank must have issued exactly one exchange")
+
+    @arg_mark(**_CPU_MARKS)
+    def test_lazy_output_and_gradient_are_bit_identical_to_the_ragged_path(self):
+        """The lazy exchange moves the rows the ragged one moves, forward and back.
+
+        Feature: lazy split-free equivalence.
+        Description: Compare the eager ragged entry with the lazy equal entry on the
+            same uniform plan, both backpropagated.
+        Expectation: Output and input gradient are identical element-wise.
+        """
+        send_plan = [[_UNIFORM_ROWS] * _EP_SIZE for _ in range(_EP_SIZE)]
+        ragged = _drive(send_plan, "0", backward=True)
+        lazy = _drive(send_plan, "1", entry=_ASYNC, backward=True)
+        for rank in range(_EP_SIZE):
+            with self.subTest(rank=rank, direction="forward"):
+                self.assertTrue(
+                    torch.equal(ragged.outputs[rank], lazy.outputs[rank]),
+                    f"rank {rank}: ragged={ragged.outputs[rank].flatten().tolist()}, "
+                    f"lazy={lazy.outputs[rank].flatten().tolist()}")
+            with self.subTest(rank=rank, direction="backward"):
+                self.assertTrue(
+                    torch.equal(ragged.grads[rank], lazy.grads[rank]),
+                    f"rank {rank}: ragged grad={ragged.grads[rank].flatten().tolist()}, "
+                    f"lazy grad={lazy.grads[rank].flatten().tolist()}")
 
 
 class TestEqualA2AGuard(unittest.TestCase):
@@ -693,10 +1098,10 @@ class TestEqualA2AGuard(unittest.TestCase):
 class TestEqualA2AKnob(unittest.TestCase):
     """``HP_EP_EQUAL_A2A`` parsing: default off, whitespace tolerated, typos fatal."""
 
-    def _enabled(self, raw: str) -> bool:
+    def _mode(self, raw: str) -> str:
         """Resolve the knob with ``raw`` as its value."""
         with mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", raw):
-            return ep_collectives._equal_a2a_enabled()
+            return ep_collectives._equal_a2a_mode()
 
     @arg_mark(**_CPU_MARKS)
     def test_default_is_off(self):
@@ -704,7 +1109,8 @@ class TestEqualA2AKnob(unittest.TestCase):
 
         Feature: ``HP_EP_EQUAL_A2A`` default value.
         Description: Read the knob from an environment that does not set it.
-        Expectation: The module default and the documented default are both "0".
+        Expectation: The module default and the documented default are both "0", and
+            they resolve to the off mode.
         """
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HP_EP_EQUAL_A2A", None)
@@ -713,18 +1119,23 @@ class TestEqualA2AKnob(unittest.TestCase):
         self.assertEqual(ep_collectives._EQUAL_A2A_RAW,  # pylint: disable=protected-access
                          os.environ.get("HP_EP_EQUAL_A2A", "0"),
                          "the module must read the knob defaulting to '0'")
+        self.assertEqual(self._mode(ep_collectives._EQUAL_A2A_RAW),  # pylint: disable=W0212
+                         ep_collectives._EQUAL_A2A_OFF,  # pylint: disable=W0212
+                         "an unset knob must resolve to the off mode")
 
     @arg_mark(**_CPU_MARKS)
-    def test_values_resolve_to_the_fast_path_switch(self):
-        """``0`` and ``1`` (with surrounding whitespace) are the only valid values.
+    def test_values_resolve_to_their_modes(self):
+        """``0`` / ``1`` / ``eager`` (with surrounding whitespace) are the valid values.
 
         Feature: ``HP_EP_EQUAL_A2A`` parsing.
-        Description: Resolve the knob for its two documented values and padded forms.
-        Expectation: "0" turns the fast path off and "1" turns it on.
+        Description: Resolve the knob for its documented values and padded forms.
+        Expectation: "0" turns the fast path off, "1" defers its wait and "eager"
+            takes the same exchange without the deferral.
         """
-        for raw, expected in (("0", False), ("1", True), (" 1 ", True), ("0 ", False)):
+        for raw, expected in (("0", "off"), ("1", "lazy"), (" 1 ", "lazy"),
+                              ("0 ", "off"), ("eager", "eager"), (" eager ", "eager")):
             with self.subTest(raw=raw):
-                self.assertEqual(self._enabled(raw), expected,
+                self.assertEqual(self._mode(raw), expected,
                                  f"HP_EP_EQUAL_A2A={raw!r} must resolve to {expected}")
 
     @arg_mark(**_CPU_MARKS)
@@ -732,13 +1143,13 @@ class TestEqualA2AKnob(unittest.TestCase):
         """A typo fails loudly instead of silently leaving the fast path off.
 
         Feature: ``HP_EP_EQUAL_A2A`` validation.
-        Description: Resolve the knob for values that are neither "0" nor "1".
+        Description: Resolve the knob for values that are none of the accepted ones.
         Expectation: Every one of them raises a ValueError naming the knob.
         """
-        for raw in ("", "2", "true", "yes", "-1", "on"):
+        for raw in ("", "2", "true", "yes", "-1", "on", "lazyish", "Eager"):
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(ValueError, "HP_EP_EQUAL_A2A"):
-                    self._enabled(raw)
+                    self._mode(raw)
 
 
 if __name__ == "__main__":

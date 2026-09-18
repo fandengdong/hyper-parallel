@@ -120,6 +120,7 @@ class _VirtualEpWorld:
         self._index = {}
         self.counts_calls = []
         self.trace = []
+        self.pending_flags = []
         self.handles = {rank: [] for rank in range(ep_size)}
         self.snapshots = []
         self.rows = {rank: [0, 0] for rank in range(ep_size)}
@@ -131,6 +132,11 @@ class _VirtualEpWorld:
             if event == "gemm":
                 self.snapshots.append(
                     (rank, [handle.completed for handle in self.handles[rank]]))
+
+    def record_pending(self, allowed: bool) -> None:
+        """Record an exchange that explicitly asked for (or refused) a lazy handle."""
+        with self._lock:
+            self.pending_flags.append(allowed)
 
     def events(self, rank):
         """Return one rank's schedule events, in order."""
@@ -393,8 +399,10 @@ def _run_ranks(mode, chunk_count, *, fused=False, wrap_async=False, seed=7,
 
     def exchange(kind):
         """Build the stand-in :func:`ep_all_to_all` / ``..._async`` for this run."""
-        def call(x, send_counts, recv_counts, group):
+        def call(x, send_counts, recv_counts, group, **kwargs):
             """Hand one exchange to the world (as a Function when differentiable)."""
+            if "allow_pending" in kwargs:
+                world.record_pending(kwargs["allow_pending"])
             if differentiable:
                 return _VirtualA2A.apply(group.rank, x, send_counts, recv_counts, world, kind)
             return world.token_exchange(group.rank, x, send_counts, recv_counts, kind)
@@ -722,6 +730,12 @@ class TestChunkedRoutedForward(unittest.TestCase):
             with self.subTest(rank=rank, schedule="fused"):
                 self.assertEqual(world.events(rank),
                                  ["async", "async", "gemm", "async", "gemm", "async"])
+        # The fused unpack is a view chain over the exchanged buffer, which only
+        # a materializing exchange result can carry: the fused path must keep
+        # asking for one (``allow_pending=False``) instead of the lazy handle
+        # the split-free exchange returns for a uniform plan.
+        self.assertEqual(world.pending_flags, [False] * (2 * _EP_SIZE),
+                         f"fused exchanges asked for pending handles: {world.pending_flags}")
 
     def test_cohesive_path_ignores_the_fused_switch_for_its_chunks(self):
         """``ep_routed_forward`` never fused its exchange; its chunks do not either."""
