@@ -228,6 +228,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "FSDP2Config",
                 "MixedPrecisionConfig",
                 "OptimizerConfig",
+                "OptimizerSwapConfig",
                 "ProfilingConfig",
                 "Target",
                 "TrainerConfig",
