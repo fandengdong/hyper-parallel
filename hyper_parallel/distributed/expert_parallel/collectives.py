@@ -21,9 +21,16 @@ other backends that do not support ragged a2a use pad-to-max +
 equivalent (padding only adds filler rows that do not participate in
 computation).
 
+When every per-peer count is equal -- which is exactly what a balanced routing
+plan produces -- the split sizes carry no information, so ``HP_EP_EQUAL_A2A=1``
+swaps the ragged exchange for the plain equal-length ``all_to_all_single``
+(``_EPAllToAllEqual``), whose backend kernel is cheaper than alltoallv. The
+rows, their order and the values are identical on both paths.
+
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+import os
 from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
@@ -35,9 +42,34 @@ platform = get_platform()
 
 _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
 
+# A ragged exchange reaches NCCL/HCCL as alltoallv, which takes a per-peer count
+# vector and runs a count-driven kernel.  Under a balanced routing plan every
+# per-peer count is the same, so the counts add nothing and the plain
+# equal-length all_to_all_single (alltoall) can be issued instead.  Opt-in while
+# it is being measured (HP_EP_EQUAL_A2A=1).
+_EQUAL_A2A_RAW = os.environ.get("HP_EP_EQUAL_A2A", "0")
+
 
 def _backend_supports_uneven_a2a(group) -> bool:
     return dist.get_backend(group) in _UNEVEN_A2A_BACKENDS
+
+
+def _equal_a2a_enabled() -> bool:
+    """Resolve ``HP_EP_EQUAL_A2A`` (``"0"`` = off, ``"1"`` = on).
+
+    Returns:
+        Whether the equal-length fast path may be taken.
+
+    Raises:
+        ValueError: If the knob is neither ``"0"`` nor ``"1"``; a typo must fail
+            loudly instead of silently leaving the fast path off.
+    """
+    raw = _EQUAL_A2A_RAW.strip()
+    if raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(f"HP_EP_EQUAL_A2A must be '0' or '1', but got {raw!r}")
 
 
 class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-method
@@ -73,6 +105,76 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
         """Swap send/recv counts and re-run the self-inverse ragged all_to_all."""
         grad = _EPAllToAllUneven.apply(
             grad_output.contiguous(), ctx.recv_counts, ctx.send_counts, ctx.group)
+        return grad, None, None, None
+
+
+class _EPAllToAllEqual(torch.autograd.Function):  # pylint: disable=abstract-method
+    """Equal-length ``all_to_all_single`` (NCCL/HCCL path when counts are uniform).
+
+    Without split sizes every peer gets ``rows_per_peer`` rows -- the backend
+    derives the chunking from the tensor shape alone -- and the received chunks
+    are concatenated in peer order. That is exactly the layout
+    :class:`_EPAllToAllUneven` produces when all counts are equal, so this path
+    is interchangeable with it (see :func:`_equal_a2a_rows` for when it applies).
+
+    forward:  all_to_all_single(no splits) -> [ep_size * rows_per_peer, ...]
+    backward: the same exchange; an equal-length a2a is its own inverse, and
+              with a uniform plan the reverse chunks are the same size.
+    """
+
+    @staticmethod
+    def _exchange(
+        x: torch.Tensor,
+        rows_per_peer: int,
+        ep_size: int,
+        group: Any,
+    ) -> torch.Tensor:
+        """Move ``rows_per_peer`` rows to each peer and return the peer-major result."""
+        out = x.new_empty((rows_per_peer * ep_size,) + tuple(x.shape[1:]))
+        dist.all_to_all_single(out, x, group=group)
+        return out
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        rows_per_peer: int,
+        ep_size: int,
+        group: Any,
+    ) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Run the equal-length all_to_all and retain its geometry for backward.
+
+        Args:
+            ctx: Autograd context of this exchange.
+            x: Payload to exchange; it holds ``ep_size * rows_per_peer`` rows.
+            rows_per_peer: Rows handed to each peer.
+            ep_size: Number of ranks in ``group``.
+            group: Process group to exchange over.
+
+        Returns:
+            The received rows, concatenated in peer order.
+        """
+        ctx.rows_per_peer = rows_per_peer
+        ctx.ep_size = ep_size
+        ctx.group = group
+        return _EPAllToAllEqual._exchange(x, rows_per_peer, ep_size, group)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None]:  # pylint: disable=arguments-differ
+        """Re-run the self-inverse equal-length exchange on the output gradient.
+
+        Args:
+            ctx: Autograd context of the forward exchange.
+            grad_output: Output gradient, one row per exchanged row.
+
+        Returns:
+            The input gradient, followed by ``None`` for the non-tensor arguments.
+        """
+        grad = _EPAllToAllEqual._exchange(
+            grad_output.contiguous(), ctx.rows_per_peer, ctx.ep_size, ctx.group)
         return grad, None, None, None
 
 
@@ -144,6 +246,49 @@ class _EPAllToAllPadded(torch.autograd.Function):  # pylint: disable=abstract-me
         return grad, None, None, None
 
 
+def _equal_a2a_rows(
+    x: torch.Tensor,
+    send_counts: list[int],
+    recv_counts: list[int],
+    group: Any,
+) -> Optional[int]:
+    """Rows per peer when the exchange may take the equal-length path, else None.
+
+    The equal-length path is only equivalent to the ragged one when the plan is
+    uniform *and* the payload really holds one such chunk per peer: the split
+    sizes then carry no information, and the plain all-to-all -- which derives
+    its chunking from the tensor shape alone -- moves exactly the rows the
+    ragged call would.  Anything else (unequal counts, a payload whose row count
+    disagrees with the counts, a non-contiguous payload, the knob off, a backend
+    without a ragged all-to-all) yields ``None`` so the caller keeps the path it
+    runs today.
+
+    Args:
+        x: Payload to exchange, split along dim 0.
+        send_counts: Rows sent to each EP rank.
+        recv_counts: Rows received from each EP rank.
+        group: EP process group.
+
+    Returns:
+        The uniform per-peer row count, or ``None`` when the fast path does not
+        apply.
+    """
+    if not _equal_a2a_enabled() or not _backend_supports_uneven_a2a(group):
+        return None
+    ep_size = len(send_counts)
+    if ep_size == 0 or len(recv_counts) != ep_size or not x.is_contiguous():
+        return None
+    rows_per_peer = send_counts[0]
+    # The split-free call takes the chunk size from the tensor shape and needs
+    # the receive buffer to be the input's size, so a uniform plan is only
+    # equivalent when both count lists hold that same count.
+    uniform = (all(count == rows_per_peer for count in send_counts)
+               and all(count == rows_per_peer for count in recv_counts))
+    if not uniform or x.shape[0] != rows_per_peer * ep_size:
+        return None
+    return rows_per_peer
+
+
 def ep_all_to_all(
     x: torch.Tensor,
     send_counts: list[int],
@@ -154,10 +299,15 @@ def ep_all_to_all(
 
     send_counts/recv_counts: list[int], length ep_size, row counts per dest/src rank.
     NCCL/HCCL -> ragged a2a (zero-padding); other backends (gloo test path) -> pad-to-max.
+    With ``HP_EP_EQUAL_A2A=1`` a uniform plan is exchanged with the equal-length
+    a2a instead (same rows, same order, cheaper kernel).
     """
-    if _backend_supports_uneven_a2a(group):
-        return _EPAllToAllUneven.apply(x, send_counts, recv_counts, group)
-    return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
+    if not _backend_supports_uneven_a2a(group):
+        return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
+    rows_per_peer = _equal_a2a_rows(x, send_counts, recv_counts, group)
+    if rows_per_peer is not None:
+        return _EPAllToAllEqual.apply(x, rows_per_peer, len(send_counts), group)
+    return _EPAllToAllUneven.apply(x, send_counts, recv_counts, group)
 
 
 def ep_all_to_all_async(
@@ -178,6 +328,16 @@ def ep_all_to_all_async(
     Backends without that support fall back to the blocking path, so the result
     always carries the same values — only the schedule differs.
 
+    With ``HP_EP_EQUAL_A2A=1`` and a uniform plan the exchange goes through
+    :class:`_EPAllToAllEqual` instead, i.e. the plain equal-length
+    ``all_to_all_single``.  That call reaches the backend without split sizes,
+    which is the cheaper kernel, but it is a ``dist`` collective rather than a
+    functional one: the current stream is ordered on the collective when it is
+    issued, so the returned tensor is not an ``AsyncCollectiveTensor`` and
+    independent work issued right after it no longer overlaps the transfer.
+    The knob therefore trades the lazy wait for the kernel; with it off, the
+    lazy ragged exchange below is exactly the one this entry runs today.
+
     Args:
         x: Input tensor, split along dim 0 by ``send_counts``.
         send_counts: Rows sent to each EP rank.
@@ -187,8 +347,11 @@ def ep_all_to_all_async(
     Returns:
         The exchanged rows, materialized lazily on the async path.
     """
-    if _backend_supports_uneven_a2a(group):
-        return platform.differentiable_all_to_all_single_async(
-            x, send_counts, recv_counts, group,
-        )
-    return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
+    if not _backend_supports_uneven_a2a(group):
+        return _EPAllToAllPadded.apply(x, send_counts, recv_counts, group)
+    rows_per_peer = _equal_a2a_rows(x, send_counts, recv_counts, group)
+    if rows_per_peer is not None:
+        return _EPAllToAllEqual.apply(x, rows_per_peer, len(send_counts), group)
+    return platform.differentiable_all_to_all_single_async(
+        x, send_counts, recv_counts, group,
+    )
