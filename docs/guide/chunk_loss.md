@@ -43,6 +43,8 @@ loss_sum = chunked_cross_entropy(
     lm_head.weight,
     chunk_size=1024,
     ignore_index=-100,
+    tp_mesh=None,          # TP>1 时传入切分词表的 tp 子 mesh
+    vocab_size=None,       # 默认由本地权重行数 × tp_size 推出
 )
 ```
 
@@ -50,9 +52,11 @@ loss_sum = chunked_cross_entropy(
 | --- | --- | --- |
 | `hidden_states` | `[B, S_local, H]`, floating | 当前 rank 的 final hidden |
 | `targets` | `[B, S_local]`, `torch.long` | 已和 hidden 对齐的目标 token |
-| `lm_head.weight` | `[V, H]`, floating | 当前 root forward 中可计算的完整 LM Head 权重 |
+| `lm_head.weight` | `[V, H]`（TP>1 时为 `[V/tp, H]`）, floating | 当前 root forward 中可计算的 LM Head 权重或其词表分片 |
 | `chunk_size` | positive `int` | 单次处理的最大本地序列长度 `C` |
 | `ignore_index` | `int` | 不参与交叉熵的目标值 |
+| `tp_mesh` | `DeviceMesh` 或 `None` | 切分词表的 tp 子 mesh；`None` 或单 rank mesh 走单卡路径 |
+| `vocab_size` | `int` 或 `None` | 全局词表大小；默认 `V_local * tp_size`，要求词表按 tp 均匀切分 |
 
 接口返回图连接的 FP32 标量 `loss_sum`，不在内部做 DP、CP、micro-batch 或 token 数归一化。
 
@@ -105,6 +109,9 @@ loss_fn:
 它的 `bind_model(model, distributed_setup)`。Qwen3-MoE 的 provider 通过模型 adapter registry
 自动解析，用户不需要在 recipe 中手写 forward patch。
 
+`loss_fn` 配置本身与并行度无关：TP>1 时仍使用同一个 `_target_`，`bind_model` 会自行解析 tp 子
+mesh（详见 §7），recipe 只需要把 `accelerator.tp_size` 设为大于 1。
+
 每个 micro-batch 的 Trainer 流程是：
 
 1. batch adapter 返回独立的 `model_inputs` 与 `loss_inputs`；
@@ -145,7 +152,8 @@ Chunk Loss 路径按以下顺序执行：
 
 1. 调用 `model.model(...)` 得到 `last_hidden_state`；
 2. 校验 final hidden 与预先 shifted targets 对齐，并应用 loss mask；
-3. 直接以 `model.lm_head.weight` 调用 `chunked_cross_entropy`；
+3. 直接以 `model.lm_head.weight` 调用 `chunked_cross_entropy`（TP>1 时附带
+   `tp_mesh=chunk_loss_tp_mesh(model)`）；
 4. 若 `output_router_logits=true`，复用 Transformers 的 load-balancing loss，并保留原
    `router_aux_loss_coef`；
 5. 返回 `ChunkedCausalLMOutput`，明确令 `logits=None`。
@@ -153,14 +161,32 @@ Chunk Loss 路径按以下顺序执行：
 训练路径要求 `use_cache=false`、`return_dict=true` 和 `logits_to_keep=0`。LM Head 当前必须是无
 bias 的 `torch.nn.Linear`。adapter 的绑定是幂等的，未收到 Chunk Loss 参数时会回退原 forward。
 
-## 7. FSDP、CP、EP 与当前限制
+## 7. FSDP、CP、EP、TP 与当前限制
 
-第一版支持 TP=1、PP=1、loss parallel 关闭时的普通 DP/FSDP、CP 和 EP 组合。以下边界会在首个
-forward 之前 fail fast：
+第一版只支持 TP=1 时的普通 DP/FSDP、CP 和 EP 组合；现在 TP>1（关闭 loss parallel）也已支持，
+仅 PP>1 与 loss parallel 会在首个 forward 之前 fail fast：
 
-- TP>1：词表或 hidden 维分片需要分布式 softmax/交叉熵，不能直接把本地 shard 当完整权重；
 - PP>1：最后 stage 的 loss 输入、token 归一化与 stage 输出协议尚未接入；
 - loss parallel：会和当前完整词表 Chunk Loss 重复定义 logits/softmax 布局。
+
+### TP>1（词表分片）
+
+TP>1 时 LM Head 权重按 `Shard(0)` 切成 `[V/tp, H]`，本地 logits 只覆盖本 rank 的词表区间，
+因此交叉熵的 softmax 归一化与 target 项都需要跨 TP 组规约。实现方式：
+
+1. `ChunkedCausalLMLoss.bind_model()` 从 `distributed_setup.mesh_context.device_mesh["tp"]`
+   取得 tp 子 mesh，并记录到模型上（`chunk_loss_tp_mesh(model)` 读取）；
+2. 模型族 adapter 把它透传给 `chunked_cross_entropy(..., tp_mesh=...)`；
+3. `chunked_cross_entropy` 复用 `components/losses/_vocab_parallel_cross_entropy.py`
+   的 vocab-parallel 交叉熵：每块执行 max / sumexp / target 项三次规约，返回完整词表的 CE 和；
+4. 每个 rank 只对自己词表分片内的 token 微分，因此 `dHidden` 需要再在 TP 组上求和，
+   才能满足「非 loss parallel 下 loss 与激活梯度在每个 TP rank 上完全相同」的既有约定
+   （见 `distributed/_builder/fsdp_adapter.py` 的 SUM 梯度缩放说明）。
+
+该路径要求词表按 tp 均匀切分（`V % tp == 0`），否则 `chunked_cross_entropy` 直接报错，
+不会用错误的词表区间去遮挡 target。TP 与 sequence parallel 共用同一条 mesh 轴，会让不同 token
+切片进入同一次词表规约，因此 `sequence_parallel=true` 且 tp>1 时 `bind_model` 直接
+`NotImplementedError`。单卡路径（`tp_mesh=None` 或单 rank mesh）与改动前的实现逐位一致。
 
 FSDP root forward 覆盖 Qwen decoder 和 LM Head；Chunk Loss 在该 forward 返回前使用 unshard 后
 的 `lm_head.weight`。它产生的 `dWeight` 仍作为该 Parameter 的梯度交给既有 FSDP

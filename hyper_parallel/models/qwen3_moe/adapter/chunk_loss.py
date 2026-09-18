@@ -27,6 +27,7 @@ from torch import nn
 
 from hyper_parallel.components.losses.chunked_cross_entropy import (
     ChunkedCausalLMOutput,
+    chunk_loss_tp_mesh,
     chunked_cross_entropy,
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: disable=protected-access
@@ -112,6 +113,7 @@ def _qwen3_moe_chunk_loss_forward(
         model.lm_head.weight,
         chunk_size=chunk_loss_chunk_size,
         ignore_index=chunk_loss_ignore_index,
+        tp_mesh=chunk_loss_tp_mesh(model),
     )
     valid_token_count = aligned_targets.ne(chunk_loss_ignore_index).sum()
 
