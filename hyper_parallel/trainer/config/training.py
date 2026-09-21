@@ -54,6 +54,13 @@ class TrainingConfig:
     # wins when present). Recompute from activation checkpointing is not
     # counted as useful FLOPs.
     peak_tflops: Optional[float] = None
+    # Reserved for the hardware-utilisation view: HFU counts *every* FLOP the device
+    # executes, so the activation-checkpoint recomputation forward has to be added to the
+    # model FLOPs that MFU uses (recompute doubles one forward: 6N -> 8N, i.e. x4/3 when
+    # every layer is checkpointed).  Leave unset to derive it from
+    # ``activation_checkpoint.mode``; set it explicitly for a selective schedule, where the
+    # recomputed fraction is a policy detail the callback cannot see.
+    hfu_recompute_factor: Optional[float] = None
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 

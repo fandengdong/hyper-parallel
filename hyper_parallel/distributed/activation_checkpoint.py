@@ -65,6 +65,29 @@ def _existing_ops(*ops):
     return frozenset(op for op in ops if op is not None)
 
 
+# The built-in selective save set is derived from torch's own compute-intensive
+# operator list, which on the NPU stack carries no ``npu::`` operators -- so the
+# MoE grouped GEMM (``torch_npu.npu_grouped_matmul``, which dominates this model's
+# device time) is NOT covered and gets recomputed by the activation checkpoint.
+# This env extends the set with named ``npu::`` operators, e.g.
+# ``HP_AC_SELECTIVE_EXTRA_SAVE_OPS=npu_grouped_matmul``, so the trade can be
+# measured without editing code. Empty (the default) leaves the set unchanged.
+HP_AC_EXTRA_SAVE_OPS_ENV = "HP_AC_SELECTIVE_EXTRA_SAVE_OPS"
+
+
+def _extra_selective_ac_save_ops() -> frozenset:
+    """Resolve the optional extra selective-save operators named in the environment."""
+    raw = os.environ.get(HP_AC_EXTRA_SAVE_OPS_ENV, "")
+    resolved = []
+    for name in (part.strip() for part in raw.split(",")):
+        if not name:
+            continue
+        op = _resolve_torch_op(name if name.startswith("npu.") else f"npu.{name}")
+        if op is not None:
+            resolved.append(op)
+    return _existing_ops(*resolved)
+
+
 # Matmul operators alternate between saving and recomputing their outputs. The
 # counter is scoped to one checkpoint region by ``make_selective_checkpoint_context_fn``.
 _SELECTIVE_AC_MATMUL_OPS = _existing_ops(
@@ -154,6 +177,7 @@ def _build_selective_ac_must_save_ops():
     )
     save_ops.update(compute_ops)
     save_ops.update(comm_ops)
+    save_ops.update(_extra_selective_ac_save_ops())
     save_ops.difference_update(_SELECTIVE_AC_FORCE_RECOMPUTE_OPS)
     return frozenset(save_ops)
 

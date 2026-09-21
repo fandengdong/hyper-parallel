@@ -35,10 +35,16 @@ __all__ = [
     "ExpertTensorParallel",
 ]
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
+from hyper_parallel.core.expert_parallel.static_splits import (
+    get_static_plan,
+    static_plan_key,
+    store_static_plan,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -512,9 +518,9 @@ class AllToAllTokenDispatcher:
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Tuple ``(permuted_local_input, local_token_counts, ctx)`` or 
+            Tuple ``(permuted_local_input, local_token_counts, ctx)`` or
             ``(permuted_local_input, local_token_counts, permuted_probs, ctx)``
-            depending on whether *permuted_probs* was provided - 
+            depending on whether *permuted_probs* was provided -
             the first two elements are the transformed inputs for local
             expert computation; *ctx* is a :class:`DispatchContext`
             carrying the updated state to be stored by the caller.
@@ -526,33 +532,47 @@ class AllToAllTokenDispatcher:
         ep_size = device_mesh.size()
         num_local_experts = num_tokens_per_expert.shape[0] // ep_size
 
-        # --- Step 1: exchange token counts (no gradient needed) ---
-        # Each rank needs to know how many tokens it will receive from every
-        # other rank (for each local expert).  Uses ``async_op=True`` + an
-        # explicit ``handle.wait()`` rather than ``async_op=False`` because
-        # the implicit cross-stream sync is NCCL-only; on HCCL the compute
-        # stream may read ``counts_out`` before the collective write is
-        # visible, producing garbage values that blow up the downstream
-        # ``torch.empty(sum(output_splits), ...)`` allocation.
-        counts_out, handle = platform.all_to_all_single(
-            num_tokens_per_expert,
-            output_shape=[num_tokens_per_expert.shape[0]],
-            group=ep_group,
-            async_op=True,
+        # --- Steps 1-2: token counts and the split vectors ---
+        # Under a static routing plan the answer never changes, so it is computed once and
+        # reused: that is what removes the per-layer counts a2a and its two D2H syncs.
+        plan_key = static_plan_key(
+            num_tokens_per_expert.shape[0], ep_size, num_local_experts,
+            device=num_tokens_per_expert.device,
         )
-        if handle is not None:
-            handle.wait()
-        # counts_out shape: [ep_size * num_local_experts]
-        # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
+        cached_plan = get_static_plan(plan_key)
+        if cached_plan is not None:
+            counts_out, input_splits, output_splits = cached_plan
+        else:
+            # Each rank needs to know how many tokens it will receive from every
+            # other rank (for each local expert).  Uses ``async_op=True`` + an
+            # explicit ``handle.wait()`` rather than ``async_op=False`` because
+            # the implicit cross-stream sync is NCCL-only; on HCCL the compute
+            # stream may read ``counts_out`` before the collective write is
+            # visible, producing garbage values that blow up the downstream
+            # ``torch.empty(sum(output_splits), ...)`` allocation.
+            counts_out, handle = platform.all_to_all_single(
+                num_tokens_per_expert,
+                output_shape=[num_tokens_per_expert.shape[0]],
+                group=ep_group,
+                async_op=True,
+            )
+            if handle is not None:
+                handle.wait()
+            # counts_out shape: [ep_size * num_local_experts]
+            # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
 
-        # --- Step 2: compute input / output splits ---
-        # input_splits[r] = tokens this rank sends to rank r
-        # output_splits[r] = tokens this rank receives from rank r
-        # Reshape to [ep_size, num_local_experts] and sum per rank on device;
-        # a single ``tolist()`` drains the rank-sum vector to host, replacing
-        # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
-        input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
-        output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            # input_splits[r] = tokens this rank sends to rank r
+            # output_splits[r] = tokens this rank receives from rank r
+            # Reshape to [ep_size, num_local_experts] and sum per rank on device;
+            # a single ``tolist()`` drains the rank-sum vector to host, replacing
+            # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
+            input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            store_static_plan(
+                plan_key, (counts_out, input_splits, output_splits),
+                f"(ep={ep_size}, local_experts={num_local_experts}, "
+                f"tokens/peer={input_splits[0] if input_splits else 0})",
+            )
 
         # --- Step 3a: exchange actual tokens (differentiable) ---
         dispatched = platform.differentiable_all_to_all_single(
@@ -989,6 +1009,8 @@ class DeredundencyTokenDispatcher:
         return handle.wait()
 
 
+logger = logging.getLogger(__name__)
+
 _TOKEN_DISPATCHERS = {
     "all_to_all": AllToAllTokenDispatcher,
     "deredundency": DeredundencyTokenDispatcher,
@@ -1089,12 +1111,12 @@ class ExpertParallel(BaseExpertParallel):
 
         Args:
             module: The ``GroupedExperts`` module.
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or 
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
                 ``(routed_input, num_tokens_per_expert, routed_probs)``.
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Tuple ``(permuted_local_input, local_token_counts)`` or 
+            Tuple ``(permuted_local_input, local_token_counts)`` or
             ``(permuted_local_input, local_token_counts, permuted_probs)``
             depending on whether *routed_probs* was provided.
         """

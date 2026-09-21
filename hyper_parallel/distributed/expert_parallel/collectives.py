@@ -64,6 +64,16 @@ _EQUAL_A2A_MODES = {
 }
 _EQUAL_A2A_RAW = os.environ.get("HP_EP_EQUAL_A2A", "0")
 
+# Ragged (uneven) exchange kernel: the list form issues one
+# ``dist.all_to_all`` with per-peer tensors, which HCCL serves through
+# alltoallv; ``HP_EP_A2A_SINGLE=1`` issues the identical exchange as one
+# ``all_to_all_single`` with split sizes, the form the micro benchmark
+# measures at ~2x the bandwidth (106.4 vs 52.9 GB/s). Default off.  Scope: this
+# only affects THIS synchronous entry; the training MoE path calls
+# ``ep_all_to_all_async``, whose ``_AsyncA2ALazyBwd`` already issues the split-sized
+# ``all_to_all_single``, so the knob is a no-op there (measured: neutral).
+_A2A_SINGLE = os.environ.get("HP_EP_A2A_SINGLE", "0") == "1"
+
 # Lazily created, then reused for every lazy exchange (see
 # :func:`_lazy_a2a_resources`): the stream the split-free collective is issued
 # on, the event that hands it the payload, and the event that hands the result
@@ -125,8 +135,17 @@ class _EPAllToAllUneven(torch.autograd.Function):  # pylint: disable=abstract-me
         ctx.recv_counts = recv_counts
         ctx.group = group
         out = x.new_empty((sum(recv_counts),) + tuple(x.shape[1:]))
-        dist.all_to_all(list(out.split(recv_counts)),
-                        list(x.split(send_counts)), group=group)
+        if _A2A_SINGLE:
+            dist.all_to_all_single(
+                out,
+                x.contiguous(),
+                output_split_sizes=[int(count) for count in recv_counts],
+                input_split_sizes=[int(count) for count in send_counts],
+                group=group,
+            )
+        else:
+            dist.all_to_all(list(out.split(recv_counts)),
+                            list(x.split(send_counts)), group=group)
         return out
 
     @staticmethod

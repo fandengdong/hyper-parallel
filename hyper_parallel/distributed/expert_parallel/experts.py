@@ -45,6 +45,12 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import (
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _install_bound_forward,
 )
+from hyper_parallel.core.expert_parallel.static_splits import (
+    get_static_plan,
+    probe_mode,
+    static_plan_key,
+    store_static_plan,
+)
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
     ep_all_to_all_async,
@@ -369,17 +375,48 @@ def _prepare_ep_dispatch(
     )
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
-    send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
-    receive_counts_tensor = torch.empty_like(send_counts_tensor)
-    dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
+    # The counts exchange is a host-serialising step: a synchronous all-to-all followed
+    # by two ``.tolist()`` drains, and a drain waits for everything already enqueued on
+    # the stream, so the token all-to-all cannot be enqueued until the counts land.  When
+    # the routing plan is static (``fix_router: true``) the answer is the same in every
+    # layer, so it is computed once and reused -- that removes the extra collective and
+    # both syncs from every later dispatch.  See ``static_splits`` for the caveats.
+    plan_key = static_plan_key(
+        token_count, experts_per_token, ep_size, local_expert_count, global_expert_count,
+        device=flattened_states.device,
+    )
+    cached_counts = get_static_plan(plan_key)
+    if cached_counts is not None:
+        send_counts, receive_counts, send_counts_tensor, receive_counts_tensor = cached_counts
+        # Bisect probes (see ``probe_mode``): run one half of the original work so the
+        # 4/4 OOM can be attributed.  Both branches are no-ops in a normal run.
+        mode = probe_mode()
+        if mode == "a2a":
+            dist.all_to_all_single(
+                torch.empty_like(send_counts_tensor), send_counts_tensor, group=ep_group,
+            )
+        elif mode == "drains":
+            send_counts_tensor.tolist()
+            receive_counts_tensor.tolist()
+    else:
+        send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
+        receive_counts_tensor = torch.empty_like(send_counts_tensor)
+        dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
+        send_counts = send_counts_tensor.tolist()
+        receive_counts = receive_counts_tensor.tolist()
+        store_static_plan(
+            plan_key, (send_counts, receive_counts, send_counts_tensor, receive_counts_tensor),
+            f"(ep={ep_size}, tokens={token_count}, topk={experts_per_token}, "
+            f"tokens/peer={send_counts[0] if send_counts else 0})",
+        )
     return (
         source_indices,
         expert_weights,
         dispatch_order,
         dispatched_states,
         dispatched_indices,
-        send_counts_tensor.tolist(),
-        receive_counts_tensor.tolist(),
+        send_counts,
+        receive_counts,
     )
 
 

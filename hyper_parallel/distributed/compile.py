@@ -15,12 +15,22 @@
 """Compile Transformer decoder layers as independent graph segments."""
 
 import logging
+import os
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Optional, Union
 
 import torch
 from torch import nn
 
+from hyper_parallel.distributed.npu_inductor_shim import (  # isort: skip
+    apply_npu_kernel_fallbacks,
+    fallback_spec,
+    install_npu_flattened_dims_shim,
+    install_rope_eager_break,
+    rope_eager_is_requested,
+    shim_is_requested,
+)
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 
@@ -198,25 +208,161 @@ def resolve_compile_kwargs(config: CompileConfig) -> dict[str, Any]:
     return kwargs
 
 
+def _resolve_compile_targets(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Return the modules to compile, optionally inside the checkpoint wrappers.
+
+    Compiling the decoder layers while activation checkpointing is on puts the
+    checkpoint context manager *inside* the traced region, and dynamo refuses to
+    enter a ``_GeneratorContextManager``: every layer then breaks its graph at the
+    entry and silently runs eagerly, so nothing is ever fused.  Measured on the
+    2-SN shape: HP logged "Compiled 61 decoder layers", the cache dir stayed empty,
+    and the device kernel inventory of a compile-enabled arm was byte-identical to
+    the uncompiled one (34856 kernels / 144 distinct, 0 only-in-either).
+
+    ``HP_COMPILE_INSIDE_AC=1`` compiles the module held *by* each checkpoint wrapper
+    instead, which leaves the context manager outside the compiled graph while still
+    covering the math (attention projections, MoE routing/permute, elementwise) that
+    the compiler is supposed to fuse.  Default off: unchanged behaviour.
+
+    Args:
+        model: Model whose compile targets should be resolved.
+
+    Returns:
+        ``(fqn, module)`` pairs to compile.
+    """
+    if os.environ.get("HP_COMPILE_INSIDE_AC", "0") != "1":
+        return get_compile_layers(model)
+
+    from hyper_parallel.distributed.activation_checkpoint import (  # pylint: disable=import-outside-toplevel
+        _find_checkpoint_wrappers,
+        _get_checkpoint_wrapped_module,
+    )
+
+    wrappers = _find_checkpoint_wrappers(model)
+    targets = []
+    for path, wrapper in wrappers.items():
+        inner = _get_checkpoint_wrapped_module(wrapper)
+        if isinstance(inner, nn.Module):
+            targets.append((path, inner))
+
+    # ``HP_COMPILE_INSIDE_AC_INCLUDE`` narrows the targets further by FQN regex.  It
+    # exists because compiling a MoE block makes execution fail inside the fused
+    # grouped GEMM (`npu_grouped_matmul ... call aclnnGroupedMatmulV5 failed, error
+    # code is 1`), while the attention blocks are where most of the copy/reshape glue
+    # lives (MLA rebuilds q/k/v with transpose/strided-slice/cat).  Empty (default)
+    # keeps every wrapped block.
+    include = os.environ.get("HP_COMPILE_INSIDE_AC_INCLUDE", "").strip()
+    if include:
+        try:
+            pattern = re.compile(include)
+        except re.error as error:
+            logger.warning(
+                "HP_COMPILE_INSIDE_AC_INCLUDE=%r is not a valid regular expression (%s); "
+                "compiling every wrapped block instead.",
+                include,
+                error,
+            )
+        else:
+            narrowed = [(path, module) for path, module in targets if pattern.search(path)]
+            flat = os.environ.get("HP_COMPILE_DESCENDANTS", "0") == "1"
+            if not narrowed and flat:
+                # A wrapped block can be a whole transformer layer, whose FQN carries no
+                # "attn" even though it *contains* the attention modules.  Matching the
+                # block FQNs only is how the first 2-SN compile arms ended up compiling the
+                # vision tower instead of the text tower: the config lists exactly 108
+                # vision-tower attention leaf specs, and "attn" selected those 108 -- a
+                # frozen subtree worth <1% of the step, whose modules are single matmuls
+                # with nothing to fuse.  With HP_COMPILE_DESCENDANTS=1 the pattern is
+                # matched against each wrapped block's descendants and the matching child
+                # is compiled instead, so `language_model.*self_attn$` reaches the text
+                # attention without pulling in the MoE grouped GEMM that crashes.
+                narrowed = _select_descendants(targets, pattern)
+            logger.info(
+                "Compile target filter %r kept %d wrapped block(s) as %d compile target(s)%s",
+                include, len([p for p, _ in targets if pattern.search(p)]) or len(targets),
+                len(narrowed), " (descendant match)" if flat else "",
+            )
+            if narrowed:
+                _log_target_preview(include, narrowed)
+            targets = narrowed
+
+    return targets or get_compile_layers(model)
+
+
+def _select_descendants(
+    targets: list[tuple[str, nn.Module]],
+    pattern: "re.Pattern[str]",
+) -> list[tuple[str, nn.Module]]:
+    """Return the deepest descendants of ``targets`` whose FQN matches ``pattern``.
+
+    Deepest-match keeps the compiled region as small as the pattern asks for: matching
+    ``self_attn$`` yields the attention module itself rather than each projection inside
+    it, which is where the copy/reshape glue of an MLA rebuild lives.
+
+    Args:
+        targets: ``(fqn, module)`` pairs of the wrapped blocks to search.
+        pattern: compiled FQN regular expression.
+
+    Returns:
+        ``(fqn, module)`` pairs, deduplicated by module identity.
+    """
+    seen: set[int] = set()
+    matches: list[tuple[str, nn.Module]] = []
+    for path, module in targets:
+        for rel, child in module.named_modules():
+            fqn = f"{path}.{rel}" if rel else path
+            if not pattern.search(fqn) or id(child) in seen:
+                continue
+            seen.add(id(child))
+            matches.append((fqn, child))
+    # Keep only the outermost matches: compiling a parent already covers its children, and
+    # nested ``torch.compile`` wrappers are exactly the failure mode this module exists to
+    # avoid.  ``self_attn$`` therefore yields the attention module, not each projection.
+    return [
+        (fqn, child)
+        for fqn, child in matches
+        if not any(fqn.startswith(other + ".") for other, _ in matches)
+    ]
+
+
+def _log_target_preview(include: str, targets: list[tuple[str, nn.Module]]) -> None:
+    """Log which subtrees a compile filter selected, so a mis-target is visible."""
+    families: dict[str, int] = {}
+    for fqn, _ in targets:
+        head = ".".join(fqn.split(".")[:3])
+        families[head] = families.get(head, 0) + 1
+    logger.info("  filter %r target families: %s", include, dict(sorted(families.items())))
+    logger.info("  filter %r first targets: %s", include, [fqn for fqn, _ in targets[:4]])
+
+
 def apply_compile(model: nn.Module, config: CompileConfig) -> nn.Module:
     """Compile each decoder layer in place while preserving module identity."""
     if not config.enabled:
         return model
 
     _install_dynamo_mapping_get_polyfill()
+    if shim_is_requested():
+        install_npu_flattened_dims_shim()
+        apply_npu_kernel_fallbacks(fallback_spec())
+    if rope_eager_is_requested():
+        install_rope_eager_break()
     torch._dynamo.config.cache_size_limit = config.dynamo_cache_size_limit  # pylint: disable=W0212
     compile_kwargs = resolve_compile_kwargs(config)
-    layers = get_compile_layers(model)
+    layers = _resolve_compile_targets(model)
     for layer_fqn, layer in layers:
         try:
             layer.compile(**compile_kwargs)
         except Exception as exc:
             raise RuntimeError(f"failed to compile segment {layer_fqn}") from exc
 
+    # Report the backend that will actually run: ``resolve_compile_kwargs`` omits the
+    # argument when it is unset, so the effective value is torch.compile's default
+    # ("inductor"), not the ``None`` that ``config.backend`` holds.  Logging the raw config
+    # value sent me chasing a nonexistent "backend=None" no-op for a while.
     logger.info(
         "Compiled %d decoder layers (backend=%s, mode=%s, dynamic=%s, fullgraph=%s)",
         len(layers),
-        config.backend,
+        compile_kwargs.get("backend", "inductor"),
         config.mode,
         config.dynamic,
         config.fullgraph,

@@ -18,7 +18,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
 
-from hyper_parallel.models.flops import batch_seq_len, resolve_flops_per_token
+from hyper_parallel.models.flops import batch_seq_len, resolve_flops_per_token, resolve_recompute_factor
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -366,5 +366,14 @@ class EnvironMeterCallback(Callback):
                 env_metrics["performance/mfu"] = env_metrics["performance/tflops"] / (
                     self._peak_tflops * max(get_world_size_safe(), 1)
                 )
+                # HFU is the hardware view: the recompute forward is executed FLOPs even
+                # though MFU excludes it.  Unknowable for a selective schedule without an
+                # explicit factor, in which case it stays absent rather than guessed.
+                factor = resolve_recompute_factor(
+                    self.trainer.config,
+                    getattr(self.trainer.config.training, "hfu_recompute_factor", None),
+                )
+                if factor:
+                    env_metrics["performance/hfu"] = env_metrics["performance/mfu"] * factor
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics

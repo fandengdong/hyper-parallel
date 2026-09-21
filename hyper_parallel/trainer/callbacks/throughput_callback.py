@@ -52,7 +52,11 @@ import logging
 import time
 from typing import Any, Optional
 
-from hyper_parallel.models.flops import batch_seq_len, resolve_flops_per_token
+from hyper_parallel.models.flops import (
+    batch_seq_len,
+    resolve_flops_per_token,
+    resolve_recompute_factor,
+)
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 
 from .base import Callback, TrainerState
@@ -87,14 +91,17 @@ class ThroughputMFUCallback(Callback):
         self._log_steps = (
             log_steps if log_steps is not None else training_cfg.logging_steps
         )
+        self._hfu_recompute_factor = getattr(training_cfg, "hfu_recompute_factor", None)
         self._peak_tflops = (
             peak_tflops if peak_tflops is not None else training_cfg.peak_tflops
         )
         self._global_batch_size = int(getattr(training_cfg, "global_batch_size", 1) or 1)
         self._flops_per_token: Optional[float] = None  # resolved lazily
+        self._recompute_factor: Optional[float] = None  # resolved lazily (HFU)
         self._seq_len: Optional[int] = None  # captured from the first batch
         self._step_start_time = 0.0
         self._warned_missing = False
+        self._warned_hfu = False
         self.last_record: dict[str, Any] = {}
 
     def on_step_begin(
@@ -135,6 +142,20 @@ class ThroughputMFUCallback(Callback):
         if value:
             self._flops_per_token = value
         return self._flops_per_token
+
+    def _resolve_recompute_factor(self) -> Optional[float]:
+        """Return the MFU -> HFU multiplier, or ``None`` when it is unknowable."""
+        if self._recompute_factor is None:
+            self._recompute_factor = resolve_recompute_factor(
+                getattr(self.trainer, "config", None), self._hfu_recompute_factor
+            )
+            if self._recompute_factor is None and not self._warned_hfu:
+                self._warned_hfu = True
+                logger.info(
+                    "ThroughputMFU: activation_checkpoint.mode=selective, so HFU needs an "
+                    "explicit training.hfu_recompute_factor; reporting MFU only"
+                )
+        return self._recompute_factor
 
     def _resolve_throughput(self, state: TrainerState) -> tuple[float, float]:
         """Return ``(padded_tokens_per_sec, step_time)``, preferring shared metrics.
@@ -198,6 +219,13 @@ class ThroughputMFUCallback(Callback):
                 mfu = observed / (self._peak_tflops * world)
                 record["mfu"] = mfu
                 fields.append(f"mfu={mfu * 100:.1f}%")
+                factor = self._resolve_recompute_factor()
+                if factor:
+                    # HFU = every FLOP the device runs / peak; MFU omits the recompute
+                    # forward by definition (see TrainingConfig.peak_tflops).
+                    record["hfu"] = mfu * factor
+                    record["recompute_factor"] = factor
+                    fields.append(f"hfu={mfu * factor * 100:.1f}%")
             elif not self._warned_missing:
                 self._warned_missing = True
                 logger.info(
