@@ -104,15 +104,14 @@ class ProfilingCallback(Callback):
         )
         self.profiler.start()
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
-        """Advance the profiler schedule after one complete optimizer step.
-
-        Args:
-            state: Trainer state at the end of the step.
-        """
-        del state, kwargs
+    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:  # pylint: disable=arguments-differ
+        """Advance the profiler schedule after one complete optimizer step."""
+        del kwargs
         if self.profiler is not None:
             self.profiler.step()
+            if state.global_step >= self.config.end_step:
+                self.profiler.stop()
+                self.profiler = None
 
     def on_train_end(self, state: TrainerState, **kwargs: Any) -> None:
         """Stop the profiler and flush any pending trace output.

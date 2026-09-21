@@ -35,9 +35,11 @@ The backend compilation slot (InductorPass) is intentionally not wired yet;
 add it here when an inductor backend integration lands.
 """
 
+__all__ = ["PassPipeline"]
+
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from ..parallel_config import PassConfig
+from ..pass_config import PassConfig
 from .base import GraphPass
 from .overlap.schedule import AutoOverlapPass
 from .parallel.fsdp_pass import FSDPPass
@@ -45,7 +47,7 @@ from .parallel.pp_pass import PpPass
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import PassPlan
+    from ..pass_plan import PassPlan
 
 
 class PassPipeline:
@@ -162,6 +164,3 @@ class CanonicalizeGraphPass(GraphPass):
         graph_module.graph.lint()
         graph_module.recompile()
         return graph_module
-
-
-__all__ = ["PassPipeline"]

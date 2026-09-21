@@ -20,6 +20,7 @@ Demonstrates how to use HyperParallel Graph Mode for training a simple model.
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from typing import Iterator, Tuple
@@ -29,13 +30,17 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413
     GraphTrainer,
     PassConfig,
     PassPlan,
 )
+
+_LOG = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,10 +81,10 @@ def build_pass_config(config: dict) -> PassConfig:
 
 
 def build_pass_plan(config: dict) -> PassPlan:
-    """Build sharding plan from YAML config"""
+    """Build PassPlan from YAML config"""
     if "sharding" in config:
         # Use YAML configuration
-        from hyper_parallel.compile import create_sharding_plan_from_yaml  # pylint: disable=C0415
+        from hyper_parallel.compile import create_pass_plan_from_yaml  # pylint: disable=C0415
         import tempfile  # pylint: disable=C0415
 
         # Write sharding config to temp file
@@ -87,7 +92,7 @@ def build_pass_plan(config: dict) -> PassPlan:
             yaml.dump(config["sharding"], f)
             temp_path = f.name
 
-        plan = create_sharding_plan_from_yaml(config_path=temp_path)
+        plan = create_pass_plan_from_yaml(config_path=temp_path)
 
         # Clean up temp file
         import os  # pylint: disable=C0415
@@ -117,8 +122,9 @@ def train_fn(
     return loss
 
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-locals
     """Run single/multi-card FSDP training on the dummy model."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
     config = load_config(args.config)
 
@@ -128,12 +134,12 @@ def main() -> None:
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-    print("=" * 80)
-    print("Simple Model Training with HyperParallel Graph Mode")
-    print("=" * 80)
-    print(f"Rank: {rank}/{world_size}")
-    print(f"FSDP: {world_size}")
-    print("=" * 80)
+    _LOG.info("=" * 80)
+    _LOG.info("Simple Model Training with HyperParallel Graph Mode")
+    _LOG.info("=" * 80)
+    _LOG.info("Rank: %s/%s", rank, world_size)
+    _LOG.info("FSDP: %s", world_size)
+    _LOG.info("=" * 80)
 
     # Create dummy model (example)
     class DummyModel(torch.nn.Module):
@@ -175,7 +181,8 @@ def main() -> None:
     # The data iterator yields ``(input, label)`` batches. train drives the whole
     # loop: it compiles on the first batch, moves each batch onto the trainer's
     # device, runs a step + optimizer update, and logs on ``log_interval``.
-    # Batches are produced on CPU; ``train`` moves them onto ``trainer.device``.
+    # Batches are produced on CPU; ``train`` moves them onto the compiler's
+    # device.
     g_input_ids = torch.randint(0, vocab_size, (1, max_seq_len))
     g_labels = torch.randint(0, vocab_size, (1, max_seq_len))
 
@@ -186,11 +193,11 @@ def main() -> None:
             labels = g_labels
             yield input_ids, labels
 
-    print("\nStarting training...")
+    _LOG.info("\nStarting training...")
     trainer.train(data_iter(), max_steps=max_steps, log_interval=log_interval)
-    print("\n" + "=" * 80)
-    print("Training completed!")
-    print("=" * 80)
+    _LOG.info("\n%s", "=" * 80)
+    _LOG.info("Training completed!")
+    _LOG.info("=" * 80)
 
     # Cleanup distributed training
     cleanup_distributed()

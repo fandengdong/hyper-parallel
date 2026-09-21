@@ -26,12 +26,6 @@ Most other `parallel_*.py` use **legacy** dispatch — do not copy those signatu
 `tests/ut/core/shard/ops/test_parallel_{op_name}.py` — follow
 `distributed-op-testing.md`.
 
-## MindSpore ST (if applicable)
-
-`tests/mindspore/st/shard/ops/cases/case_{op_name}.py` — declarative
-`OpShardCase` (`ms.mint.*`, never raw Primitives). Tags:
-`("npu_level0",)` or `("npu_level1",)`. Placement length == mesh ndim.
-
 ## PyTorch ST (if applicable)
 
 `tests/torch/shard/ops/cases/case_{op_name}.py` — same framework with
@@ -49,15 +43,10 @@ pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_lev
 # Ascend only:
 pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
 pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
-pytest -vs tests/mindspore/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
-pytest -vs tests/mindspore/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
 
 HYPER_PARALLEL_SHARD_CASE_FILTER="{op}_ops_*" \
   pytest tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
 python -m tests.shard_ops.framework --case {op}_ops_dp --num-proc 4
-HYPER_PARALLEL_PLATFORM=mindspore \
-  python -m tests.shard_ops.framework --framework mindspore --device-type npu \
-  --case {op}_ops_dp --num-proc 4
 ```
 
 `--num-proc` == `math.prod(mesh_shape)`. Non-Ascend: UT + Torch gloo only.

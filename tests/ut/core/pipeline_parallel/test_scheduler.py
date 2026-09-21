@@ -18,7 +18,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # pylint: disable=C0413
 import torch
@@ -76,44 +75,73 @@ class TestSyncSharedParametersGradGuards(unittest.TestCase):
     def _call(self, info):
         """Invoke the unbound method on a duck-typed stage that owns ``info``."""
         fake_stage = SimpleNamespace(_shared_parameters=[info], _has_backward=True)
-        with patch("hyper_parallel.core.pipeline_parallel.stage.platform") as mock_platform:
-            mock_platform.all_reduce.return_value = (torch.zeros(2, 2), None)
+        with patch("hyper_parallel.core.pipeline_parallel.stage.dist") as mock_dist:
+            mock_dist.all_reduce.return_value = None
             PipelineStage.sync_shared_parameters_grad(fake_stage)
-        return mock_platform
+        return mock_dist
 
     def test_zero_fills_when_grad_is_none(self):
         """A ``None`` grad still enters the collective with a zero contribution."""
         info = self._make_info(grad=None, group="pp_group")
-        mock_platform = self._call(info)
-        mock_platform.full_like.assert_called_once()
-        assert mock_platform.all_reduce.call_count == 1, \
+        mock_dist = self._call(info)
+        torch.testing.assert_close(info.parameter.grad, torch.zeros_like(info.parameter))
+        assert mock_dist.all_reduce.call_count == 1, \
             (f"a grad-less shared end must still all-reduce (zeros), "
-             f"got {mock_platform.all_reduce.call_count} calls")
+             f"got {mock_dist.all_reduce.call_count} calls")
 
     def test_skips_when_group_is_none(self):
         """A ``None`` group (handshake not yet run) must not reach ``all_reduce``."""
         info = self._make_info(grad=torch.ones(2, 2), group=None)
-        mock_platform = self._call(info)
-        mock_platform.all_reduce.assert_not_called()
+        mock_dist = self._call(info)
+        mock_dist.all_reduce.assert_not_called()
 
     def test_skips_when_frozen(self):
         """``requires_grad=False`` peers all skip (tied/frozen is group-wide)."""
         info = self._make_info(grad=None, group="pp_group", requires_grad=False)
-        mock_platform = self._call(info)
-        mock_platform.all_reduce.assert_not_called()
+        mock_dist = self._call(info)
+        mock_dist.all_reduce.assert_not_called()
 
     def test_reduces_when_grad_and_group_ready(self):
         """A ready entry reduces its grad exactly once over its group."""
         grad = torch.ones(2, 2)
         info = self._make_info(grad=grad, group="pp_group")
-        mock_platform = self._call(info)
-        assert mock_platform.all_reduce.call_count == 1, \
+        mock_dist = self._call(info)
+        assert mock_dist.all_reduce.call_count == 1, \
             (f"ready shared grad should all-reduce once, "
-             f"got {mock_platform.all_reduce.call_count} calls")
-        reduced = mock_platform.all_reduce.call_args.args[0]
+             f"got {mock_dist.all_reduce.call_count} calls")
+        reduced = mock_dist.all_reduce.call_args.args[0]
         assert reduced is grad, \
             (f"all_reduce should receive the live grad tensor, "
              f"got {type(reduced)}")
+
+    def test_noncontiguous_gradient_copies_back_after_async_wait(self):
+        """A native reduction preserves the original grad and waits before copying."""
+        grad = torch.ones(2, 2).t()
+        info = self._make_info(grad=grad, group=object())
+        fake_stage = SimpleNamespace(_shared_parameters=[info], _has_backward=True)
+        completed = []
+
+        def all_reduce(tensor: torch.Tensor, group: object, async_op: bool) -> SimpleNamespace:
+            """Delay the mock reduction until the returned work is waited."""
+            self.assertIs(group, info.group)
+            self.assertTrue(async_op)
+            self.assertTrue(tensor.is_contiguous())
+            self.assertIsNot(tensor, grad)
+
+            def wait() -> None:
+                """Finish the reduction while the original gradient is still untouched."""
+                torch.testing.assert_close(grad, torch.ones_like(grad))
+                tensor.mul_(2)
+                completed.append(True)
+
+            return SimpleNamespace(wait=wait)
+
+        with patch("torch.distributed.all_reduce", side_effect=all_reduce):
+            PipelineStage.sync_shared_parameters_grad(fake_stage)
+
+        self.assertEqual(completed, [True])
+        self.assertIs(info.parameter.grad, grad)
+        torch.testing.assert_close(grad, torch.full_like(grad, 2))
 
 
 if __name__ == "__main__":

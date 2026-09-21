@@ -24,7 +24,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from torch import nn
 

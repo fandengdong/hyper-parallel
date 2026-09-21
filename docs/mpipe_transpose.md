@@ -46,7 +46,7 @@ result back to stage 0. The rest of the schedule is ordinary 1F1B.
 | D2 | **Preprocess is a separate replicated module**, scheduled via dedicated `MPIPE_*` steps. Stage 0's `PipelineStage` wraps only `body0` (chunk 0 minus the first `T` layers); the inherited interleaved-1F1B logic runs unchanged on the body model. |
 | D3 | **Option A** — the caller passes `preprocess_module` on **every** rank (standalone, identical architecture). On rank 0 it holds the trained parameters; on other ranks it is a structural copy overwritten each step by the broadcast. Required because ranks `1..PP-1` do not otherwise hold stage 0's layers. |
 | D4 | **Per-rank micro read** — every rank reads its own micro-batch `i`; this is why the preprocess input must be shipped to stage 0 (`MPIPE_GRAPH_SEND`). |
-| D5 | **Torch first**, MindSpore parity afterward. |
+| D5 | **Torch only**, using native Torch tensor, autograd, and distributed APIs. |
 
 ### Micro-batch categories
 
@@ -135,39 +135,32 @@ body schedule.
 
 ## 5. Files
 
-1. `core/pipeline_parallel/scheduler.py` — `MetaStepType` members and the
-   in-schedule dataload steps; `core/pipeline_parallel/mpipe/schedule.py` —
-   `ScheduleMPipeTranspose` (ordering + executor registration), platform-aware
-   `MPIPE_TRANSPOSE_BWD` emission, and the overflow / owner-backward layouts.
-2. `core/pipeline_parallel/mpipe/executor_base.py` — `MPipeTransposeExecutorBase`:
-   backend-agnostic broadcast / P2P transport / step orchestration, with
-   abstract autograd hooks.
-3. `platform/torch/pipeline_parallel/mpipe_transpose.py` and
-   `platform/mindspore/pipeline_parallel/mpipe_transpose.py` — thin subclasses
-   implementing the autograd hooks (detached forward, mark-requires-grad,
-   stage-0 backward, and on torch the owner-backward hooks).
+1. `core/pipeline_parallel/scheduler.py` — core scheduling and data-loading steps;
+   `core/pipeline_parallel/mpipe/schedule.py` — `ScheduleMPipeTranspose`, including
+   ordering, executor registration, and overflow / owner-backward layouts.
+2. `core/pipeline_parallel/mpipe/executor.py` — `MPipeTransposeExecutor` implements
+   native Torch broadcast, P2P transport, preprocess autograd, stage-0 recompute
+   backward, and owner-backward gradient reduction.
+3. `core/pipeline_parallel/_stage.py` and `_microbatch.py` — Torch stage autograd
+   and micro-batch splitting. `_p2p.py` owns pipeline communicator initialization.
 4. `core/pipeline_parallel/__init__.py` + `hyper_parallel/__init__.py` — export
    `ScheduleMPipeTranspose`.
-5. Per-rank dataload convention: every rank passes the batch; rank `i` uses its
-   micro-batch `i` for the transposed forward.
+5. Per-rank dataload convention: every rank passes the batch; the owner of each
+   micro-batch runs its transposed forward.
 6. Tests: `tests/ut/core/pipeline_parallel/test_mpipe_transpose.py` (ordering),
    `test_mpipe_transpose_exec.py` (single-process recompute equivalence).
    Distributed correctness: `tests/torch/pipeline_parallel/_test_mpipe_transpose.py`
-   (worker; the backend adapts to the device — gloo on CPU, hccl on Ascend NPU)
-   launched by `test_mpipe_transpose_dist.py` via `parallel_run`/`TorchCase`.
+   (gloo on CPU, hccl on Ascend NPU), launched by `test_mpipe_transpose_dist.py`
+   via `parallel_run` / `TorchCase`.
 
-### Platform-aware backward
+### Backward execution
 
-Torch's `autograd.backward` traverses the connected graph to all leaves, so a
-non-transposed micro-batch's body backward flows into the preprocess params
-automatically — no `MPIPE_TRANSPOSE_BWD` needed for it. MindSpore's captured
-`grad_fn` is scoped to the body submodule's own weights, so it only deposits the
-*input* grad on the preprocess output; there, **every** micro-batch needs an
-explicit recompute backward. The schedule therefore emits `MPIPE_TRANSPOSE_BWD`
-for non-transposed micro-batches only when the backend requires it
-(`platform_type == MINDSPORE`). Whether shipping the recompute input
-(`MPIPE_GRAPH_*`) beats recomputation is a perf question to settle later and may
-change this choice.
+Pipeline parallel supports PyTorch only. With owner-backward disabled, stage 0
+recomputes trainable preprocess outputs and backpropagates their received feature
+gradients. With owner-backward enabled, each owner retains its preprocess graph,
+receives feature gradients, and runs native `torch.autograd.backward`; the tower's
+local parameter gradients are then summed over the PP group. Gradient accumulation
+reduces only the current run's contribution before adding the previous snapshot.
 
 ---
 

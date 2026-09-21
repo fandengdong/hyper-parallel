@@ -110,24 +110,7 @@
 - 错误用例：
   - `test_{op_name}_xxx_failure` — 触发条件及预期报错子串
 
-### 文件四：MindSpore ST（如适用）
-
-- 用例文件：`tests/mindspore/st/shard/ops/cases/case_{op_name}.py`
-- 使用声明式 `OpShardCase` 框架（`InputSpec`, `CompareSpec`, `register`）
-- 接口使用 `ms.mint.xxx()`（禁止直接使用 Primitive 类）
-- 用例名格式：`{op_name}_ops_{scenario}`
-- tags：4 卡 `(2,2)` → `("npu_level0",)`；2 卡/8 卡 → `("npu_level1",)`
-- **placement 元组长度 == mesh ndim**；若有派生输入用 `derived_inputs`（见 rule）
-
-| 用例名 | mesh | placements | 说明 |
-|-------|------|-----------|------|
-| `{op}_ops_dp` | `(2,2)` | `[(Shard(0), Replicate())]` | DP，与单机对比 |
-| `{op}_ops_tp` | `(2,)` | `[(Shard(1),)]` | TP，1D mesh |
-| ... | ... | ... | ... |
-
-> 详见 `.agent/rules/distributed-op-testing.md`
-
-### 文件五：PyTorch ST（如适用）
+### 文件四：PyTorch ST（如适用）
 
 - 用例文件：`tests/torch/shard/ops/cases/case_{op_name}.py`
 - 使用声明式 `OpShardCase` 框架（同上）
@@ -138,3 +121,5 @@
 |-------|------|-----------|------|
 | `{op}_ops_dp` | `(2,2)` | `[(Shard(0), Replicate())]` | DP，与单机对比 |
 | ... | ... | ... | ... |
+
+> 详见 `.agent/rules/distributed-op-testing.md`

@@ -14,7 +14,7 @@
 # ============================================================================
 """loss_parallel error handling and parameter tests.
 
-Note: Hardware-specific tests moved to tests/st/torch/tensor_parallel/test_loss_parallel_hardware.py
+Note: Hardware-specific tests moved to tests/torch/loss_parallel/test_loss_parallel_pytorch.py
 """
 
 import pytest

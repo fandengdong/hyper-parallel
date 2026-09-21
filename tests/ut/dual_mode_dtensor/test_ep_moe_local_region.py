@@ -1093,7 +1093,7 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
             self.local_expert_count = 1
             self.gate_up_proj = nn.Parameter(torch.randn(1, 8, 4))
             self.down_proj = nn.Parameter(torch.randn(1, 4, 4))
-            self._ep_act_fn = torch.tanh
+            self.ep_act_fn = torch.tanh
 
     experts = Experts()
     hidden_states = torch.randn(3, 4)
@@ -1159,6 +1159,22 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_adapter"
     torch.testing.assert_close(w, ref_w.to(w.dtype),
                                msg="case: sigmoid_group_router_adapter")
+
+    moe.n_group = 2
+    moe.topk_group = 1
+    idx, w = _sigmoid_group_router(moe, hidden)
+    group_scores = choice.view(-1, 2, 2).topk(2, dim=-1)[0].sum(dim=-1)
+    group_idx = group_scores.topk(1, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+    score_mask = group_mask.unsqueeze(-1).expand(-1, 2, 2).reshape(-1, 4)
+    grouped_choice = choice.masked_fill(~score_mask.bool(), float("-inf"))
+    ref_idx = grouped_choice.topk(2, dim=-1, sorted=False)[1]
+    ref_w = scores.gather(1, ref_idx)
+    ref_w = ref_w / (ref_w.sum(-1, keepdim=True) + 1e-20) * 2.5
+    assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_group_filter"
+    torch.testing.assert_close(
+        w, ref_w.to(w.dtype), msg="case: sigmoid_group_router_group_filter"
+    )
 
 
 def test_fix_router_balanced_load(monkeypatch):
@@ -1323,7 +1339,7 @@ def test_expert_token_counts_without_bincount(monkeypatch):
         def __init__(self, local_expert_count):
             super().__init__()
             self.local_expert_count = local_expert_count
-            self._ep_use_grouped_gemm = True
+            self.ep_use_grouped_gemm = True
             self.counts = None
             self.seen_rows = None
 
@@ -1368,7 +1384,7 @@ def test_expert_token_counts_without_bincount(monkeypatch):
             self.local_expert_count = local_expert_count
             self.gate_up_proj = nn.Parameter(torch.randn(local_expert_count, 8, 4))
             self.down_proj = nn.Parameter(torch.randn(local_expert_count, 4, 4))
-            self._ep_act_fn = torch.tanh
+            self.ep_act_fn = torch.tanh
 
     torch.manual_seed(13)
     eager = EagerExperts(3)
@@ -1415,16 +1431,19 @@ def test_expert_token_counts_without_bincount(monkeypatch):
     )
     destination = topk_index.reshape(-1) // 2
     expected_counts = real_bincount(destination, minlength=4).tolist()
-    assert dispatch[5] == expected_counts, \
-        f"case: dispatch_send_counts_no_bincount: send_counts={dispatch[5]}, " \
+    assert dispatch.send_counts == expected_counts, \
+        f"case: dispatch_send_counts_no_bincount: send_counts={dispatch.send_counts}, " \
         f"expected={expected_counts}"
     # the fake exchange is the identity, so recv_counts mirrors send_counts
-    assert dispatch[6] == expected_counts, \
-        f"case: dispatch_send_counts_no_bincount: recv_counts={dispatch[6]}, " \
+    assert dispatch.receive_counts == expected_counts, \
+        f"case: dispatch_send_counts_no_bincount: recv_counts={dispatch.receive_counts}, " \
         f"expected={expected_counts}"
     assert exchanged["send"].dtype == torch.int64, \
         f"case: dispatch_send_counts_no_bincount: dtype={exchanged['send'].dtype}"
-    source_indices, _, dispatch_order, dispatched_states, dispatched_indices, _, _ = dispatch
+    source_indices = dispatch.source_indices
+    dispatch_order = dispatch.dispatch_order
+    dispatched_states = dispatch.states
+    dispatched_indices = dispatch.expert_indices
     assert torch.equal(dispatched_states, hidden[source_indices[dispatch_order]]), \
         f"case: dispatch_send_counts_no_bincount: dispatched rows=" \
         f"{dispatched_states.tolist()}, expected={hidden[source_indices[dispatch_order]].tolist()}"

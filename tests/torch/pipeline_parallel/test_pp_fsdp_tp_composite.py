@@ -14,8 +14,7 @@
 # ============================================================================
 """Pytest launcher for Llama3 PP + FSDP + TP composite (1F1B) vs serial reference.
 
-Follows ``tests/mindspore/st/pipeline_parallel/test_pp_composite.py`` launcher layout:
-one ``torchrun`` worker on 8 NPUs exercising ``Schedule1F1B`` with per-step loss parity
+Launches one ``torchrun`` worker on 8 NPUs exercising ``Schedule1F1B`` with per-step loss parity
 against a full-model serial reference (``examples/torch/llama3`` Llama3 layout,
 nested ``fully_shard``, ``micro_batch_num=4``).
 """

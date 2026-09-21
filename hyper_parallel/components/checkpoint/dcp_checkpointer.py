@@ -15,6 +15,12 @@
 # ============================================================================
 """Distributed-checkpoint (DCP) backend for :class:`CheckpointerBase`."""
 
+__all__ = [
+    "STEP_PREFIX",
+    "DistributedCheckpointer",
+    "initialize_optimizer_state",
+]
+
 import gc
 import logging
 import os
@@ -41,7 +47,7 @@ from hyper_parallel.core.distributed_checkpoint import (
     load as dcp_load,
     save as dcp_save,
 )
-from hyper_parallel.core.distributed_checkpoint.util import flatten_state_dict
+from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
 from hyper_parallel.core.optimizer.adamw import AdamW as HyperAdamW
 from hyper_parallel.core.optimizer.muon import Muon as HyperMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
@@ -366,7 +372,7 @@ class DistributedCheckpointer(CheckpointerBase):
       Always correct.
     * ``False`` --- embedded in the DCP payload. Fewer files, but DCP
       deduplicates entries sharing an FQN across ranks (see
-      ``distributed_checkpoint/util.py::plan_ownership_masks``), so every rank
+      ``distributed_checkpoint/utils.py::plan_ownership_masks``), so every rank
       restores whichever rank's copy won. Only valid when the extra state is
       rank-invariant.
 
@@ -669,10 +675,3 @@ class DistributedCheckpointer(CheckpointerBase):
             )
         logger.info("Read extra_state embedded in the DCP state dict")
         return extra
-
-
-__all__ = [
-    "STEP_PREFIX",
-    "DistributedCheckpointer",
-    "initialize_optimizer_state",
-]

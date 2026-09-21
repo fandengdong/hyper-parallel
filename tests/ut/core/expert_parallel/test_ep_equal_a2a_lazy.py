@@ -144,6 +144,37 @@ class _VirtualStreamContext:
         return False
 
 
+class _DeviceHandleDouble:
+    """Expose the fake stream/event factories under the torch device-module names.
+
+    ``collectives`` now reaches the accelerator through
+    ``get_device_handle()`` (``torch.npu`` / ``torch.cuda``) rather than through
+    the retired platform object, so the tests bind their traced fakes to that
+    handle instead of patching a module-level ``platform``.
+    """
+
+    def __init__(self, streams: Any) -> None:
+        """Wrap the fake that owns the stream, event and trace bookkeeping."""
+        self._streams = streams
+
+    def Stream(self) -> Any:  # noqa: N802 - mirrors torch.npu/torch.cuda
+        """Return the shared comm stream."""
+        return self._streams.new_stream()
+
+    def Event(self) -> Any:  # noqa: N802 - mirrors torch.npu/torch.cuda
+        """Return a fresh event."""
+        return self._streams.new_event()
+
+    def current_stream(self) -> Any:
+        """Return the stream the calling rank computes on."""
+        return self._streams.get_current_stream()
+
+    @property
+    def stream(self) -> Any:
+        """Return the factory used as a stream context manager."""
+        return self._streams.get_stream_context()
+
+
 class _VirtualEpWorld:
     """One-process EP group double: the collectives the split issues, plus a trace.
 
@@ -457,12 +488,8 @@ def _run_split(knob: str, *, backward: bool = False, issue_only: bool = False) -
                                 _LAZY_A2A_STREAM=None,
                                 _LAZY_A2A_READY_EVENT=None,
                                 _LAZY_A2A_DONE_EVENT=None), \
-            mock.patch.multiple(ep_collectives.platform,
-                                new_stream=world.new_stream,
-                                new_event=world.new_event,
-                                get_current_stream=world.get_current_stream,
-                                get_stream_context=world.get_stream_context), \
-            mock.patch.object(ep_collectives.platform,
+            mock.patch.object(ep_collectives, "get_device_handle", lambda: _DeviceHandleDouble(world)), \
+            mock.patch.object(ep_collectives,
                               "differentiable_all_to_all_single_async",
                               side_effect=lazy_exchange):
         threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(_EP_SIZE)]
@@ -589,8 +616,9 @@ class TestSplitPathWithTheEqualKnob(unittest.TestCase):
                               f"got {type(state.received_indices)}")
         self.assertFalse(state.received_states.completed,
                          "the dispatch must not have waited for the exchange itself")
-        with mock.patch.object(ep_collectives.platform, "get_current_stream",
-                               run.world.get_current_stream):
+        with mock.patch.object(
+                ep_collectives, "get_device_handle",
+                lambda: mock.MagicMock(current_stream=run.world.get_current_stream)):
             states = ep_collectives.wait_ep_all_to_all(state.received_states)
             indices = ep_collectives.wait_ep_all_to_all(state.received_indices)
         self.assertTrue(state.received_states.completed,

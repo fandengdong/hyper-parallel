@@ -23,6 +23,9 @@ from itertools import compress
 import pickle
 from typing import Any, Optional, Union
 
+import torch
+from torch import Tensor
+
 from hyper_parallel.core.distributed_checkpoint.metadata import (
     CHUNK_INFO,
     Metadata,
@@ -45,22 +48,21 @@ from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadItemType,
     BroadcastSource,
 )
-from hyper_parallel.core.distributed_checkpoint.reshard import infer_intersection
-from hyper_parallel.core.distributed_checkpoint.ragged_utils import (
+from hyper_parallel.core.distributed_checkpoint.ragged import (
     create_ragged_write_items,
     get_ragged_box_tensor,
 )
-from hyper_parallel.core.distributed_checkpoint.util import (
+from hyper_parallel.core.distributed_checkpoint.utils import (
     narrow_tensor_by_index,
     chunk_to_area,
     create_chunk_list_for_tensor,
+    infer_intersection,
     plan_ownership_masks,
     flatten_state_dict,
     set_element,
     dcp_timer_decorator,
     logger,
-    platform,
-    Tensor,
+    str_to_dtype,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout, infer_slice_area_by_layout
@@ -92,6 +94,49 @@ def _own_plan_index(all_plans: Union[list[SavePlan], list[LoadPlan]], rank: int)
     return own_index
 
 
+def _compute_global_offsets(
+    global_shape: tuple[int, ...],
+    dtensor_layout: Layout,
+    current_rank: int,
+) -> tuple[int, ...]:
+    """
+    Compute the offsets of local tensor in global tensor based on layout.
+
+    Args:
+        global_shape (tuple[int, ...]): Global shape of the tensor.
+        dtensor_layout (Layout): Layout of the DTensor.
+        current_rank (int): Rank whose shard offsets are wanted.
+
+    Returns:
+        tuple[int, ...]: Tuple of offsets for each dimension.
+    """
+    if dtensor_layout is None:
+        # If layout is None, return all zeros (no sharding)
+        return tuple(0 for _ in global_shape)
+
+    # Validate layout attributes
+    if not hasattr(dtensor_layout, 'mesh_shape') or dtensor_layout.mesh_shape is None:
+        raise ValueError("Layout must have mesh_shape attribute")
+    if not hasattr(dtensor_layout, 'tensor_map') or dtensor_layout.tensor_map is None:
+        raise ValueError("Layout must have tensor_map attribute")
+    if not hasattr(dtensor_layout, 'rank_list') or dtensor_layout.rank_list is None:
+        raise ValueError("Layout must have rank_list attribute")
+
+    if current_rank not in dtensor_layout.rank_list:
+        raise ValueError(
+            f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
+
+    inner_rank_id = dtensor_layout.rank_list.index(current_rank)
+    # Calculate slice area using infer_slice_area_by_rank
+    slice_area = infer_slice_area_by_layout(
+        dtensor_layout,
+        inner_rank_id,
+        global_shape,
+    )
+    # Extract offsets (start values) from slice_area
+    return tuple(start for start, _ in slice_area)
+
+
 @dataclass(frozen=True)
 class CachedSaveResult:
     """Cached finalized save result keyed by planner cache namespace."""
@@ -110,7 +155,15 @@ class StandardSavePlanner(SavePlanner):
             enable_plan_caching: bool = True,
             remove_redundancy: bool = True,
             save_to_minimum_rank: bool = False,
-    ):
+    ) -> None:
+        """
+        Args:
+            enable_plan_caching (bool): Reuse the plan and metadata of an earlier save when the
+                state dict has not changed shape. Default True.
+            remove_redundancy (bool): Let only one rank write each replicated item. Default True.
+            save_to_minimum_rank (bool): Give a redundant item to the lowest-numbered plan that
+                holds it rather than to the one with the least planned storage. Default False.
+        """
         self.state_dict: Optional[dict[str, Any]] = None
         self.is_coordinator: bool = False
         self.rank: int = 0
@@ -120,7 +173,7 @@ class StandardSavePlanner(SavePlanner):
         self._enable_plan_caching: bool = enable_plan_caching
         self._cached_plans_key: str = self.__class__.__name__
 
-    def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], **kwargs: Any) -> None:
         """
         Configure planner.
 
@@ -162,44 +215,6 @@ class StandardSavePlanner(SavePlanner):
         if self.state_dict is None:
             raise RuntimeError("Planner not set up")
 
-        def compute_global_offsets(global_shape: tuple[int, ...], dtensor_layout: Layout) -> tuple[int, ...]:
-            """
-            Compute the offsets of local tensor in global tensor based on layout.
-
-            Args:
-                global_shape (tuple[int, ...]): Global shape of the tensor.
-                dtensor_layout (Layout): Layout of the DTensor.
-
-            Returns:
-                tuple[int, ...]: Tuple of offsets for each dimension.
-            """
-            if dtensor_layout is None:
-                # If layout is None, return all zeros (no sharding)
-                return tuple(0 for _ in global_shape)
-
-            # Validate layout attributes
-            if not hasattr(dtensor_layout, 'mesh_shape') or dtensor_layout.mesh_shape is None:
-                raise ValueError("Layout must have mesh_shape attribute")
-            if not hasattr(dtensor_layout, 'tensor_map') or dtensor_layout.tensor_map is None:
-                raise ValueError("Layout must have tensor_map attribute")
-            if not hasattr(dtensor_layout, 'rank_list') or dtensor_layout.rank_list is None:
-                raise ValueError("Layout must have rank_list attribute")
-
-            current_rank = self.rank
-            if current_rank not in dtensor_layout.rank_list:
-                raise ValueError(
-                    f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
-
-            inner_rank_id = dtensor_layout.rank_list.index(current_rank)
-            # Calculate slice area using infer_slice_area_by_rank
-            slice_area = infer_slice_area_by_layout(
-                dtensor_layout,
-                inner_rank_id,
-                global_shape,
-            )
-            # Extract offsets (start values) from slice_area
-            return tuple(start for start, _ in slice_area)
-
         items = []
         for fqn, obj in self.state_dict.items():
             # Check if it's a DTensor
@@ -213,7 +228,7 @@ class StandardSavePlanner(SavePlanner):
 
                 # Get chunk metadata with offsets
                 if layout:
-                    offsets = compute_global_offsets(obj.shape, layout)
+                    offsets = _compute_global_offsets(obj.shape, layout, self.rank)
                 else:
                     offsets = (0,) * len(local_tensor.shape)
 
@@ -235,7 +250,7 @@ class StandardSavePlanner(SavePlanner):
                 )
                 items.append(write_item)
             elif isinstance(obj, Tensor):
-                # Create write item for platform.Tensor: build single chunk with tensor's own size
+                # Create write item for torch.Tensor: build single chunk with tensor's own size
                 dtype_str = str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
                 properties = TensorProperties(dtype=dtype_str)
                 # handle Tensor with shard information
@@ -319,7 +334,7 @@ class StandardSavePlanner(SavePlanner):
                     chunks = self._global_chunks_for(
                         item.index.fqn, tensor_data['properties'], tensor_data['size'], fqn_info)
                     if is_own_plan:
-                        # Set index (platform.Tensor has exactly one chunk). replace() copies the
+                        # Set index (torch.Tensor has exactly one chunk). replace() copies the
                         # remaining fields by name, so adding a field to either dataclass cannot
                         # silently drop it here; only this rank's items are rebuilt, so the cost
                         # is per-rank, not per-cluster.
@@ -428,10 +443,10 @@ class StandardSavePlanner(SavePlanner):
         if item.type == WriteItemType.TENSOR:
             if isinstance(obj, DTensor):
                 if obj.layout is not None and obj.layout.ragged_shard is not None:
-                    return platform.detach(get_ragged_box_tensor(obj, item.index)).to("cpu")
-                return platform.detach(obj.to_local()).to("cpu")
+                    return get_ragged_box_tensor(obj, item.index).detach().to("cpu")
+                return obj.to_local().detach().to("cpu")
             if isinstance(obj, Tensor):
-                return platform.detach(obj).to("cpu")
+                return obj.detach().to("cpu")
             raise TypeError(f"Write item {fqn} expected tensor-like object, got {type(obj)}")
         if item.type == WriteItemType.BYTE_IO:
             return obj
@@ -530,7 +545,7 @@ class StandardLoadPlanner(LoadPlanner):
     Iterate state_dict and creates load plans via chunk list for resharding support.
     """
 
-    def __init__(self, allow_partial_load: bool = False, broadcast_replicated_tensors: bool = False):
+    def __init__(self, allow_partial_load: bool = False, broadcast_replicated_tensors: bool = False) -> None:
         """
         Args:
             allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
@@ -547,7 +562,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.broadcast_replicated_tensors: bool = broadcast_replicated_tensors
         self.flatten_state_dict: bool = True
 
-    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs: Any) -> None:
         """
         Configure planner with state dict and metadata.
 
@@ -626,7 +641,7 @@ class StandardLoadPlanner(LoadPlanner):
                     )
                 if not self._rank_owns_dtensor_shard(obj):
                     continue
-                # Both DTensor and platform.Tensor: create local chunks and read items
+                # Both DTensor and torch.Tensor: create local chunks and read items
                 local_chunks = create_chunk_list_for_tensor(obj)
                 requests += create_read_items_for_chunk_list(
                     fqn, md, local_chunks, broadcastable=not _is_on_host(obj),
@@ -772,22 +787,23 @@ class StandardLoadPlanner(LoadPlanner):
             raise KeyError(f"Key {fqn} not found in state_dict")
 
         target = self.state_dict[fqn]
+        # Each branch only picks out this rank's piece of the entry; detaching and narrowing
+        # it is the same for all three, so it is done once below rather than per branch.
         if (
                 isinstance(target, DTensor)
                 and target.layout is not None
                 and target.layout.ragged_shard is not None
         ):
-            box_tensor = get_ragged_box_tensor(target, read_item.dest_index)
-            return narrow_tensor_by_index(
-                box_tensor,
-                read_item.dest_offsets,
-                read_item.lengths,
-            )
+            local_tensor = get_ragged_box_tensor(target, read_item.dest_index)
+        elif isinstance(target, DTensor):
+            local_tensor = target.to_local()
+        else:
+            local_tensor = target
 
-        local_tensor = target.to_local() if isinstance(target, DTensor) else target
-        local_tensor = platform.detach(local_tensor)
+        # Detached because the caller writes the loaded slice in place: an in-place write
+        # into a view of a leaf parameter that requires grad raises rather than loading.
         return narrow_tensor_by_index(
-            local_tensor,
+            local_tensor.detach(),
             read_item.dest_offsets,
             read_item.lengths,
         )
@@ -830,9 +846,19 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
     """Load planner that builds distributed checkpoint from dcp into fully ``state_dict`` (in-place)."""
 
     def __init__(self) -> None:
+        """Build a planner that merges every shard of a checkpoint into one state dict."""
         super().__init__()
 
-    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs: Any) -> None:
+        """
+        Populate the empty ``state_dict`` from the checkpoint metadata, then configure.
+
+        Args:
+            state_dict (dict[str, Any]): Must be empty; filled in place with a full-size tensor
+                per entry of the metadata.
+            metadata (Metadata): Metadata of the checkpoint being merged.
+            **kwargs (Any): Additional keyword arguments (e.g. is_coordinator).
+        """
         if len(state_dict) > 0:
             raise ValueError(
                 "state_dict must be empty for _DcpMergeLoadPlanner; "
@@ -845,9 +871,9 @@ class _DcpMergeLoadPlanner(StandardLoadPlanner):
         self.is_coordinator = kwargs.get("is_coordinator", False)
         for k, v in metadata.state_dict_metadata.items():
             if isinstance(v, TensorStorageMetadata):
-                v = platform.empty(
-                    platform.list_to_size(v.size),
-                    dtype=platform.str_to_dtype(v.properties.dtype),
+                v = torch.empty(
+                    torch.Size(v.size),
+                    dtype=str_to_dtype(v.properties.dtype),
                 )
 
             state_dict[k] = v

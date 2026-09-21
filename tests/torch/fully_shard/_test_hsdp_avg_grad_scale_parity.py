@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch ST: HSDP AVG gradient scaling correctness (comm_fusion=False vs True).
-
-Mirrors the MindSpore case in ``tests/mindspore/st/fully_shard/_test_hsdp_avg_grad_scale_parity.py``.
-"""
+"""Torch ST: HSDP AVG gradient scaling correctness (comm_fusion=False vs True)."""
 from __future__ import annotations
 
 import os
 from typing import Dict
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+# pylint: disable=wrong-import-position
+# The platform must be selected before anything imports ``hyper_parallel``.
 
 import numpy as np
 import torch
@@ -43,22 +41,39 @@ _GRAD_DUMP_ENV = "HP_HSDP_AVG_GRAD_DUMP_PATH"
 
 
 class _MLPLayer(nn.Module):
+    """Single transformer-style block: two linears around a ReLU."""
+
     def __init__(self, hidden: int) -> None:
+        """Build the two projection layers of the block.
+
+        Args:
+            hidden: Hidden size used for both projections.
+        """
         super().__init__()
         self.fc1 = nn.Linear(hidden, hidden, bias=True)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden, hidden, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply fc1, ReLU and fc2 to the incoming activations."""
         return self.fc2(self.relu(self.fc1(hidden_states)))
 
 
 class _StackedMLP(nn.Module):
+    """Stack of ``_MLPLayer`` blocks returning a reduced loss scalar."""
+
     def __init__(self, num_layers: int, hidden: int) -> None:
+        """Build ``num_layers`` blocks of width ``hidden``.
+
+        Args:
+            num_layers: Number of stacked blocks.
+            hidden: Hidden size shared by every block.
+        """
         super().__init__()
         self.layers = nn.ModuleList([_MLPLayer(hidden) for _ in range(num_layers)])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run every block in order and sum the outputs into a scalar."""
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         return hidden_states.sum()

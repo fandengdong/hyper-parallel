@@ -42,7 +42,7 @@ from tests.common.mark_utils import arg_mark  # pylint: disable=wrong-import-pos
 # The package re-exports a function named after this module, so ``import ... as``
 # would bind the function; the platform patch needs the module object itself.
 _LOSS_MODULE = importlib.import_module("hyper_parallel.components.losses.chunked_cross_entropy")
-# The vocab-parallel cross entropy keeps its own module-level platform.
+# The vocab-parallel cross entropy keeps its own module-level reduction.
 _KERNEL_MODULE = importlib.import_module(
     "hyper_parallel.components.losses._vocab_parallel_cross_entropy"
 )
@@ -281,16 +281,21 @@ def _run_simulated_rank(world, rank, result, errors, inputs, chunk_size):
 
 
 def _patch_platforms(platform):
-    """Route every reduction of the Chunk Loss path through one stand-in."""
-    previous = (_LOSS_MODULE.platform, _KERNEL_MODULE.platform)
-    _LOSS_MODULE.platform = platform
-    _KERNEL_MODULE.platform = platform
+    """Route the Chunk Loss reduction through one stand-in.
+
+    The vocab-parallel kernel is Torch-native now; only the Chunk Loss module
+    still owns a module-level ``differentiable_all_reduce`` to swap.
+    """
+    previous = (_LOSS_MODULE.differentiable_all_reduce,
+                _KERNEL_MODULE._differentiable_all_reduce)
+    _LOSS_MODULE.differentiable_all_reduce = platform.differentiable_all_reduce
+    _KERNEL_MODULE._differentiable_all_reduce = platform.differentiable_all_reduce
     return previous
 
 
 def _restore_platforms(previous):
-    """Restore the platform objects captured by :func:`_patch_platforms`."""
-    _LOSS_MODULE.platform, _KERNEL_MODULE.platform = previous
+    """Restore the reductions captured by :func:`_patch_platforms`."""
+    _LOSS_MODULE.differentiable_all_reduce, _KERNEL_MODULE._differentiable_all_reduce = previous
 
 
 def _run_simulated_group(world, workers):
@@ -413,7 +418,10 @@ class TestChunkedCrossEntropySingleRankUnchanged(unittest.TestCase):
         hidden_states, targets, head_weight = _chunk_loss_inputs()
         for tp_mesh in (None, _MeshOfSizeOne()):
             with self.subTest(tp_mesh=tp_mesh):
-                with mock.patch.object(_LOSS_MODULE, "platform", _ForbiddenPlatform()):
+                with mock.patch.object(
+                    _LOSS_MODULE, "differentiable_all_reduce",
+                    _ForbiddenPlatform().differentiable_all_reduce,
+                ):
                     loss = chunked_cross_entropy(
                         hidden_states, targets, head_weight, chunk_size=4, tp_mesh=tp_mesh
                     )
@@ -440,9 +448,11 @@ class TestChunkedCrossEntropyVocabParallel(unittest.TestCase):
     """A sharded vocabulary must reproduce the full-vocabulary objective."""
 
     def setUp(self):
-        """Keep the module platform patchable per test."""
-        self._loss_module_platform = _LOSS_MODULE.platform
-        self.addCleanup(setattr, _LOSS_MODULE, "platform", self._loss_module_platform)
+        """Keep the module reduction patchable per test."""
+        self._loss_module_reduce = _LOSS_MODULE.differentiable_all_reduce
+        self.addCleanup(
+            setattr, _LOSS_MODULE, "differentiable_all_reduce", self._loss_module_reduce
+        )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -575,7 +585,7 @@ class TestChunkedCrossEntropyVocabParallel(unittest.TestCase):
         previous = _patch_platforms(_SimulatedTpPlatform(world))
         try:
             with self.assertRaises(AssertionError):
-                _LOSS_MODULE.platform.differentiable_all_reduce(torch.zeros(1), "sum", object())
+                _LOSS_MODULE.differentiable_all_reduce(torch.zeros(1), "sum", object())
         finally:
             _restore_platforms(previous)
         self.assertIsNotNone(_simulate_sharded_forward(hidden_states, targets, head_weight, 4))

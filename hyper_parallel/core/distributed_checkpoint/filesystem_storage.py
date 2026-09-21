@@ -18,6 +18,7 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import torch.distributed as dist
 from safetensors import safe_open
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
@@ -40,17 +41,14 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
     WriteResult,
     METADATA_FILE_NAME,
 )
-from hyper_parallel.core.distributed_checkpoint.util import (
-    narrow_tensor_by_index,
+from hyper_parallel.core.distributed_checkpoint.broadcast import (
     BroadcastBatcher,
-    dcp_timer_decorator,
-    logger,
-    platform,
     wait_broadcasts,
 )
-
-from hyper_parallel.platform.platform import (
-    PlatformType,
+from hyper_parallel.core.distributed_checkpoint.checkpoint_io import save_checkpoint_file
+from hyper_parallel.core.distributed_checkpoint.utils import (
+    dcp_timer_decorator,
+    logger,
 )
 
 
@@ -122,7 +120,7 @@ class FileSystemWriter(StorageWriter):
             **kwargs: Additional keyword arguments (e.g., rank, use_collectives).
         """
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank") if "rank" in kwargs else platform.get_rank()
+        self.rank = kwargs.get("rank") if "rank" in kwargs else dist.get_rank()
         self.use_collectives = kwargs.get("use_collectives", True)
 
     def optimize_local_plan(self, plan: SavePlan) -> SavePlan:
@@ -272,7 +270,7 @@ class FileSystemWriter(StorageWriter):
 
         file_name = f"_rank{self.rank}_.safetensors"
         file_path = self.checkpoint_dir / file_name
-        platform.save_checkpoint(tensor_dict, str(file_path))
+        save_checkpoint_file(tensor_dict, str(file_path))
 
         # Record StorageInfo for each tensor
         # Note: we don't know per-tensor byte offsets, so offset=0, length=-1
@@ -429,8 +427,6 @@ def _validate_and_copy_tensor(
 ) -> None:
     """Validate a loaded tensor slice and copy it to its planner destination."""
     target_tensor = planner.acquire_tensor(req)
-    if platform.is_tensor(target_tensor):
-        target_tensor = platform.detach(target_tensor)
 
     target_size = _get_tensor_size(target_tensor)
     tensor_size = _get_tensor_size(tensor)
@@ -442,18 +438,30 @@ def _validate_and_copy_tensor(
     _copy_tensor_to_target(req, tensor, target_tensor, planner)
 
 
-def _fetch_torch_tensor_file(
+def _fetch_tensor_file(
         tensor_file: Any,
         reqs: list[ReadItem],
         storage_data: dict[MetadataIndex, StorageInfo],
 ) -> list[tuple[ReadItem, Any]]:
-    """Slice the region each item asked for off an open Torch safetensors file.
+    """
+    Slice the region each item asked for off an already open safetensors file.
+
+    Nothing but the file is touched: no planner, no device, which is what leaves the caller
+    free to decide when what was read is put in place.
 
     A name the file does not hold is left to safetensors to report - "File does not contain
     tensor <name>", which says as much as a check here could. Checking first meant listing
     the file, and listing brings every name in it across from the reader whether one shard is
     being read or all of them: 6.5 ms on a file of nine thousand tensors, paid again every
     time the file is opened, to say ahead of time what the next line says anyway.
+
+    Args:
+        tensor_file (Any): The open file, as :class:`_OpenFiles` hands it over.
+        reqs (list[ReadItem]): List of ReadItems for this file.
+        storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
+
+    Returns:
+        list[tuple[ReadItem, Any]]: Each item with the region it asked for.
     """
     fetched: list[tuple[ReadItem, Any]] = []
     for req in reqs:
@@ -472,50 +480,6 @@ def _fetch_torch_tensor_file(
             tensor = tensor_file.get_tensor(tensor_key)
         fetched.append((req, tensor))
     return fetched
-
-
-def _fetch_ms_tensor_file(
-        param_dict: Any,
-        reqs: list[ReadItem],
-        storage_data: dict[MetadataIndex, StorageInfo],
-) -> list[tuple[ReadItem, Any]]:
-    """Narrow the region each item asked for out of a file the ms adapter has read in."""
-    fetched: list[tuple[ReadItem, Any]] = []
-    for req in reqs:
-        storage_info = _get_storage_info(req, storage_data)
-        tensor_key = storage_info.tensor_key or req.storage_index.fqn
-        if tensor_key not in param_dict:
-            raise KeyError(f"Key {tensor_key} not found in checkpoint file")
-        fetched.append((req, narrow_tensor_by_index(
-            param_dict[tensor_key],
-            req.storage_offsets,
-            req.lengths,
-        )))
-    return fetched
-
-
-def _fetch_tensor_file(
-        tensor_file: Any,
-        reqs: list[ReadItem],
-        storage_data: dict[MetadataIndex, StorageInfo],
-) -> list[tuple[ReadItem, Any]]:
-    """
-    Take what a set of items wants out of an already open checkpoint file.
-
-    Nothing but the file is touched: no planner, no device, which is what leaves the caller
-    free to decide when what was read is put in place.
-
-    Args:
-        tensor_file (Any): The open file, as :class:`_OpenFiles` hands it over.
-        reqs (list[ReadItem]): List of ReadItems for this file.
-        storage_data (dict[MetadataIndex, StorageInfo]): Physical storage mapping.
-
-    Returns:
-        list[tuple[ReadItem, Any]]: Each item with the region it asked for.
-    """
-    if platform.platform_type == PlatformType.PYTORCH:
-        return _fetch_torch_tensor_file(tensor_file, reqs, storage_data)
-    return _fetch_ms_tensor_file(tensor_file, reqs, storage_data)
 
 
 def _apply_fetched(
@@ -544,11 +508,9 @@ def _apply_fetched(
 # rank agrees on means walking the files over and over, where the old file-at-a-time read
 # went through each one once, and opening one costs far more than the slice read it wraps --
 # 0.70 ms against 0.045 ms, measured on a file holding four hundred tensors. So the files
-# stay open. How many depends on what open means: a torch reader is a memory map over the
-# file and several cost next to nothing to hold, while the ms adapter reads every tensor of
-# the file into memory, so only the one in use is kept, as before.
-_TORCH_FILES_KEPT = 8
-_MS_FILES_KEPT = 1
+# stay open. A safetensors reader is a memory map over the file, so several of them cost
+# next to nothing to hold.
+_FILES_KEPT = 8
 
 
 class _OpenFiles:
@@ -593,33 +555,17 @@ class _OpenFiles:
 
 def _open_checkpoint_files() -> _OpenFiles:
     """
-    A place to keep the checkpoint files of one read open, for the platform in use.
+    A place to keep the checkpoint files of one read open.
 
     Returns:
-        _OpenFiles: Opens through safetensors on torch and through the platform adapter
-        otherwise, holding as many as that kind of reader is cheap to hold.
+        _OpenFiles: Opens through safetensors, holding as many as such a reader is cheap
+        to hold.
     """
-    if platform.platform_type == PlatformType.PYTORCH:
-        return _OpenFiles(
-            _TORCH_FILES_KEPT,
-            lambda path: safe_open(path, framework="pt", device="cpu"),
-            lambda reader: reader.__exit__(None, None, None),
-        )
-    return _OpenFiles(_MS_FILES_KEPT, platform.load_checkpoint, lambda reader: None)
-
-
-def _broadcast_batch_bytes(requested: int) -> int:
-    """
-    How small a shard has to be to travel with others, for the platform in use.
-
-    Returns:
-        int: What the caller asked for on torch. Zero on the ms platform, where gathering
-        shards into one buffer would go through reshaped views whose writes are not known to
-        reach the buffer behind them; there every shard is sent on its own, as before.
-    """
-    if platform.platform_type == PlatformType.PYTORCH:
-        return requested
-    return 0
+    return _OpenFiles(
+        _FILES_KEPT,
+        lambda path: safe_open(path, framework="pt", device="cpu"),
+        lambda reader: reader.__exit__(None, None, None),
+    )
 
 
 class FileSystemReader(StorageReader):
@@ -687,7 +633,7 @@ class FileSystemReader(StorageReader):
         self.is_coordinator = is_coordinator
         # Do not evaluate get_rank() when an offline caller supplies rank. The
         # default process group is intentionally not initialized by converters.
-        self.rank = kwargs["rank"] if "rank" in kwargs else platform.get_rank()
+        self.rank = kwargs["rank"] if "rank" in kwargs else dist.get_rank()
 
     def optimize_local_plan(self, plan: LoadPlan) -> LoadPlan:
         """
@@ -843,7 +789,7 @@ class FileSystemReader(StorageReader):
             plan (LoadPlan): Load plan containing ReadItems.
             planner (LoadPlanner): Load planner for resolving and committing tensors.
             broadcast_groups (Optional[dict]): Communication group of every shard the plan
-                marked, keyed by rank tuple, as :func:`ensure_broadcast_groups` returns them.
+                marked, keyed by rank tuple, as :func:`broadcast_groups_for_load` yields them.
                 Building one is collective, so it is done before the read rather than here.
             broadcast_batch_bytes (int): Shards smaller than this are gathered and sent
                 together instead of one at a time. Zero sends every shard on its own.
@@ -869,7 +815,7 @@ class FileSystemReader(StorageReader):
         batches.extend(self._private_batches(by_shard).values())
 
         in_flight: deque = deque()
-        batcher = BroadcastBatcher(_broadcast_batch_bytes(broadcast_batch_bytes), groups)
+        batcher = BroadcastBatcher(broadcast_batch_bytes, groups)
         open_files = _open_checkpoint_files()
         try:
             read = (self._fetch_from_storage(batch, open_files) for batch in batches)

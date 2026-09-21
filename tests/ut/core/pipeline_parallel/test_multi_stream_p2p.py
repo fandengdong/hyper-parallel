@@ -44,7 +44,7 @@ def test_init_p2p_multi_stream_groups_uses_mesh_order_and_interleaved_wrap() -> 
     expected_groups = {2: "multi-stream-0-2", 6: "multi-stream-0-6"}
 
     with patch.object(
-            scheduler_module.platform,
+            scheduler_module,
             "create_p2p_multi_stream_groups",
             return_value=expected_groups,
     ) as create_multi_stream_groups:
@@ -68,15 +68,15 @@ def test_batched_issue_passes_multi_stream_group_to_platform() -> None:
     descriptor = object()
     handle = object()
 
-    with patch.object(scheduler_module.platform, "p2p_op", return_value=descriptor) as p2p_op, \
+    with patch.object(scheduler_module.dist, "P2POp", return_value=descriptor) as p2p_op, \
             patch.object(
-                scheduler_module.platform,
+                scheduler_module.dist,
                 "batch_isend_irecv",
-                return_value=handle,
+                return_value=[handle],
             ) as batch_isend_irecv:
         handles = runtime._batched_issue([("isend", tensor, 3)])
 
-    p2p_op.assert_called_once_with("isend", tensor, 3, group="multi-stream-1-3")
+    p2p_op.assert_called_once_with(scheduler_module.dist.isend, tensor, 3, group="multi-stream-1-3")
     batch_isend_irecv.assert_called_once_with([descriptor])
     assert handles == [handle], f"Expected one batch handle {[handle]}, got={handles}"
 
@@ -104,7 +104,7 @@ def test_batch_transport_keeps_pipeline_group() -> None:
     runtime._batch_p2p_group = "pipeline-group"
     tensor = object()
 
-    with patch.object(scheduler_module.platform, "p2p_op", return_value=object()) as p2p_op:
+    with patch.object(scheduler_module.dist, "P2POp", return_value=object()) as p2p_op:
         runtime._p2p_op("irecv", tensor, 5)
 
-    p2p_op.assert_called_once_with("irecv", tensor, 5, group="pipeline-group")
+    p2p_op.assert_called_once_with(scheduler_module.dist.irecv, tensor, 5, group="pipeline-group")

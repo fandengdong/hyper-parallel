@@ -25,12 +25,11 @@ DCP 模块位于 `hyper_parallel/core/distributed_checkpoint/`：
 | `filesystem_storage.py` | 文件系统实现 `FileSystemWriter` / `FileSystemReader`（safetensors） |
 | `metadata.py` | `Metadata` / `ChunkStorageMetadata` / `ChunkInfo` / `BroadcastInfo` 等元数据结构 |
 | `async_persist.py` | 异步保存：staging（`DataCopier`）与子进程持久化 |
-| `reshard.py` | 区间求交与 `ReshardHandler`（离线重切分工具） |
-| `ragged_utils.py` | `RaggedShard`（非均匀切分）的几何适配 |
+| `ragged.py` | `RaggedShard`（非均匀切分）的几何适配 |
 | `offline_transform.py` | Hugging Face safetensors ⇄ DCP 离线互转 |
-| `layout.py` | Layout 的采集、落盘与跨 rank 汇总 |
-| `util.py` | 去冗余、同分片组推导、广播、分阶段计时等公共能力 |
-| `saver.py` / `loader.py` | 单文件 safetensors 存取（`save_checkpoint` / `load_checkpoint`），与分布式流程无关 |
+| `utils.py` | 去冗余、同分片组推导、区间求交、分阶段计时等公共能力 |
+| `broadcast.py` | 副本分片的广播：通信组的建立与销毁、发送与批量合并 |
+| `checkpoint_io.py` | 单个 checkpoint 文件的读写（safetensors / pickle） |
 
 ---
 
@@ -177,17 +176,6 @@ load(state_dict_tp2, checkpoint_id="/ckpt/step_1000")
 
 已覆盖的典型倒换：`TP4 → TP2`、`TP4 → DP2×TP2`、`DP2×TP2 → TP2`，以及 `fully_shard` 分片之间的重切分。
 
-`reshard.ReshardHandler` 是同一套区间求交逻辑的**离线工具类**，用于在训练流程之外手工搬运分片：
-
-```python
-from hyper_parallel.core.distributed_checkpoint import ReshardHandler
-
-handler = ReshardHandler(param_name="w1", full_shape=(8, 8),
-                         from_layout=src_layout, to_layout=dst_layout, to_rank_id=0)
-offsets = handler.infer_all_tensor_offset()      # {源 rank: 需要从它那里取的局部区间}
-tensor = handler.get_real_tensor(collected)      # 把收集到的切片拼成目标 rank 的分片
-```
-
 ---
 
 ## 副本张量读一次 + 广播
@@ -195,10 +183,12 @@ tensor = handler.get_real_tensor(collected)      # 把收集到的切片拼成�
 在有复制维度的场景（如 DP 复制、TP 上的 `Replicate()` 参数），多张卡持有同一份数据。打开广播后，每份数据在组内只有一张卡真正读盘，其余 rank 通过一次组内 broadcast 拿到，**把磁盘读放大从 N× 降到 1×**：
 
 ```python
+import torch.distributed as dist
+
 load(state_dict, checkpoint_id=path)   # 两者默认都是开的
 
 # 多次加载时可预建通信组，省掉加载路径上的建组开销
-groups = {ranks: platform.create_group(ranks) for ranks in my_group_ranks if rank in ranks}
+groups = {ranks: dist.new_group(ranks=list(ranks)) for ranks in my_group_ranks if rank in ranks}
 load(state_dict, checkpoint_id=path, use_collectives=True,
      broadcast_replicated_tensors=True, broadcast_groups=groups)
 ```
@@ -322,23 +312,7 @@ full_sd = dcp_to_full_state_dict("/ckpt/step_1000")
 save_state_dict_as_huggingface_format("/export/hf", full_sd, max_shard_size="5GB")
 ```
 
-`src_platform` 可取 `"huggingface"`（HF 目录）、`"torch"` / `"mindspore"`（完整 checkpoint 文件），后两者要求当前运行时与之匹配。
-
----
-
-## Layout 工具
-
-用于采集与持久化参数的切分信息，供离线重切分等场景使用：
-
-```python
-from hyper_parallel.core.distributed_checkpoint import (
-    get_current_layout, get_global_layout, save_layout, load_layout, combine_layout,
-)
-
-save_layout(get_current_layout(model), f"/ckpt/rank{rank}.layout")  # 每 rank 各存一份
-all_layout = combine_layout("/ckpt")                                 # 离线合并目录下所有 .layout
-all_layout = get_global_layout(model)                                # 或在线 all_gather 汇总
-```
+`src_platform` 可取 `"huggingface"`（HF 目录）或 `"torch"`（PyTorch 完整 checkpoint 文件，pickle 或 `.safetensors`）。
 
 ---
 
@@ -356,7 +330,7 @@ def _copy_my_state(obj):
     return MyState(...)   # 返回 Host 内存中的副本
 ```
 
-> 注意 `DTensor` 是 `platform.Tensor` 的子类，分派按"精确类型 → 最派生的注册基类"顺序解析。自定义类型如果也存在继承关系，请确认命中的是预期的 handler。
+> 注意 `DTensor` 是 `torch.Tensor` 的子类，分派按"精确类型 → 最派生的注册基类"顺序解析。自定义类型如果也存在继承关系，请确认命中的是预期的 handler。
 
 ---
 
@@ -406,10 +380,10 @@ stage、`head` 只在末 stage，两个 stage 几乎没有共同的键。这套�
 ### 通信组：建出来、用一次、销毁
 
 一个 stage 内部的副本组（stage 的 4 张卡、或某个 tp 列的 2 张卡）通常不在任何已有通信域里，
-得现建。`ensure_broadcast_groups` 用的是 **`platform.new_group(ranks)`**——它直接调
-`dist.new_group`，**建的就是给它的那几个 rank**，建完就还给调用方。
+得现建。建组走的是 **`dist.new_group(ranks=...)`**——**建的就是给它的那几个 rank**，
+建完就还给调用方。
 
-这里**不用 `platform.create_group`**，它做的事超出所需：把 rank 列表当**模板**展开成对全世界
+这里**不用 `create_group`**（`core/dtensor/_utils.py`），它做的事超出所需：把 rank 列表当**模板**展开成对全世界
 的一个划分，并把展开出的每个组都塞进进程级缓存。两个后果对 PP 都不合适——缓存会让这些只用
 一次的通信域活到任务结束（一个 communicator 一直占着显存），而模板展开会**拒绝** PP 会产生的
 rank 列表，比如绑定在两个不相邻 stage 上的参数（`[0,1,6,7]` → `ValueError: Template must have
@@ -419,7 +393,7 @@ consistent intra-group step`）。走 `new_group` 这两个问题都不存在。
 各卡算出来一致，而销毁只由组内成员发起，它们是一起走到读取末尾的）。调用方通过
 `broadcast_groups=` 预建传进来的组**不属于**这次加载，原样留着不动。
 
-**建组是全局集合调用。** `ensure_broadcast_groups` 的进入条件是
+**建组是全局集合调用。** 建组的进入条件是
 `broadcast_replicated_tensors and use_collectives and world_size > 1`——三个全卡一致的量，
 不是「我有没有要广播的分片」。一个全部参数都被切满、一个副本分片都没有的 stage，仍然必须
 进来陪着建组，否则另一个 stage 会一直等它。这些 rank 从 `new_group` 拿到的是后端的非成员标记
@@ -431,7 +405,7 @@ consistent intra-group step`）。走 `new_group` 这两个问题都不存在。
 
 ```bash
 # 无 NPU 也可验证（CPU + gloo 后端）
-export HYPER_PARALLEL_PLATFORM=torch HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
+export HYPER_PARALLEL_TEST_DEVICE_TYPE=cpu
 python -m torch.distributed.run --nproc-per-node=4 -m pytest -s \
     tests/torch/distributed_checkpoint/dcp_async_save.py::test_dcp_async_save_twice_reuses_the_plan_cache
 ```

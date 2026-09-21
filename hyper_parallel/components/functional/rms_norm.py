@@ -15,7 +15,6 @@
 """Root mean square normalization function."""
 
 import torch  # pylint: disable=forbidden-backend-import
-import torch_npu
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -29,4 +28,9 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
     Returns:
         The normalized tensor.
     """
+    # Imported per call rather than at module scope: a module-level ``torch_npu``
+    # binding is captured on first import, so a test that swaps sys.modules for a
+    # stub would leave this function holding the stub for the rest of the session.
+    import torch_npu  # pylint: disable=C0415
+
     return torch_npu.npu_rms_norm(x, weight, epsilon=eps)[0]

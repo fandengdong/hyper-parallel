@@ -23,12 +23,9 @@ Flag-style::
 
     python -m tests.shard_ops.framework --case sort_2d_dp_last_dim
     python -m tests.shard_ops.framework --case-glob "sort_*" --tag sort
-    python -m tests.shard_ops.framework --framework mindspore --case sort_2d_dp_last_dim
 
-framework is auto-derived from the file path, ``HYPER_PARALLEL_PLATFORM``
-env var, or defaults to ``torch``.  ``--device-type`` defaults from
-``HYPER_PARALLEL_TEST_DEVICE_TYPE`` or the framework default (cpu for
-torch, npu for mindspore).
+framework defaults to ``torch``.  ``--device-type`` defaults from
+``HYPER_PARALLEL_TEST_DEVICE_TYPE`` or the framework default (cpu).
 """
 import argparse
 import os
@@ -46,22 +43,17 @@ _FW_CFG: Dict[str, dict] = {
         "platform_pkg": ["tests.torch.shard.ops.framework"],
         "device_type": "cpu",
     },
-    "mindspore": {
-        "cases_pkg": "tests.mindspore.st.shard.ops.cases",
-        "platform_pkg": ["tests.mindspore.st.shard.ops.framework"],
-        "device_type": "npu",
-    },
 }
 
 
 def _parse_target(target: Optional[str]) -> dict:
     """Parse a pytest-style target: ``[PATH][::CASE_NAME]``.
 
-    Returns a dict with keys ``framework``, ``cases_pkg``, ``module_filter``
-    and ``case_name``.  Unresolved keys are ``None``.
+    Returns a dict with keys ``cases_pkg``, ``module_filter`` and
+    ``case_name``.  Unresolved keys are ``None``.
     """
-    result: dict = {"framework": None, "cases_pkg": None,
-                    "module_filter": None, "case_name": None}
+    result: dict = {"cases_pkg": None, "module_filter": None,
+                    "case_name": None}
     if not target:
         return result
 
@@ -70,22 +62,9 @@ def _parse_target(target: Optional[str]) -> dict:
     file_path = path if path and path != "::" else None
 
     if file_path:
-        result["framework"] = _framework_from_path(file_path)
-        result["cases_pkg"] = _cases_pkg_from_framework(result["framework"])
+        result["cases_pkg"] = _FW_CFG["torch"]["cases_pkg"]
         result["module_filter"] = _module_from_path(file_path)
     return result
-
-
-def _framework_from_path(file_path: str) -> str:
-    """Derive framework from a file path like ``.../torch/...``."""
-    parts = file_path.replace("\\", "/").split("/")
-    if "mindspore" in parts:
-        return "mindspore"
-    return "torch"
-
-
-def _cases_pkg_from_framework(framework: str) -> str:
-    return _FW_CFG[framework]["cases_pkg"]
 
 
 def _module_from_path(file_path: str) -> str:
@@ -114,9 +93,7 @@ def _filter(cases: List[OpShardCase], args,
 
 def _resolve_config(args, target_info: dict) -> dict:
     """Resolve framework, device_type, cases_pkg, platform_pkg."""
-    framework = target_info["framework"] or \
-                os.environ.get("HYPER_PARALLEL_PLATFORM") or \
-                args.framework
+    framework = "torch"
 
     cfg = _FW_CFG[framework]
     if args.device_type is not None:
@@ -138,8 +115,6 @@ def main(argv: List[str] = None) -> int:
         description="Local shard-ops case runner — pytest-style target or flags.",
     )
     p.add_argument("target", nargs="?", default=None)
-    p.add_argument("--framework", default="torch",
-                   choices=["torch", "mindspore"])
     p.add_argument("--device-type", default=None, choices=["npu", "cpu"])
     p.add_argument("--cases-pkg", default=None)
     p.add_argument("--platform-pkg", action="append", default=[])

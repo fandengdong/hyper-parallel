@@ -303,6 +303,37 @@ class _FakeStreamContext:
         return False
 
 
+class _DeviceHandleDouble:
+    """Expose the fake stream/event factories under the torch device-module names.
+
+    ``collectives`` now reaches the accelerator through
+    ``get_device_handle()`` (``torch.npu`` / ``torch.cuda``) rather than through
+    the retired platform object, so the tests bind their traced fakes to that
+    handle instead of patching a module-level ``platform``.
+    """
+
+    def __init__(self, streams: Any) -> None:
+        """Wrap the fake that owns the stream, event and trace bookkeeping."""
+        self._streams = streams
+
+    def Stream(self) -> Any:  # noqa: N802 - mirrors torch.npu/torch.cuda
+        """Return the shared comm stream."""
+        return self._streams.new_stream()
+
+    def Event(self) -> Any:  # noqa: N802 - mirrors torch.npu/torch.cuda
+        """Return a fresh event."""
+        return self._streams.new_event()
+
+    def current_stream(self) -> Any:
+        """Return the stream the calling rank computes on."""
+        return self._streams.get_current_stream()
+
+    @property
+    def stream(self) -> Any:
+        """Return the factory used as a stream context manager."""
+        return self._streams.get_stream_context()
+
+
 class _FakeStreams:
     """Fake of the platform's stream/event API with a trace and call counters.
 
@@ -452,11 +483,7 @@ def _equal_a2a_scope(dist_double: Any, knob: str, streams: _FakeStreams):
                                 _LAZY_A2A_STREAM=None,
                                 _LAZY_A2A_READY_EVENT=None,
                                 _LAZY_A2A_DONE_EVENT=None), \
-            mock.patch.multiple(ep_collectives.platform,
-                                new_stream=streams.new_stream,
-                                new_event=streams.new_event,
-                                get_current_stream=streams.get_current_stream,
-                                get_stream_context=streams.get_stream_context):
+            mock.patch.object(ep_collectives, "get_device_handle", lambda: _DeviceHandleDouble(streams)):
         yield
 
 
@@ -514,7 +541,7 @@ def _drive(send_plan: List[List[int]], knob: str, *, entry: str = _SYNC, backwar
             failures.append((rank, exc))
 
     with _equal_a2a_scope(dist_double, knob, streams), \
-            mock.patch.object(ep_collectives.platform,
+            mock.patch.object(ep_collectives,
                               "differentiable_all_to_all_single_async",
                               side_effect=lazy_exchange):
         threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in range(ep_size)]
@@ -748,11 +775,7 @@ class TestEqualA2ADispatch(unittest.TestCase):
 
         with mock.patch.object(ep_collectives, "dist", _VirtualEpDist(world)), \
                 mock.patch.object(ep_collectives, "_EQUAL_A2A_RAW", "1"), \
-                mock.patch.multiple(ep_collectives.platform,
-                                    new_stream=streams.new_stream,
-                                    new_event=streams.new_event,
-                                    get_current_stream=streams.get_current_stream,
-                                    get_stream_context=streams.get_stream_context):
+                mock.patch.object(ep_collectives, "get_device_handle", lambda: _DeviceHandleDouble(streams)):
             threads = [threading.Thread(target=issue, args=(rank,)) for rank in range(_EP_SIZE)]
             for thread in threads:
                 thread.start()

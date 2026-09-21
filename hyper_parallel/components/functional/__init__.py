@@ -20,6 +20,10 @@ must not force every backend onto CPU-only consumers that only need a
 single submodule (e.g. ``functional.npu_grouped_swiglu``).
 """
 
+# PEP 562 requires the special ``__getattr__`` name, and the public symbols
+# listed in ``__all__`` are materialized dynamically by that hook.
+# pylint: disable=invalid-name,undefined-all-variable
+
 import importlib
 from typing import Any
 
@@ -34,6 +38,9 @@ _EXPORT_TO_MODULE = {
     "dsa_sparse_attention": "dsa_sparse_attention",
     "dsa_sparse_attention_rescale": "dsa_sparse_attention_rescale",
     "grouped_matmul": "grouped_matmul",
+    "chunk_gated_delta_rule": "gated_delta_net",
+    "fused_chunk_kda": "kimi_delta_attention",
+    "fused_chunk_kda_p2p": "kimi_delta_attention",
     "mhc_post": "mhc_post",
     "mhc_pre": "mhc_pre",
     "moe_token_permute": "moe_token_permute",
@@ -74,6 +81,9 @@ __all__ = [
     "dsa_sparse_attention",
     "dsa_sparse_attention_rescale",
     "grouped_matmul",
+    "chunk_gated_delta_rule",
+    "fused_chunk_kda",
+    "fused_chunk_kda_p2p",
     "mhc_post",
     "mhc_pre",
     "moe_token_permute",

@@ -35,10 +35,12 @@ Split out of components/distributed/ep_utils.py in stage 4e.
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
 from hyper_parallel.components.functional.npu_grouped_swiglu import (
     npu_grouped_swiglu,
 )
@@ -59,6 +61,19 @@ from hyper_parallel.distributed.expert_parallel.collectives import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _EPDispatch:
+    """Prepared tensors and split sizes for one routed expert exchange."""
+
+    source_indices: torch.Tensor
+    expert_weights: torch.Tensor
+    dispatch_order: torch.Tensor
+    states: torch.Tensor
+    expert_indices: torch.Tensor
+    send_counts: list[int]
+    receive_counts: list[int]
 
 
 def resolve_swiglu_weights(
@@ -200,7 +215,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     sorted_states = dispatched_states[token_order]
     local_expert_counts = _expert_token_counts(
         local_expert_indices, experts.local_expert_count)
-    if getattr(experts, "_ep_use_grouped_gemm", False):
+    if getattr(experts, "ep_use_grouped_gemm", False):
         grouped_forward = getattr(experts, "forward_expert_major", None)
         if callable(grouped_forward):
             sorted_output = grouped_forward(sorted_states, local_expert_counts)
@@ -241,7 +256,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
             up_states = F.linear(  # pylint: disable=not-callable
                 expert_states, up_weight[local_expert_index]
             )
-        activation = getattr(experts, "_ep_act_fn", F.silu)
+        activation = getattr(experts, "ep_act_fn", F.silu)
         sorted_outputs.append(
             F.linear(  # pylint: disable=not-callable
                 activation(gate_states) * up_states,
@@ -304,8 +319,8 @@ def bind_local_expert_forward(
                 f"{type(module).__name__}: unsupported expert activation {hidden_act!r}; "
                 "provide experts.act_fn or extend the EP activation registry"
             )
-    module.experts._ep_act_fn = activation
-    module.experts._ep_use_grouped_gemm = use_grouped_gemm
+    module.experts.ep_act_fn = activation
+    module.experts.ep_use_grouped_gemm = use_grouped_gemm
     # The forward write itself lives in the forward rewriter (05 §15.2.3:
     # the single MethodType/assignment site); this binder only sets the
     # companion attributes above.
@@ -360,7 +375,7 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
-):
+) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     token_count = flattened_states.shape[0]
@@ -409,14 +424,14 @@ def _prepare_ep_dispatch(
             f"(ep={ep_size}, tokens={token_count}, topk={experts_per_token}, "
             f"tokens/peer={send_counts[0] if send_counts else 0})",
         )
-    return (
-        source_indices,
-        expert_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_indices,
-        send_counts,
-        receive_counts,
+    return _EPDispatch(
+        source_indices=source_indices,
+        expert_weights=expert_weights,
+        dispatch_order=dispatch_order,
+        states=dispatched_states,
+        expert_indices=dispatched_indices,
+        send_counts=send_counts,
+        receive_counts=receive_counts,
     )
 
 
@@ -944,7 +959,7 @@ def ep_routed_forward(
     # any collective is issued.
     chunk_count = _resolve_dispatch_chunks(ep_size)
 
-    batch_size, sequence_length, hidden_size = hidden_states.shape
+    output_shape = tuple(hidden_states.shape)
     topk_indices, topk_weights = router_fn(module, hidden_states)  # [T, K]
     dispatch = _prepare_ep_dispatch(
         hidden_states,
@@ -955,49 +970,40 @@ def ep_routed_forward(
         ep_size=ep_size,
         ep_group=ep_group,
     )
-    (
-        source_token_indices,
-        flattened_expert_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_expert_indices,
-        send_counts,
-        receive_counts,
-    ) = dispatch
     if chunk_count > 1:
         plan = _ep_dispatch_chunks(
-            send_counts, receive_counts, ep_size, chunk_count, ep_rank)
+            dispatch.send_counts, dispatch.receive_counts, ep_size, chunk_count, ep_rank)
         combined_chunks = _run_ep_local_experts_chunked(
             module,
             plan,
-            dispatched_states,
-            dispatched_expert_indices,
+            dispatch.states,
+            dispatch.expert_indices,
             ep_group,
             expert_offset,
         )
         return _aggregate_ep_chunks(
             combined_chunks,
             plan.row_ranges,
-            flattened_expert_weights,
-            source_token_indices,
-            dispatch_order,
-            (batch_size, sequence_length, hidden_size),
+            dispatch.expert_weights,
+            dispatch.source_indices,
+            dispatch.dispatch_order,
+            output_shape,
         )
     combined_expert_outputs = _run_ep_local_experts(
         module,
-        dispatched_states,
-        dispatched_expert_indices,
-        send_counts,
-        receive_counts,
+        dispatch.states,
+        dispatch.expert_indices,
+        dispatch.send_counts,
+        dispatch.receive_counts,
         ep_group,
         expert_offset,
     )
     return _aggregate_ep_outputs(
         combined_expert_outputs,
-        flattened_expert_weights,
-        source_token_indices,
-        dispatch_order,
-        (batch_size, sequence_length, hidden_size),
+        dispatch.expert_weights,
+        dispatch.source_indices,
+        dispatch.dispatch_order,
+        output_shape,
     )
 
 
@@ -1093,15 +1099,7 @@ def ep_routed_dispatch(
 
     batch_size, sequence_length, hidden_size = hidden_states.shape
     topk_indices, topk_weights = router_fn(module, hidden_states)
-    (
-        source_token_indices,
-        flattened_expert_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_expert_indices,
-        send_counts,
-        receive_counts,
-    ) = _prepare_ep_dispatch(
+    dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
         topk_weights,
@@ -1110,6 +1108,13 @@ def ep_routed_dispatch(
         ep_size=ep_size,
         ep_group=ep_group,
     )
+    source_token_indices = dispatch.source_indices
+    flattened_expert_weights = dispatch.expert_weights
+    dispatch_order = dispatch.dispatch_order
+    dispatched_states = dispatch.states
+    dispatched_expert_indices = dispatch.expert_indices
+    send_counts = dispatch.send_counts
+    receive_counts = dispatch.receive_counts
     if chunk_count > 1:
         plan = _ep_dispatch_chunks(
             send_counts, receive_counts, ep_size, chunk_count,

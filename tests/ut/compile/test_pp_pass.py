@@ -61,13 +61,12 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import fx, nn
 
 
-from hyper_parallel.compile.parallel_config import PassConfig  # pylint: disable=C0413
+from hyper_parallel.compile.pass_config import PassConfig  # pylint: disable=C0413
 from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=C0413
     PpPass,
     _auto_stage_split,
@@ -75,7 +74,7 @@ from hyper_parallel.compile.passes.parallel.pp_pass import (  # pylint: disable=
 from hyper_parallel.compile.passes.parallel.pp_schedule import (  # pylint: disable=C0413
     ScheduleGPipe,
 )
-from hyper_parallel.compile.sharding_config import PassPlan  # pylint: disable=C0413
+from hyper_parallel.compile.pass_plan import PassPlan  # pylint: disable=C0413
 from hyper_parallel.compile.tracer.graph_tracer import (  # pylint: disable=C0413
     run_traced_graph,
     trace_model_graph,
@@ -889,8 +888,8 @@ class TestYamlPpSection(unittest.TestCase):
         """Test the mapping and list YAML shapes both parse."""
         import tempfile  # pylint: disable=C0415
 
-        from hyper_parallel.compile.sharding_config import (  # pylint: disable=C0415
-            create_sharding_plan_from_yaml,
+        from hyper_parallel.compile.pass_plan import (  # pylint: disable=C0415
+            create_pass_plan_from_yaml,
         )
 
         yaml_text = """
@@ -904,7 +903,7 @@ pp:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
             f.write(yaml_text)
             path = f.name
-        plan = create_sharding_plan_from_yaml(config_path=path)
+        plan = create_pass_plan_from_yaml(config_path=path)
         self.assertEqual(
             plan.pp_module_fqns_per_stage,
             [

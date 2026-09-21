@@ -72,7 +72,7 @@ pp:
 ```
 
 Both come from `PassPlan.pp_stage(stage_idx, fqns)` /
-`create_sharding_plan_from_yaml`.
+`create_pass_plan_from_yaml`.
 
 ## Configuration reference (`parallel:` section)
 

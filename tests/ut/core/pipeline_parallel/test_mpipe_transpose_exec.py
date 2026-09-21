@@ -29,15 +29,13 @@ import unittest
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402  pylint: disable=wrong-import-position
 
-from hyper_parallel.platform.torch.pipeline_parallel.mpipe_transpose import (  # noqa: E402  pylint: disable=wrong-import-position
+from hyper_parallel.core.pipeline_parallel.mpipe.executor import (  # noqa: E402  pylint: disable=wrong-import-position
     MPipeTransposeExecutor,
 )
-import hyper_parallel.core.pipeline_parallel.mpipe.executor_base as mpipe_base  # noqa: E402  pylint: disable=wrong-import-position
-import hyper_parallel.platform.torch.pipeline_parallel.mpipe_transpose as mpipe_torch  # noqa: E402  pylint: disable=wrong-import-position
+import hyper_parallel.core.pipeline_parallel.mpipe.executor as mpipe_base  # noqa: E402  pylint: disable=wrong-import-position
 from hyper_parallel.core.pipeline_parallel.mpipe.schedule import (  # noqa: E402  pylint: disable=wrong-import-position
     ScheduleMPipeTranspose,
 )
@@ -88,7 +86,7 @@ def _make_executor(preprocess, num_transpose, has_trainable=True,  # pylint: dis
     executor._keep_grad = {}           # placed feature tensors (stage-0 / owner-backward grad read)
     executor._owner_backward = owner_backward
     executor._mpipe_group = None
-    executor._mpipe_group_info = None
+    executor._mpipe_group = None
     executor._grad_snapshot = None  # tower-grad snapshot for the accumulation-safe reduce
     executor._has_trainable = has_trainable
     # Must be an INSTANCE attribute: as a class attribute a function consumer
@@ -338,28 +336,41 @@ class TestMPipeTransposeExecutorTransport(unittest.TestCase):
         executor.reset()
         assert not executor._inputs_for_explicit_forward and not executor._outputs_for_stage0
 
-    @patch.object(mpipe_base, "platform")
-    def test_broadcast_params(self, mock_plat):
+    def test_reset_rejects_undrained_cache(self):
+        """
+        Feature: MPipe Transpose executor per-run cache check.
+        Description: Call ``reset`` while a per-micro cache still holds an entry
+            left over from the previous run.
+        Expectation: it raises ``RuntimeError`` naming the cache and the micro-batch.
+        """
+        executor = MPipeTransposeExecutor(_StubSchedule(torch.nn.Linear(4, 4)))
+        # pylint: disable=protected-access
+        executor._keep_grad[3] = torch.zeros(1)
+        with self.assertRaisesRegex(RuntimeError, r"'keep_grad' still holds micro-batches \[3\]"):
+            executor.reset()
+
+    @patch.object(mpipe_base, "dist")
+    def test_broadcast_params(self, mock_dist):
         """
         Feature: MPipe Transpose parameter broadcast.
         Description: Run ``broadcast_params`` for a trainable preprocess with mocked P2P.
         Expectation: every preprocess tensor is broadcast from stage 0.
         """
-        mock_plat.get_global_rank.return_value = 0
+        mock_dist.get_global_rank.return_value = 0
         executor = _make_executor(torch.nn.Linear(4, 4), num_transpose=2)
         executor.broadcast_params(_step(0), _Ctx(arg_mbs=[[torch.randn(2, 4)]]))
-        assert mock_plat.broadcast.called
+        assert mock_dist.broadcast.called
 
-    @patch.object(mpipe_base, "platform")
-    def test_fwd_send_and_graph_send(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_fwd_send_and_graph_send(self, mock_dist):
         """
         Feature: MPipe Transpose i->0 send (output + stage-0-backward input).
         Description: Run ``fwd_send`` / ``fwd_bwd_graph_input_send`` with mocked P2P.
         Expectation: the (shape, dtype) meta is sent and each isend handle is deferred
             onto the schedule's ``_send_handles``.
         """
-        mock_plat.get_global_rank.return_value = 1
-        mock_plat.isend.return_value = "handle"
+        mock_dist.get_global_rank.return_value = 1
+        mock_dist.isend.return_value = "handle"
         executor = _make_executor(torch.nn.Linear(4, 4), num_transpose=2)
         # pylint: disable=protected-access
         executor._outputs_for_stage0[1] = torch.randn(2, 4)
@@ -368,11 +379,11 @@ class TestMPipeTransposeExecutorTransport(unittest.TestCase):
         ctx.schedule = _StubSchedule(torch.nn.Linear(4, 4))
         executor.fwd_send(_step(1), ctx)
         executor.fwd_bwd_graph_input_send(_step(1), ctx)
-        assert mock_plat.send_object_list.call_count >= 2
+        assert mock_dist.send_object_list.call_count >= 2
         assert len(ctx.schedule._send_handles) >= 2
 
-    @patch.object(mpipe_base, "platform")
-    def test_fwd_recv_and_graph_recv(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_fwd_recv_and_graph_recv(self, mock_dist):
         """
         Feature: MPipe Transpose i->0 receive (output into stage-0 slot + stage-0-backward input).
         Description: Run ``fwd_recv`` / ``fwd_bwd_graph_input_recv`` with mocked P2P (a trainable preprocess
@@ -380,14 +391,13 @@ class TestMPipeTransposeExecutorTransport(unittest.TestCase):
         Expectation: the received output lands in ``ctx.arg_mbs`` and the stage-0-backward input in
             the executor's per-micro input cache.
         """
-        mock_plat.get_global_rank.return_value = 1
+        mock_dist.get_global_rank.return_value = 1
 
         def _recv_meta(meta, src, group=None):  # pylint: disable=unused-argument
             meta[0] = (2, 4)
             meta[1] = torch.float32
-        mock_plat.recv_object_list.side_effect = _recv_meta
-        mock_plat.empty.return_value = torch.zeros(2, 4)
-        mock_plat.irecv.return_value = MagicMock()
+        mock_dist.recv_object_list.side_effect = _recv_meta
+        mock_dist.irecv.return_value = MagicMock()
         executor = _make_executor(torch.nn.Linear(4, 4), num_transpose=2, has_trainable=True)
         # pylint: disable=protected-access
         executor._device = torch.device("cpu")
@@ -396,7 +406,7 @@ class TestMPipeTransposeExecutorTransport(unittest.TestCase):
         executor._outputs_for_stage0[0] = (torch.zeros(2, 4),)
         ctx = _Ctx(arg_mbs=[None, None])
         executor.fwd_recv(_step(1), ctx)
-        assert ctx.arg_mbs[1] is not None and mock_plat.irecv.called
+        assert ctx.arg_mbs[1] is not None and mock_dist.irecv.called
         executor.fwd_bwd_graph_input_recv(_step(1), ctx)
         assert 1 in executor._inputs_for_explicit_forward
 
@@ -510,8 +520,8 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
             assert torch.allclose(param.grad, ref_param.grad, atol=1e-6), \
                 f"stage-0 tower grad via body backward mismatch: max abs diff {diff}"
 
-    @patch.object(mpipe_base, "platform")
-    def test_grad_send_ships_feature_grad_and_skips_self(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_grad_send_ships_feature_grad_and_skips_self(self, mock_dist):
         """
         Feature: MPipe owner-backward feature-grad ship-back.
         Description: ``grad_send`` ships dL/dfeatures for a transposed micro owned
@@ -519,8 +529,8 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
             connected tower already backpropagated).
         Expectation: meta + deferred isend for micro 1; nothing sent for micro 0.
         """
-        mock_plat.get_global_rank.side_effect = lambda group, rank: rank  # identity map
-        mock_plat.isend.return_value = "handle"
+        mock_dist.get_global_rank.side_effect = lambda group, rank: rank  # identity map
+        mock_dist.isend.return_value = "handle"
         executor = _make_executor(torch.nn.Linear(4, 4), num_transpose=2,
                                   has_trainable=True, owner_backward=True)
         # pylint: disable=protected-access
@@ -530,28 +540,29 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         ctx = _Ctx(arg_mbs=[None, None])
         ctx.schedule = _StubSchedule(torch.nn.Linear(4, 4))
         executor.grad_send(_step(1), ctx)
-        assert mock_plat.send_object_list.called and len(ctx.schedule._send_handles) == 1
-        before = mock_plat.send_object_list.call_count
+        assert mock_dist.send_object_list.called and len(ctx.schedule._send_handles) == 1
+        before = mock_dist.send_object_list.call_count
         executor._keep_grad[0] = (feat,)
         executor.grad_send(_step(0), ctx)  # stage 0 owns micro 0 -> local no-op
-        assert mock_plat.send_object_list.call_count == before
+        assert mock_dist.send_object_list.call_count == before
 
-    @patch.object(mpipe_base, "platform")
-    def test_grad_recv_with_backward_runs_owner_backward(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_grad_recv_with_backward_runs_owner_backward(self, mock_dist):
         """
         Feature: MPipe owner-backward feature-grad receive.
         Description: ``grad_recv_with_backward`` receives dL/dfeatures and backprops the retained
             tower graph (``_outputs_for_bwd``), depositing grads on the owner's tower replica.
         Expectation: after grad_recv_with_backward the preprocess params have grads.
         """
-        mock_plat.get_global_rank.side_effect = lambda group, rank: rank
+        mock_dist.get_global_rank.side_effect = lambda group, rank: rank
 
         def _recv_meta(meta, src, group=None):  # pylint: disable=unused-argument
             meta[0] = (2, 4)
             meta[1] = torch.float32
-        mock_plat.recv_object_list.side_effect = _recv_meta
-        mock_plat.empty.return_value = torch.ones(2, 4)
-        mock_plat.irecv.return_value = MagicMock()
+        mock_dist.recv_object_list.side_effect = _recv_meta
+        mock_dist.irecv.side_effect = lambda buffer, *args: MagicMock(
+            wait=lambda: buffer.fill_(1))
+        mock_dist.irecv.return_value = MagicMock()
         preprocess = torch.nn.Linear(4, 4)
         executor = _make_executor(preprocess, num_transpose=2, has_trainable=True, owner_backward=True)
         # pylint: disable=protected-access
@@ -560,8 +571,8 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         executor.grad_recv_with_backward(_step(1), _Ctx(arg_mbs=[None, None]))
         assert all(p.grad is not None for p in preprocess.parameters())
 
-    @patch.object(mpipe_torch, "platform")
-    def test_reduce_tower_grads_allreduces_and_zero_inits(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_reduce_tower_grads_allreduces_and_zero_inits(self, mock_dist):
         """
         Feature: MPipe owner-backward tower-grad reduction.
         Description: ``reduce_tower_grads`` SUM-all-reduces each trainable tower
@@ -570,17 +581,17 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         Expectation: every trainable param ends with a grad; all_reduce runs once
             per trainable param.
         """
-        mock_plat.all_reduce.side_effect = lambda data, group_info: (data, None)
+        mock_dist.all_reduce.side_effect = lambda data, group: None
         preprocess = torch.nn.Linear(4, 4)  # weight + bias = 2 trainable params
         executor = _make_executor(preprocess, num_transpose=2, has_trainable=True, owner_backward=True)
         params = list(preprocess.parameters())
         params[0].grad = torch.randn_like(params[0])  # weight has a grad; bias is None
         executor.reduce_tower_grads(_step(0), _Ctx(arg_mbs=[]))
         assert all(p.grad is not None for p in preprocess.parameters())  # bias zero-inited
-        assert mock_plat.all_reduce.call_count == 2
+        assert mock_dist.all_reduce.call_count == 2
 
-    @patch.object(mpipe_torch, "platform")
-    def test_reduce_tower_grads_reduces_only_delta_under_accum(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_reduce_tower_grads_reduces_only_delta_under_accum(self, mock_dist):
         """
         Feature: MPipe owner-backward tower-grad reduction under accumulation.
         Description: With a non-None grad snapshot (the already-reduced grad from a
@@ -590,7 +601,7 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         Expectation: with an all_reduce that doubles its input (2-rank SUM of equal
             contributions), the result is snapshot + 2*delta, NOT 2*(snapshot+delta).
         """
-        mock_plat.all_reduce.side_effect = lambda data, group_info: (data * 2, None)
+        mock_dist.all_reduce.side_effect = lambda data, group: data.mul_(2)
         preprocess = torch.nn.Linear(4, 4)
         executor = _make_executor(preprocess, num_transpose=2, has_trainable=True, owner_backward=True)
         # pylint: disable=protected-access
@@ -607,8 +618,8 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
             assert torch.allclose(param.grad, expected, atol=1e-5), \
                 f"delta-reduce wrong (re-reduced the accumulated total?): max abs diff {diff}"
 
-    @patch.object(mpipe_torch, "platform")
-    def test_reduce_grads_dtensor_reduces_local_shard_in_place(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_reduce_grads_dtensor_reduces_local_shard_in_place(self, mock_dist):
         """
         Feature: MPipe owner-backward tower-grad reduction with an FSDP-sharded tower.
         Description: When the tower is FSDP-wrapped ``param.grad`` is a sharded
@@ -619,7 +630,7 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
             ``param.grad`` is still the same DTensor object; its local shard holds
             the reduced value.
         """
-        mock_plat.all_reduce.side_effect = lambda data, group_info: (data * 2, None)
+        mock_dist.all_reduce.side_effect = lambda data, group: data.mul_(2)
         local = torch.randn(4, 4)
         dgrad = _FakeDTensorGrad(local.clone())
         param = _FakeShardedParam(dgrad)
@@ -629,14 +640,14 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         executor._preprocess = _FakeShardedPreprocess([param])
         executor._grad_snapshot = None  # first run
         executor.reduce_tower_grads(_step(0), _Ctx(arg_mbs=[]))
-        reduced_arg = mock_plat.all_reduce.call_args[0][0]
+        reduced_arg = mock_dist.all_reduce.call_args[0][0]
         assert not hasattr(reduced_arg, "to_local"), \
             "pp reduce ran on the DTensor, not its local shard"
         assert param.grad is dgrad, "param.grad reassigned -> DTensor wrapper dropped"
         assert torch.allclose(dgrad.to_local(), local * 2, atol=1e-5)
 
-    @patch.object(mpipe_torch, "platform")
-    def test_reduce_grads_dtensor_reduces_only_delta_under_accum(self, mock_plat):
+    @patch.object(mpipe_base, "dist")
+    def test_reduce_grads_dtensor_reduces_only_delta_under_accum(self, mock_dist):
         """
         Feature: MPipe owner-backward FSDP tower reduction under grad accumulation.
         Description: With a local-shard snapshot from a prior (already-reduced) pass,
@@ -646,7 +657,7 @@ class TestMPipeTransposeOwnerBackward(unittest.TestCase):
         Expectation: an all_reduce that doubles its input yields local shard =
             snapshot + 2*delta (not 2*(snapshot+delta)); ``param.grad`` stays the DTensor.
         """
-        mock_plat.all_reduce.side_effect = lambda data, group_info: (data * 2, None)
+        mock_dist.all_reduce.side_effect = lambda data, group: data.mul_(2)
         snap = torch.randn(4, 4)
         delta = torch.randn(4, 4)
         dgrad = _FakeDTensorGrad((snap + delta).clone())  # accumulated local grad
@@ -807,7 +818,7 @@ class TestMPipeTransposeStage0BackwardKwargGrad(unittest.TestCase):
         Description: _explicit_forward_before_backward must backprop only the
             outputs that received a gradient (a None dL/dfeature = zero
             contribution) when some but not all outputs are consumed. Guards the
-            torch path; the MindSpore path mirrors it by zero-filling the sens.
+            Torch autograd path.
         Expectation: the grad-bearing output trains its params; the None-grad
             output contributes nothing (no crash).
         """

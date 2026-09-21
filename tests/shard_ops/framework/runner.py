@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Parent-side launcher: assemble TorchCase/MindSporeCase and parallel_run."""
+"""Parent-side launcher: assemble TorchCase and parallel_run."""
 import multiprocessing as mp
 import os
 import shutil
@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 from tests.common.parallel_case import (
-    MindSporeCase, TorchCase, parallel_run, run_case,
+    TorchCase, parallel_run, run_case,
 )
 from tests.shard_ops.framework.case_spec import OpShardCase
 from tests.shard_ops.framework.reporter import summarize
@@ -262,7 +262,7 @@ class _Runner:
 
     @staticmethod
     def _make_launcher_case(framework: str, num_proc: int):
-        """Create a TorchCase or MindSporeCase with an OS-assigned free port."""
+        """Create a TorchCase with an OS-assigned free port."""
         case_name = "test_suite_entry"
         # Always allocate an OS-assigned free port instead of relying on the
         # counter-based ``allocate_port``: the counter does not validate that
@@ -273,12 +273,6 @@ class _Runner:
             return TorchCase(
                 _ENTRY_FILE, case_name,
                 master_port=master_port, num_proc=num_proc,
-            )
-        if framework == "mindspore":
-            return MindSporeCase(
-                _ENTRY_FILE, case_name,
-                master_port=master_port,
-                worker_num=num_proc, local_worker_num=num_proc, glog_v=2,
             )
         raise ValueError(f"unsupported framework: {framework!r}")
 

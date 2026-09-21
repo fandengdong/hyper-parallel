@@ -29,7 +29,7 @@ from torch import nn
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (  # noqa: E402  pylint: disable=wrong-import-position
+from hyper_parallel.core.activation_memory import (  # noqa: E402  pylint: disable=wrong-import-position
     checkpoint_wrapper,
 )
 from hyper_parallel.distributed.compile import (  # noqa: E402  pylint: disable=wrong-import-position
@@ -442,11 +442,16 @@ class TestNpuFlattenedDimsShim(unittest.TestCase):
 
         module = types.ModuleType("torch_npu._inductor.codegen.ir")
         module.detect_flattened_dims = behaviour
+        stubs = {"torch_npu._inductor.codegen.ir": module}
         for name in ("torch_npu", "torch_npu._inductor", "torch_npu._inductor.codegen"):
             parent = types.ModuleType(name)
             parent.__path__ = []  # type: ignore[attr-defined]
-            sys.modules.setdefault(name, parent)
-        sys.modules["torch_npu._inductor.codegen.ir"] = module
+            stubs.setdefault(name, parent)
+        # Restore the module table afterwards so no fake torch_npu package is
+        # left importable once this test is done.
+        patcher = unittest.mock.patch.dict(sys.modules, stubs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return module
 
     def _install(self, module):
@@ -524,9 +529,20 @@ class TestNpuKernelFallback(unittest.TestCase):
         top = types.ModuleType("torch_npu")
         top.__path__ = []  # type: ignore[attr-defined]
         top._inductor = package  # pylint: disable=protected-access
-        sys.modules["torch_npu"] = top
-        sys.modules["torch_npu._inductor"] = package
-        sys.modules["torch_npu._inductor.config"] = config
+        # Restore sys.modules afterwards: a stub left behind without the real
+        # torch_npu surface is captured by every module that imports torch_npu
+        # later in the session (``components.functional.rms_norm`` does), which
+        # then fails on attributes the real module provides.
+        patcher = unittest.mock.patch.dict(
+            sys.modules,
+            {
+                "torch_npu": top,
+                "torch_npu._inductor": package,
+                "torch_npu._inductor.config": config,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return config
 
     def test_empty_spec_is_a_no_op(self):

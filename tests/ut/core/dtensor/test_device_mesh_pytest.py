@@ -15,7 +15,6 @@
 """PyTorch :class:`~hyper_parallel.core.dtensor.device_mesh.DeviceMesh` unit tests (pytest style)."""
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from unittest.mock import Mock, patch
 
@@ -30,7 +29,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     _DEVICE_MESH_MAP,
     init_device_mesh,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 # ---------------------------------------------------------------------------

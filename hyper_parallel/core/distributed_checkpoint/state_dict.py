@@ -12,25 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Optimizer state dict core API — platform-agnostic forwarding layer.
+"""Optimizer state dict core API — a forwarding layer over the torch implementation.
 
-This module provides ``get_optim_state_dict`` and ``set_optim_state_dict``
-as core-layer entry points that delegate to the active platform backend
-via ``get_platform()``.  No torch / mindspore imports are allowed here.
+This module provides ``get_optim_state_dict`` and ``set_optim_state_dict`` as core-layer
+entry points that forward to the FSDP-aware torch implementations, which know how to gather
+DTensor shards and flatten an optimizer state dict.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
+from hyper_parallel.core.fully_shard.state_dict_utils import (
+    get_optim_state_dict as _get_optim_state_dict,
+    set_optim_state_dict as _set_optim_state_dict,
+)
 
 
 def get_optim_state_dict(model: Any, optimizer: Any, *, options: Any = None) -> Any:
-    """Get optimizer state dict with platform-specific implementation.
-
-    Delegates to the platform-specific implementation at runtime.
+    """Get the optimizer state dict.
 
     Args:
         model: The model whose parameters are optimized.
@@ -41,7 +40,7 @@ def get_optim_state_dict(model: Any, optimizer: Any, *, options: Any = None) -> 
     Returns:
         dict: Optimizer state dict with FQN-based keys.
     """
-    return platform.get_optim_state_dict(model, optimizer, options=options)
+    return _get_optim_state_dict(model, optimizer, options=options)
 
 
 def set_optim_state_dict(
@@ -51,9 +50,7 @@ def set_optim_state_dict(
     *,
     options: Any = None,
 ) -> None:
-    """Set optimizer state dict with platform-specific implementation.
-
-    Delegates to the platform-specific implementation at runtime.
+    """Load an optimizer state dict into ``optimizer``.
 
     Args:
         model: The model whose parameters are optimized.
@@ -62,4 +59,4 @@ def set_optim_state_dict(
         options: Optional configuration (full_state_dict, cpu_offload,
             strict, broadcast_from_rank0, etc.).
     """
-    platform.set_optim_state_dict(model, optimizer, optim_state_dict, options=options)
+    _set_optim_state_dict(model, optimizer, optim_state_dict, options=options)

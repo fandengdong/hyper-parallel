@@ -34,6 +34,9 @@ from typing import Any, Optional, Union
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
+import torch
+import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.distributed_checkpoint.metadata import (
@@ -51,10 +54,9 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
 from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardSavePlanner,
 )
-from hyper_parallel.core.distributed_checkpoint.util import (
+from hyper_parallel.core.distributed_checkpoint.utils import (
     dcp_timer_decorator,
     logger,
-    platform,
 )
 
 _COMPLETE_FLAG = b"\x00__PICKLE_WRITE_COMPLETE__\x00"
@@ -75,8 +77,17 @@ class DataCopier:
     _registry = {}
 
     @classmethod
-    def register(cls, *types):
-        def decorator(func):
+    def register(cls, *types: type) -> Callable:
+        """Register the decorated function as the copy handler of every type given.
+
+        Args:
+            *types (type): Types the handler is responsible for.
+
+        Returns:
+            Callable: Decorator recording the handler and returning it unchanged.
+        """
+        def decorator(func: Callable) -> Callable:
+            """Record ``func`` against every registered type and hand it back."""
             for t in types:
                 cls._registry[t] = func
             return func
@@ -90,7 +101,7 @@ class DataCopier:
         registered base class afterwards.
 
         Registration order must not decide the handler. ``DTensor`` is registered after
-        ``platform.Tensor`` and is a subclass of it, so scanning in registration order would
+        ``torch.Tensor`` and is a subclass of it, so scanning in registration order would
         hand a ``DTensor`` subclass to the plain tensor handler, staging it as a bare local
         tensor with its mesh and placements dropped.
 
@@ -113,7 +124,7 @@ class DataCopier:
         return cls._registry[best_type] if best_type is not None else None
 
     @classmethod
-    def copy(cls, obj):
+    def copy(cls, obj: Any) -> Any:
         """
         Copy ``obj`` with its registered handler, or with a generic deep copy as fallback.
 
@@ -143,16 +154,15 @@ class DataCopier:
         return obj_c
 
 
-def _copy_tensor_to_cpu(tensor: platform.Tensor) -> platform.Tensor:
-    """Return a host-memory copy of a framework tensor, detached from autograd where applicable."""
-    # ``to("cpu")`` is supported on both Torch and MindSpore tensor APIs used by HyperParallel.
-    t = platform.detach(tensor).to("cpu", copy=True)
+def _copy_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a host-memory copy of a tensor, detached from autograd."""
+    t = tensor.detach().to("cpu", copy=True)
     if hasattr(tensor, CHUNK_INFO):
         setattr(t, CHUNK_INFO, getattr(tensor, CHUNK_INFO))
     return t
 
 
-@DataCopier.register(int, float, complex, bool, str, type(None), Enum, platform.dtype)
+@DataCopier.register(int, float, complex, bool, str, type(None), Enum, torch.dtype)
 def _copy_const(obj):
     return obj
 
@@ -167,7 +177,7 @@ def _copy_ndarray(obj):
     return obj.copy()
 
 
-@DataCopier.register(platform.Tensor)
+@DataCopier.register(torch.Tensor)
 def _copy_tensor(obj):
     result = _copy_tensor_to_cpu(obj)
     return result
@@ -240,6 +250,14 @@ class AsyncSaveResponse:
     persist_completion: Future[Metadata]
 
     def get_result(self, timeout: int = None) -> Optional[Metadata]:
+        """Wait for the save to be persisted and return its metadata.
+
+        Args:
+            timeout (int): Seconds to wait. Default ``None``, which waits indefinitely.
+
+        Returns:
+            Optional[Metadata]: Metadata of the persisted checkpoint.
+        """
         return self.persist_completion.result(timeout=timeout)
 
 
@@ -264,15 +282,17 @@ def cleanup_and_reinit_process_group(
     master_addr: str,
     master_port: int,
     rank: int,
-    world_size: int
-):
+    world_size: int,
+) -> None:
     """
     Cleanup hccl process group and reinitialize gloo process group.
-    """
-    # torch is imported lazily so this module stays importable on a MindSpore-only install.
-    import torch.distributed as dist  # pylint: disable=import-outside-toplevel
-    import torch.distributed.distributed_c10d as c10d  # pylint: disable=import-outside-toplevel
 
+    Args:
+        master_addr (str): Address of the rendezvous the new group meets at.
+        master_port (int): Port of that rendezvous.
+        rank (int): Rank of this process in the new group.
+        world_size (int): Number of processes in the new group.
+    """
     # Resetting the private c10d state is the only way to drop the process group inherited
     # from the parent process, so the accesses below are deliberate.
     # pylint: disable=protected-access
@@ -367,9 +387,8 @@ def execute_async_persist_with_gloo(
         master_addr: TCP rendezvous address for the gloo store.
         master_port: Training master port; the child connects to that store as a client.
     """
-    # Lazy imports: torch keeps this module framework-agnostic, and ``api`` imports this
-    # module at load time, so importing it here is what breaks the import cycle.
-    import torch.distributed as dist  # pylint: disable=import-outside-toplevel
+    # ``api`` imports this module at load time, so this import stays function local: that is
+    # what keeps the two from importing each other at load time.
     from hyper_parallel.core.distributed_checkpoint.api import _save_impl  # pylint: disable=import-outside-toplevel
     try:
         # Clear the original communication group information and establish the gloo communication.
@@ -490,7 +509,7 @@ def resolve_async_persist_result(
         )
 
 
-def batch_read_worker(file_batch: tuple[int], checkpoint_id, file_type) -> list:
+def batch_read_worker(file_batch: tuple[int], checkpoint_id: str, file_type: FileType) -> list:
     """
     Read one batch of files, waiting for the files that the other ranks have not written yet.
 
@@ -651,11 +670,19 @@ def _safe_remove_file(file_path: str) -> None:
         )
 
 
-def load_file(checkpoint_id: str, file_type: FileType, file_id: int):
+def load_file(checkpoint_id: str, file_type: FileType, file_id: int) -> Any:
     """
     Reads files from the storage.
     Currently, this function is mainly used to
     asynchronously save local plan and storage data files.
+
+    Args:
+        checkpoint_id (str): Checkpoint directory holding the file.
+        file_type (FileType): Which kind of file to read, local plan or storage data.
+        file_id (int): Id of the file within that kind.
+
+    Returns:
+        Any: The unpickled content of the file.
     """
     file_path = assemble_file_path(checkpoint_id, file_type, file_id)
 
@@ -689,12 +716,18 @@ def write_file(
     checkpoint_id: str,
     file_type: FileType,
     file_id: int,
-    content: Union[SavePlan, WriteResult]
-):
+    content: Union[SavePlan, WriteResult],
+) -> None:
     """
     Write files to the storage.
     Currently, this function is mainly used to
     asynchronously save local plan and storage data files.
+
+    Args:
+        checkpoint_id (str): Checkpoint directory to write into.
+        file_type (FileType): Which kind of file to write, local plan or storage data.
+        file_id (int): Id of the file within that kind.
+        content (Union[SavePlan, WriteResult]): What to pickle into it.
     """
     final_path = assemble_file_path(checkpoint_id, file_type, file_id)
 

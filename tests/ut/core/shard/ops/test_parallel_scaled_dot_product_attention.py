@@ -13,9 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """parallel_scaled_dot_product_attention unit test"""
-# pylint: disable=C9006,C9007,C0415,W0613,W0404,W0621
+import os
 import unittest
 from unittest.mock import MagicMock, patch
+
+import numpy as np
+import torch
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -26,7 +29,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = ScaledDotProductAttentionDistributedOp("scaled_dot_product_attention")
 
@@ -51,12 +54,13 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests."""
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2x2 (dp, sp, mp) mesh via init_device_mesh."""
@@ -592,6 +596,9 @@ class TestSdpaHelperMethods(unittest.TestCase):
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x4_mesh(self, mock_platform):
         self._setup_mock_platform(mock_platform, world_size=8)
@@ -643,7 +650,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_get_dims_non_3d_defaults_to_4d(self):
         """_get_dims returns 4D mapping when tensor_map is not length 3."""
-        from unittest.mock import MagicMock
         mock_layout = MagicMock()
         mock_layout.tensor_map = (None, None, None, None, None)
         dims = op._get_dims(mock_layout)
@@ -655,7 +661,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_no_alias_tensor_map(self, mock_platform):
         """_get_dim_split_num returns 1 when layout has no alias_tensor_map."""
-        from unittest.mock import MagicMock
         mock_layout = MagicMock()
         del mock_layout.alias_tensor_map
         result = op._get_dim_split_num(mock_layout, 0)
@@ -664,7 +669,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_dim_out_of_range_returns_one(self, mock_platform):
         """_get_dim_split_num returns 1 when dim_idx >= len(alias_tensor_map)."""
-        from unittest.mock import MagicMock
         mock_layout = MagicMock()
         mock_layout.alias_tensor_map = ("dp",)
         result = op._get_dim_split_num(mock_layout, 5)
@@ -673,7 +677,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_dim_split_num_none_mapping_returns_one(self, mock_platform):
         """_get_dim_split_num returns 1 for a 'None' mapped dimension."""
-        from unittest.mock import MagicMock
         mock_layout = MagicMock()
         mock_layout.alias_tensor_map = ("None", "dp")
         result = op._get_dim_split_num(mock_layout, 0)
@@ -762,7 +765,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_get_expand_impl_callable_no_sp_calls_func(self, mock_platform):
         """expanded_impl with no sequence parallelism calls func directly."""
-        from unittest.mock import MagicMock
         self._setup_mock_platform(mock_platform, world_size=8)
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
@@ -801,7 +803,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_get_split_info_no_alias_tensor_map_returns_defaults(self):
         """_get_split_info returns all-1 defaults when alias_tensor_map is None."""
-        from unittest.mock import MagicMock
         mock_layout = MagicMock()
         mock_layout.alias_tensor_map = None
         dims = {"batch": 0, "head": 1, "seq": 2}
@@ -810,7 +811,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_build_causal_mask_for_chunk_shape_and_values(self):
         """_build_causal_mask_for_chunk returns correct shape and causal pattern."""
-        import torch
         result = ScaledDotProductAttentionDistributedOp._build_causal_mask_for_chunk(
             local_q_len=4, kv_len=8, split_id=1, device=torch.device("cpu")
         )
@@ -820,7 +820,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_adjust_attn_mask_causal_split_id_zero_preserves_causal(self):
         """_adjust_attn_mask_for_sp with is_causal=True and split_id=0 keeps is_causal=True."""
-        import torch
         key = torch.randn(2, 4, 8, 64)
         value = torch.randn(2, 4, 8, 64)
         adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
@@ -832,7 +831,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_adjust_attn_mask_causal_split_id_nonzero_builds_mask(self):
         """_adjust_attn_mask_for_sp with is_causal=True and split_id=1 builds causal mask."""
-        import torch
         key = torch.randn(2, 4, 8, 64)
         value = torch.randn(2, 4, 8, 64)
         adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
@@ -843,7 +841,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_adjust_attn_mask_explicit_mask_2d_sliced(self):
         """_adjust_attn_mask_for_sp with explicit 2D attn_mask slices local Q range."""
-        import torch
         key = torch.randn(2, 4, 8, 64)
         value = torch.randn(2, 4, 8, 64)
         global_q_len = 8
@@ -856,7 +853,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_adjust_attn_mask_explicit_mask_4d_sliced(self):
         """_adjust_attn_mask_for_sp with explicit 4D attn_mask slices local Q range."""
-        import torch
         key = torch.randn(2, 4, 8, 64)
         value = torch.randn(2, 4, 8, 64)
         global_q_len = 8
@@ -868,12 +864,9 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(adj_mask.shape[2], local_q_len)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.platform")
-    def test_expanded_impl_with_sequence_parallelism(self, mock_sdpa_platform, mock_mesh_platform):
+    def test_expanded_impl_with_sequence_parallelism(self, mock_mesh_platform):
         """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""
-        import torch
         self._setup_mock_platform(mock_mesh_platform, world_size=8)
-        mock_sdpa_platform.get_rank.return_value = 0
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")
         )
@@ -896,7 +889,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_validate_sharding_consistency_none_alias_tensor_map_returns(self):
         """_validate_sharding_consistency returns silently when alias_tensor_map is None."""
-        from unittest.mock import MagicMock
         mock_q = MagicMock()
         mock_q.alias_tensor_map = None
         mock_k = MagicMock()
@@ -905,7 +897,6 @@ class TestSdpaHelperMethods(unittest.TestCase):
 
     def test_validate_sharding_consistency_both_none_alias_tensor_map_returns(self):
         """_validate_sharding_consistency skips when both alias_tensor_maps are None."""
-        from unittest.mock import MagicMock
         mock_q = MagicMock()
         mock_q.alias_tensor_map = None
         mock_k = MagicMock()

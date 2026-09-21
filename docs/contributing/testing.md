@@ -9,8 +9,7 @@
 | 目录 | 说明 | 是否需要分布式环境 |
 |------|------|-------------------|
 | `tests/ut/` | 单元测试 | 不需要 |
-| `tests/st/torch/` | PyTorch 分布式系统测试 | 需要（torchrun） |
-| `tests/st/mindspore/` | MindSpore 分布式系统测试 | 需要（msrun，8卡） |
+| `tests/torch/` | PyTorch 分布式系统测试 | 需要（torchrun） |
 
 ## 运行测试
 
@@ -23,13 +22,7 @@ pytest tests/ut/
 ### PyTorch 分布式测试
 
 ```bash
-torchrun --nproc_per_node=8 -m pytest tests/st/torch/
-```
-
-### MindSpore 分布式测试
-
-```bash
-msrun_case()  # 项目封装的 msrun 启动函数，默认 8 卡
+torchrun --nproc_per_node=8 -m pytest tests/torch/
 ```
 
 ### 按模块运行
@@ -39,9 +32,7 @@ msrun_case()  # 项目封装的 msrun 启动函数，默认 8 卡
 pytest tests/ut/core/shard/
 
 # 仅运行 activation_checkpoint UT
-pytest tests/ut/core/activation_checkpoint/
-pytest tests/ut/platform/torch/activation_checkpoint/
-pytest tests/ut/platform/mindspore/activation_checkpoint/
+pytest tests/ut/core/activation_memory/
 ```
 
 ## 测试标记
@@ -55,7 +46,7 @@ pytest tests/ut/platform/mindspore/activation_checkpoint/
 ## 测试编写规范
 
 1. **新增功能必须配套 UT**：覆盖率目标 ≥ 80%
-2. **分布式测试需要同时覆盖 MindSpore 和 PyTorch 后端**（如适用）
+2. **分布式测试覆盖真实的通信路径**：UT 用 mock 校验调用契约，ST 用多进程校验数值
 3. **使用项目封装的分布式启动函数**：`torchrun_case()` 和 `msrun_case()`
 4. **优先使用 Gloo CPU backend 进行 UT**：减少 NPU 资源占用，`tests/common/` 中提供了 Gloo 适配器
 

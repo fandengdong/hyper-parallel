@@ -14,9 +14,7 @@
 # ============================================================================
 """PP + HSDP (2-D ``(replicate, shard)`` mesh) under Interleaved 1F1B vs single-card.
 
-Torch counterpart of ``tests/mindspore/st/pipeline_parallel/_test_pp_composite.py``'s
-``test_fully_shard_pp_vpp``, but the ``fully_shard`` units run over a **2-D HSDP**
-submesh instead of a 1-D FSDP mesh.  The point is to exercise the HSDP gradient
+The ``fully_shard`` units run over a **2-D HSDP** submesh.  The point is to exercise the HSDP gradient
 *drain* (reduce-scatter over the shard dim **and** all-reduce over the replicate
 dim) when it is driven by the pipeline ``FSDP_REDUCE_GRAD`` MetaStep under
 ``ScheduleInterleaved1F1B`` -- the path fixed by the unconditional drain in
@@ -53,7 +51,6 @@ from __future__ import annotations
 import copy
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from typing import Dict, List, Tuple
 

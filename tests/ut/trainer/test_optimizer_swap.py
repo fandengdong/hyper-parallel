@@ -37,7 +37,7 @@ from hyper_parallel.components.optim.builders import AdamW as AdamWBuilder
 from hyper_parallel.core.optimizer import ChainedOptimizer, SwapOptimizerConfig
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
-from hyper_parallel.platform.torch.swap_optimizer import adapters as swap_adapters
+from hyper_parallel.core.optimizer import swap_optimizer_base as swap_adapters
 from hyper_parallel.trainer import base as trainer_base
 from hyper_parallel.trainer.base import BaseTrainer, _to_swap_optimizer_config
 from hyper_parallel.trainer.config import (
@@ -335,7 +335,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         self.assertEqual(list(passed.state_keys), ["exp_avg"])
         self.assertFalse(passed.include_master_params)
         self.assertIs(passed.packed_swap, True)
-        self.assertTrue(passed.packed_swap_was_explicit)
 
     @arg_mark(**_MARK)
     def test_unspecified_packed_swap_keeps_the_backend_default(self):
@@ -351,7 +350,6 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
         swap_config = _to_swap_optimizer_config(config.optimizer.swap)
         built = _build_optimizer(config, self.model)
 
-        self.assertFalse(swap_config.packed_swap_was_explicit)
         self.assertIs(swap_config.packed_swap, True)
         self.assertTrue(built.runtime.packed_enabled)
 

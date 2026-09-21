@@ -33,7 +33,6 @@ import os
 import unittest
 import warnings
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn

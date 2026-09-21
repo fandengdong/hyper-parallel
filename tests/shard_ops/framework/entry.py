@@ -44,7 +44,6 @@ from tests.shard_ops.framework.utils import (
 
 _PLATFORM_FRAMEWORK_PKG = {
     "torch": "tests.torch.shard.ops.framework",
-    "mindspore": "tests.mindspore.st.shard.ops.framework",
 }
 
 

@@ -21,13 +21,12 @@ import numpy as np
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.context_parallel import async_context_parallel as async_cp_module  # noqa: E402
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh  # noqa: E402
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType  # noqa: E402
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class _FakeTwoDMesh:
@@ -187,7 +186,6 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
 
 def _setup_mock_mesh_platform(mock_platform, world_size, rank=0):
     """Configure a mocked device-mesh platform for CPU-only DTensor tests."""
-    mock_platform.platform_type = PlatformType.PYTORCH
     mock_platform.get_rank.return_value = rank
     mock_platform.get_world_size.return_value = world_size
     mock_platform.tensor_to_numpy.side_effect = (
@@ -219,7 +217,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         work = object()
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "all_to_all_single",
                 return_value=(out_perm, work),
                 create=True,
@@ -265,7 +263,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         out_perm = torch.empty(6, 2, 4)
         work = object()
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "all_gather_single",
                 return_value=(out_perm, work),
                 create=True,
@@ -298,11 +296,11 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
             v_proj = nn.Identity()
 
             with patch.object(
-                    async_cp_module.platform,
+                    async_cp_module.utils,
                     "register_forward_pre_hook",
                     create=True,
             ) as mock_pre, patch.object(
-                    async_cp_module.platform,
+                    async_cp_module.utils,
                     "register_full_backward_pre_hook",
                     create=True,
             ) as mock_bwd:
@@ -330,8 +328,8 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         k_proj = nn.Identity()
         v_proj = nn.Identity()
 
-        with patch.object(async_cp_module.platform, "register_forward_pre_hook", create=True) as mock_pre, \
-                patch.object(async_cp_module.platform, "register_full_backward_pre_hook", create=True) as mock_bwd:
+        with patch.object(async_cp_module.utils, "register_forward_pre_hook", create=True) as mock_pre, \
+                patch.object(async_cp_module.utils, "register_full_backward_pre_hook", create=True) as mock_bwd:
             result = style.apply(
                 module,
                 _FakeTwoDMesh(),
@@ -545,7 +543,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         bwd_slot = []
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "differentiable_async_a2a_wait",
                 return_value="waited",
                 create=True,
@@ -564,7 +562,7 @@ class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
         mock_wait.assert_called_once_with(tensor, "work", "out", "group", 2, 1, 2, bwd_slot)
 
         with patch.object(
-                async_cp_module.platform,
+                async_cp_module.utils,
                 "differentiable_async_allgather_wait",
                 return_value="gathered",
                 create=True,

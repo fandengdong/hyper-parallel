@@ -17,8 +17,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from hyper_parallel.core.pipeline_parallel import scheduler as scheduler_module
 from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B
+from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
 
 
 class TestBatchP2PGroupInitialization(unittest.TestCase):
@@ -51,7 +54,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
     def test_batch_transport_prepares_group_once(self) -> None:
         """Two runs of one batch schedule prepare its process group only once."""
         schedule = self._make_schedule(batch_p2p=True)
-        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+        with mock.patch.object(scheduler_module, "prepare_batch_p2p_group") as prepare_group:
             schedule.run_microbatches([], [], [])
             schedule.run_microbatches([], [], [])
 
@@ -61,7 +64,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
     def test_plain_transport_does_not_prepare_group(self) -> None:
         """Plain P2P preserves its existing no-preparation startup path."""
         schedule = self._make_schedule(batch_p2p=False)
-        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+        with mock.patch.object(scheduler_module, "prepare_batch_p2p_group") as prepare_group:
             schedule.run_microbatches([], [], [])
 
         prepare_group.assert_not_called()
@@ -71,7 +74,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
         """Multi-stream P2P should initialize the full PP group used for metadata."""
         schedule = self._make_schedule(batch_p2p=True)
         schedule._p2p_mode = "multi_stream"
-        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+        with mock.patch.object(scheduler_module, "prepare_batch_p2p_group") as prepare_group:
             schedule.run_microbatches([], [], [])
 
         prepare_group.assert_called_once_with(mock.sentinel.pp_group)
@@ -85,7 +88,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
             1: mock.sentinel.edge_group_1,
             7: mock.sentinel.edge_group_7,
         }
-        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+        with mock.patch.object(scheduler_module, "prepare_batch_p2p_group") as prepare_group:
             schedule.run_microbatches([], [], [])
             schedule.run_microbatches([], [], [])
 
@@ -103,7 +106,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
                 schedule = self._make_schedule(batch_p2p=batch_p2p)
                 schedule._p2p_multi_stream_groups = {1: mock.sentinel.edge_group}
                 with mock.patch.object(
-                        scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+                        scheduler_module, "prepare_batch_p2p_group") as prepare_group:
                     schedule.run_microbatches([], [], [])
 
                 self.assertNotIn(
@@ -114,7 +117,7 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
         """A batch schedule without a cross-rank edge needs no preparation."""
         schedule = self._make_schedule(batch_p2p=True)
         schedule.real_stage_num = 1
-        with mock.patch.object(scheduler_module.platform, "prepare_batch_p2p_group") as prepare_group:
+        with mock.patch.object(scheduler_module, "prepare_batch_p2p_group") as prepare_group:
             schedule.run_microbatches([], [], [])
 
         prepare_group.assert_not_called()
@@ -125,14 +128,14 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
         schedule = self._make_schedule(batch_p2p=True)
         specs = [("isend", mock.sentinel.tensor, 1)]
         with mock.patch.object(
-                scheduler_module.platform, "p2p_op", return_value=mock.sentinel.op) as p2p_op:
+                scheduler_module.dist, "P2POp", return_value=mock.sentinel.op) as p2p_op:
             with mock.patch.object(
-                    scheduler_module.platform, "batch_isend_irecv",
-                    return_value=mock.sentinel.handle) as batch_isend_irecv:
+                    scheduler_module.dist, "batch_isend_irecv",
+                    return_value=[mock.sentinel.handle]) as batch_isend_irecv:
                 handles = schedule._batched_issue(specs)
 
         p2p_op.assert_called_once_with(
-            "isend", mock.sentinel.tensor, 1, group=mock.sentinel.pp_group)
+            scheduler_module.dist.isend, mock.sentinel.tensor, 1, group=mock.sentinel.pp_group)
         batch_isend_irecv.assert_called_once_with([mock.sentinel.op])
         self.assertEqual(handles, [mock.sentinel.handle])
 
@@ -148,9 +151,25 @@ class TestBatchP2PGroupInitialization(unittest.TestCase):
         """A failed preparation is retried instead of being treated as initialized."""
         schedule = self._make_schedule(batch_p2p=True)
         with mock.patch.object(
-                scheduler_module.platform, "prepare_batch_p2p_group",
+                scheduler_module, "prepare_batch_p2p_group",
                 side_effect=RuntimeError("preparation failed")):
             with self.assertRaisesRegex(RuntimeError, "preparation failed"):
                 schedule.run_microbatches([], [], [])
 
         self.assertFalse(schedule._batch_p2p_group_initialized)
+
+    def test_virtual_stages_share_automatically_created_process_group(self) -> None:
+        """Virtual chunks reuse one subgroup when native c10d does not cache it."""
+        schedule = object.__new__(ScheduleInterleaved1F1B)
+        schedule.n_local_stages = 2
+        schedule.stages = [
+            PipelineStage(torch.nn.Identity(), index, 4, device=torch.device("cpu"))
+            for index in (0, 2)
+        ]
+        with mock.patch("torch.distributed.get_rank", return_value=0), \
+                mock.patch("torch.distributed.get_world_size", return_value=4), \
+                mock.patch("torch.distributed.new_group") as new_group:
+            schedule._init_stages()
+
+        new_group.assert_called_once_with([0, 2], use_local_synchronization=True)
+        self.assertIs(schedule.stages[0].pp_group, schedule.stages[1].pp_group)

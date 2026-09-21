@@ -85,8 +85,8 @@ from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F
+from torch.nn import Module
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
@@ -112,8 +112,6 @@ from hyper_parallel.distributed.recipe_spec import (
 )
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-Module = platform.Module
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -250,8 +248,10 @@ def _prepare_hybrid_sdpa_kwargs(
     )
 
 
-def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs):
+def _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kwargs, *, normalize_gqa=False):
     """CP-aware SDPA: K/V all-gather + D-04 offset-aware causal mask."""
+    if normalize_gqa:
+        q, k, v, kwargs = _normalize_hf_sdpa_gqa(q, k, v, kwargs)
     cp_dim = 2  # sequence dim of the [B, N, S, H] layout
     global_k, global_v = flex_cp_allgather(
         k.contiguous(), v.contiguous(), cp_dim, cp_mesh)
@@ -535,7 +535,9 @@ def sdpa_hf_cp_wrapper(
         def cp_aware_sdpa(q: Any, k: Any, v: Any, **kw: Any) -> Any:
             """CP-aware SDPA replacement: all-gather K/V plus the D-04 mask."""
             fired["hit"] = True
-            return _cp_sdpa_call(orig_sdpa, cp_mesh, q, k, v, kw)
+            return _cp_sdpa_call(
+                orig_sdpa, cp_mesh, q, k, v, kw, normalize_gqa=True
+            )
 
         F.scaled_dot_product_attention = cp_aware_sdpa
         try:
@@ -710,10 +712,12 @@ def sdpa_hf_load_balance_cp_wrapper(
             keep_kwargs, peer_kwargs = _prepare_head_tail_sdpa_kwargs(
                 call_kwargs, q, k, cp_mesh
             )
+
+            def _call_original_sdpa(query, key, value, attention_kwargs):
+                return original_sdpa(query, key, value, **attention_kwargs)
+
             return head_tail_load_balance_attention(
-                lambda query, key, value, attention_kwargs: original_sdpa(
-                    query, key, value, **attention_kwargs
-                ),
+                _call_original_sdpa,
                 q,
                 k,
                 v,
@@ -994,12 +998,14 @@ def sdpa_hf_hybrid_cp_wrapper(
                 cp_mesh,
                 ulysses_degree,
             )
+
+            def _call_original_sdpa(call_query, call_key, call_value, call_kwargs):
+                return original_sdpa(
+                    call_query, call_key, call_value, **call_kwargs
+                )
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_sdpa(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_original_sdpa,
                 query,
                 key,
                 value,
@@ -1047,12 +1053,14 @@ def flex_hf_hybrid_cp_wrapper(
                 **attention_kwargs: Any) -> Any:
             """Route one intercepted FlexAttention call through Hybrid CP."""
             fired["hit"] = True
+
+            def _call_original_flex(call_query, call_key, call_value, call_kwargs):
+                return original_flex_attention(
+                    call_query, call_key, call_value, **call_kwargs
+                )
+
             return hybrid_cp_attention(
-                lambda call_query, call_key, call_value, call_kwargs: (
-                    original_flex_attention(
-                        call_query, call_key, call_value, **call_kwargs
-                    )
-                ),
+                _call_original_flex,
                 query,
                 key,
                 value,
@@ -1142,14 +1150,47 @@ def _validate_ulysses_requirements(target_module, cp_size):
                 f"{name}={count} is not divisible by CP size {cp_size}")
     if getattr(text_config, "dsa_dense_warm_up", False):
         raise ValueError("MLA/DSA CP does not support DSA dense warm-up")
-    if not getattr(text_config, "apply_FA_rescale", False):
-        raise ValueError("MLA/DSA CP requires apply_FA_rescale=True")
+    if not getattr(text_config, "apply_fa_rescale", False):
+        raise ValueError("MLA/DSA CP requires apply_fa_rescale=True")
     if getattr(text_config, "use_fused_sink_fa", False):
         raise ValueError("MLA/DSA CP does not support fused sink FA")
 
 
+def _collect_mla_dsa_text_models(target_module):
+    """Collect text-model modules supported by the MLA/DSA wrapper.
+
+    Args:
+        target_module: Root module whose descendants are inspected.
+
+    Returns:
+        The matching text-model modules in traversal order.
+    """
+    text_models = []
+    for name, module in target_module.named_modules():
+        if name.rsplit(".", maxsplit=1)[-1] in {"text_model", "language_model"}:
+            text_models.append(module)
+    return text_models
+
+
+def _collect_mla_dsa_attention_registries(attention_module):
+    """Collect registries that expose both required MLA/DSA backends.
+
+    Args:
+        attention_module: Python module that owns the attention registries.
+
+    Returns:
+        Dictionaries containing both required attention functions.
+    """
+    attention_registries = []
+    required_attention_functions = {"npu_fa_rescale", "dsa_sparse_attention"}
+    for value in vars(attention_module).values():
+        if isinstance(value, dict) and required_attention_functions <= value.keys():
+            attention_registries.append(value)
+    return attention_registries
+
+
 @inner_wrapper
-def mla_dsa_ulysses_cp_wrapper(
+def mla_dsa_ulysses_cp_wrapper(  # pylint: disable=inconsistent-return-statements
         target_module: Module, mesh: Any, tp_mesh: Any,
         cp_mesh: Any, ep_mesh: Any) -> Any:
     """Configure input, MoME, MLA and DSA Ulysses adaptations."""
@@ -1162,9 +1203,7 @@ def mla_dsa_ulysses_cp_wrapper(
     _validate_ulysses_requirements(target_module, cp_mesh.size())
     context = _UlyssesContext(cp_mesh)
 
-    text_models = [module for name, module in target_module.named_modules()
-                   if name.rsplit(".", maxsplit=1)[-1] in {
-                       "text_model", "language_model"}]
+    text_models = _collect_mla_dsa_text_models(target_module)
     if not text_models:
         raise RuntimeError("Cannot find a text or language model")
     requests = []
@@ -1182,10 +1221,7 @@ def mla_dsa_ulysses_cp_wrapper(
         raise RuntimeError(
             f"Expected one MLA/DSA attention module, found {names}")
     attention_module = next(iter(attention_modules))
-    attention_registries = [
-        value for value in vars(attention_module).values()
-        if isinstance(value, dict)
-        and {"npu_fa_rescale", "dsa_sparse_attention"} <= value.keys()]
+    attention_registries = _collect_mla_dsa_attention_registries(attention_module)
     if len(attention_registries) != 1:
         raise RuntimeError(
             "Expected one attention-function registry containing MLA and DSA backends")

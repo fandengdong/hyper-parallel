@@ -42,10 +42,10 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.platform import get_platform
-
-
-platform = get_platform()
+from hyper_parallel.core.dtensor._utils import (
+    differentiable_all_to_all_single_async,
+    get_device_handle,
+)
 
 _UNEVEN_A2A_BACKENDS = ("nccl", "hccl")
 
@@ -256,9 +256,9 @@ def _lazy_a2a_resources() -> tuple[Any, Any, Any]:
     global _LAZY_A2A_STREAM, _LAZY_A2A_READY_EVENT, _LAZY_A2A_DONE_EVENT  # pylint: disable=global-statement
     with _LAZY_A2A_LOCK:
         if _LAZY_A2A_DONE_EVENT is None:
-            _LAZY_A2A_STREAM = platform.new_stream()
-            _LAZY_A2A_READY_EVENT = platform.new_event()
-            _LAZY_A2A_DONE_EVENT = platform.new_event()
+            _LAZY_A2A_STREAM = get_device_handle().Stream()
+            _LAZY_A2A_READY_EVENT = get_device_handle().Event()
+            _LAZY_A2A_DONE_EVENT = get_device_handle().Event()
         return _LAZY_A2A_STREAM, _LAZY_A2A_READY_EVENT, _LAZY_A2A_DONE_EVENT
 
 
@@ -293,9 +293,9 @@ def _issue_split_free_a2a(out: torch.Tensor, x: torch.Tensor, group: Any) -> Any
         The event recorded when the exchange has completed; the consumer's
         stream waits on it (see :class:`_PendingEqualA2A`).
     """
-    compute_stream = platform.get_current_stream()
+    compute_stream = get_device_handle().current_stream()
     stream, ready_event, done_event = _lazy_a2a_resources()
-    stream_context = platform.get_stream_context()
+    stream_context = get_device_handle().stream
     ready_event.record(compute_stream)
     with stream_context(stream):
         ready_event.wait(stream)
@@ -335,7 +335,7 @@ class _PendingEqualA2A:
     def wait(self) -> torch.Tensor:
         """Order the current stream after the exchange and return its result."""
         if not self.completed:
-            self._event.wait(platform.get_current_stream())
+            self._event.wait(get_device_handle().current_stream())
             self.completed = True
         return self._tensor
 
@@ -632,6 +632,6 @@ def ep_all_to_all_async(
             tensor, event = _EPAllToAllEqualLazy.apply(x, rows_per_peer, ep_size, group)
             return _PendingEqualA2A(tensor, event)
         return _EPAllToAllEqual.apply(x, rows_per_peer, ep_size, group)
-    return platform.differentiable_all_to_all_single_async(
+    return differentiable_all_to_all_single_async(
         x, send_counts, recv_counts, group,
     )

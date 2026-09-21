@@ -41,7 +41,7 @@ from hyper_parallel.core.dtensor.layout import (
 )
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, StridedShard
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
-from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel.core.dtensor.dtensor_base import DTensorBase
 
 logger = logging.getLogger(__name__)
 

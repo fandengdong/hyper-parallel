@@ -136,8 +136,8 @@ Pick the matching paragraph for the report's last section:
 - 14:02 /check-pr posted
 - 14:08 pr-check-pass label observed
 - 14:08 /retest posted (build #2451)
-- 14:23 build #2451 FAILURE on test_pynative_swiglu_x (UNRELATED, sticky vs #2450)
-- 14:38 temp-skip applied on test_pynative_swiglu_x → commit abc1234, /retest posted
+- 14:23 build #2451 FAILURE on test_activation_checkpoint (UNRELATED, sticky vs #2450)
+- 14:38 temp-skip applied on test_activation_checkpoint → commit abc1234, /retest posted
 - 15:03 build #2452 FAILURE on Check_Pylint W1510 in train.py:118 (PR-INDUCED, trivial)
 - 15:04 patched train.py:118 — pylint 10.00/10 — commit def5678, /retest posted
 - 15:24 build #2453 SUCCESS — ci-pipeline-passed label observed
@@ -153,8 +153,8 @@ Pick the matching paragraph for the report's last section:
 > Revert before merge. One test was temp-skipped as a confirmed
 > unrelated flake.
 
-- **tests/st/pynative/test_swiglu.py::test_pynative_swiglu_x** at
-  `tests/st/pynative/test_swiglu.py:88`
+- **tests/torch/activation_checkpoint/test_activation_checkpoint.py::test_activation_checkpoint** at
+  `tests/torch/activation_checkpoint/test_activation_checkpoint.py:88`
   - failed in builds: #2450, #2451
   - triage: Q1=no, Q2=no, Q3=passed-on-master
   - applied in commit: abc1234
@@ -173,7 +173,7 @@ Pick the matching paragraph for the report's last section:
 
 ## What you (the PR author) need to do next
 
-Revert commit `abc1234` (the temp-skip on test_pynative_swiglu_x)
+Revert commit `abc1234` (the temp-skip on test_activation_checkpoint)
 before merge: `git revert abc1234`. Re-run `autofix 651` after revert
 — if the gate still passes, the unrelated flake has cleared on master;
 if it sticks, escalate to the maintainer for a master-side fix.

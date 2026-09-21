@@ -14,9 +14,8 @@
 # ============================================================================
 """Llama3 PP + FSDP + TP composite test (1F1B) vs full-model serial reference.
 
-Mirrors ``tests/mindspore/st/pipeline_parallel/_test_pp_composite.py`` driver logic
-(per-step loss parity against an in-process serial reference before ``optimizer.step()``)
-and ``examples/torch/llama3`` Llama3 PP stage layout:
+Checks per-step loss parity against an in-process serial reference before ``optimizer.step()``
+using the ``examples/torch/llama3`` Llama3 PP stage layout:
 
 * **Distributed** — 3-D mesh ``(pp=2, fsdp=2, tp=2)`` on 8 ranks, ``Schedule1F1B``,
   ``parallelize_llama3`` on ``mesh["tp"]``, and nested ``fully_shard`` on every trainable
@@ -35,7 +34,6 @@ from __future__ import annotations
 
 import os
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from typing import Iterable, List, Optional
 

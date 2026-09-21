@@ -20,7 +20,6 @@ import unittest
 import warnings
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.random import is_rng_supported_mesh, manual_seed
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER

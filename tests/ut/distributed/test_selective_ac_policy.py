@@ -25,7 +25,7 @@ import torch
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (  # noqa: E402  pylint: disable=wrong-import-position
+from hyper_parallel.core.activation_memory import (  # noqa: E402  pylint: disable=wrong-import-position
     CheckpointPolicy,
 )
 from hyper_parallel.distributed.activation_checkpoint import (  # noqa: E402  pylint: disable=wrong-import-position

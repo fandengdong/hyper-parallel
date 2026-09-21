@@ -14,29 +14,25 @@
 # ============================================================================
 """parallel_unbind test"""
 import unittest
-from unittest.mock import patch, MagicMock
-import numpy as np
+from unittest.mock import MagicMock, patch
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_unbind import UnbindDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
+    _DEVICE_MESH_MAP,
     init_device_mesh,
-    _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE, _build_layout
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.shard.ops.parallel_unbind import UnbindDistributedOp
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 op = UnbindDistributedOp("unbind")
 
 
 class TestParallelUnbind(unittest.TestCase):
     """Unit tests for UnbindDistributedOp."""
-    def setUp(self) -> None:
-        """Set up test fixtures before each test method.
 
-        Clears global caches to ensure test isolation and initializes
-        the platform for testing.
-        """
+    def setUp(self) -> None:
+        """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
@@ -53,124 +49,94 @@ class TestParallelUnbind(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
-        """Configure common mock-platform attributes used across tests.
-
-        Args:
-            mock_platform: The MagicMock object injected by @patch.
-            platform_type: Optional PlatformType to set on the mock.
-            world_size: Value returned by mock_platform.get_world_size().
-        """
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
+    @staticmethod
+    def _setup_mock_platform(mock_platform, world_size=8):
+        """Configure common mock-platform attributes used across tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
 
     def _make_2x4_mesh(self, mock_platform):
-        """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
+        """Set up mock and return a standard 2x4 (dp, mp) mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp"))
 
     def _make_2x2x2_mesh(self, mock_platform, mesh_dim_names=("dp", "tp", "mp")):
-        """Set up mock and return a standard 2x2x2 mesh via init_device_mesh."""
+        """Set up mock and return a standard 2x2x2 mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_dim0(self, mock_platform):
         """
-        Feature: Unbind on unsharded dimension 0
+        Feature: Unbind on unsharded dimension 0.
         Description: Unbind input (3, 8) on dim 0. Dim 0 is unsharded, Dim 1 is sharded.
         Expectation: Return tuple of layouts, size equals dim 0 size. Remaining dimension preserves sharding.
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Shard(1))
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
         input_shape = (3, 8)
 
         cache_values = [x_layout, input_shape, 0]
         output_layouts, _ = op.infer_layout(cache_values)
 
-        assert isinstance(output_layouts, tuple), (
-            f"Expected tuple of layouts, got {type(output_layouts)}"
-        )
-        assert len(output_layouts) == 3, (
-            f"Expected 3 output layouts, got {len(output_layouts)}"
-        )
+        self.assertIsInstance(output_layouts, tuple)
+        self.assertEqual(len(output_layouts), 3)
 
         expected_map = (0,)
         for layout in output_layouts:
-            assert layout.to_dict()["tensor_map"] == expected_map, (
-                f"Unbind dim0 failed. Expected {expected_map}, got {layout.to_dict()['tensor_map']}"
-            )
+            self.assertEqual(layout.to_dict()["tensor_map"], expected_map)
 
-        # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
-            f"get_expand_impl should return None, "
-            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
-        )
+        self.assertIsNone(op.get_expand_impl(None, (output_layouts, None), cache_values))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_dim1(self, mock_platform):
         """
-        Feature: Unbind on unsharded dimension 1
+        Feature: Unbind on unsharded dimension 1.
         Description: Unbind input (4, 4) on dim 1. Dim 0 is sharded, Dim 1 is unsharded.
         Expectation: Return tuple of layouts. Dim 0 preserves sharding.
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         input_shape = (4, 4)
 
         cache_values = [x_layout, input_shape, 1]
         output_layouts, _ = op.infer_layout(cache_values)
 
-        assert len(output_layouts) == 4, (
-            f"Expected 4 output layouts, got {len(output_layouts)}"
-        )
+        self.assertEqual(len(output_layouts), 4)
 
         expected_map = (1,)
         for layout in output_layouts:
-            assert layout.to_dict()["tensor_map"] == expected_map, (
-                f"Unbind dim1 failed. Expected {expected_map}, got {layout.to_dict()['tensor_map']}"
-            )
+            self.assertEqual(layout.to_dict()["tensor_map"], expected_map)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_inference_negative_dim(self, mock_platform):
         """
-        Feature: Unbind with negative dimension
-        Description: Unbind input (2, 4, 8) on dim -1 (last dim). Only last dim is unsharded.
+        Feature: Unbind with negative dimension.
+        Description: Unbind input (2, 4, 8) on dim -1. Only last dim is unsharded.
         Expectation: Correctly resolves negative index and infers layout.
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
-        x_placements = (Shard(0), Shard(1), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate()), 3)
         input_shape = (2, 4, 8)
 
         cache_values = [x_layout, input_shape, -1]
         output_layouts, _ = op.infer_layout(cache_values)
 
-        assert len(output_layouts) == 8, (
-            f"Expected 8 output layouts, got {len(output_layouts)}"
-        )
+        self.assertEqual(len(output_layouts), 8)
 
         expected_map = (2, 1)
         for layout in output_layouts:
-            assert layout.to_dict()["tensor_map"] == expected_map, (
-                f"Unbind negative dim failed. Expected {expected_map}, got {layout.to_dict()['tensor_map']}"
-            )
+            self.assertEqual(layout.to_dict()["tensor_map"], expected_map)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_sharded_dim_error(self, mock_platform):
         """
-        Feature: Unbind sharded dimension error
+        Feature: Unbind sharded dimension error.
         Description: Attempt to unbind a dimension that is currently sharded.
         Expectation: ValueError raised.
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         input_shape = (4, 4)
 
         cache_values = [x_layout, input_shape, 0]
@@ -180,13 +146,12 @@ class TestParallelUnbind(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_layout_dim_out_of_range(self, mock_platform):
         """
-        Feature: Unbind dimension out of range
+        Feature: Unbind dimension out of range.
         Description: Attempt to unbind a dimension index larger than rank.
         Expectation: ValueError raised.
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         input_shape = (4, 4)
 
         cache_values = [x_layout, input_shape, 2]
@@ -196,14 +161,12 @@ class TestParallelUnbind(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_preprocess(self, mock_platform):
         """
-        Feature: Unbind preprocess
-        Description: Verify preprocess correctly extracts layout, shape, and dim into cache_values
-            and converts DTensor inputs to local tensors.
+        Feature: Unbind preprocess.
+        Description: Verify preprocess extracts layout, shape, dim and local tensor.
         Expectation: local_args contains local tensors, cache_values has [layout, shape, dim].
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Shard(1))
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
         mock_tensor = MagicMock()
         mock_tensor.layout = x_layout
@@ -213,35 +176,22 @@ class TestParallelUnbind(unittest.TestCase):
 
         local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, 0), {})
 
-        assert local_args[0] is mock_local, (
-            f"Expected to_local result in local_args[0], got {local_args[0]}"
-        )
-        assert local_args[1] == 0, (
-            f"Expected dim=0 in local_args[1], got {local_args[1]}"
-        )
-        assert not local_kwargs, (
-            f"Expected empty local_kwargs, got {local_kwargs}"
-        )
-        assert cache_values[0] is x_layout, (
-            f"Expected layout in cache_values[0], got {cache_values[0]}"
-        )
-        assert cache_values[1] == (3, 8), (
-            f"Expected shape (3, 8) in cache_values[1], got {cache_values[1]}"
-        )
-        assert cache_values[2] == 0, (
-            f"Expected dim=0 in cache_values[2], got {cache_values[2]}"
-        )
+        self.assertIs(local_args[0], mock_local)
+        self.assertEqual(local_args[1], 0)
+        self.assertFalse(local_kwargs)
+        self.assertIs(cache_values[0], x_layout)
+        self.assertEqual(cache_values[1], (3, 8))
+        self.assertEqual(cache_values[2], 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_unbind_preprocess_default_dim(self, mock_platform):
         """
-        Feature: Unbind preprocess with default dim
+        Feature: Unbind preprocess with default dim.
         Description: Verify preprocess defaults dim to 0 when not provided.
         Expectation: cache_values[2] defaults to 0.
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Shard(1))
-        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
         mock_tensor = MagicMock()
         mock_tensor.layout = x_layout
@@ -251,9 +201,9 @@ class TestParallelUnbind(unittest.TestCase):
 
         local_args, local_kwargs, cache_values = op.preprocess((mock_tensor,), {})
 
-        assert cache_values[2] == 0, (
-            f"Expected default dim=0 in cache_values[2], got {cache_values[2]}"
-        )
+        self.assertIs(local_args[0], mock_local)
+        self.assertFalse(local_kwargs)
+        self.assertEqual(cache_values[2], 0)
 
 
 if __name__ == "__main__":

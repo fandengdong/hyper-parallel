@@ -225,7 +225,7 @@ class SavePlanner(abc.ABC):
     """Abstract base class for save planners."""
 
     @abc.abstractmethod
-    def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], **kwargs: Any) -> None:
         """
         Configure the planner with state dict.
 
@@ -296,7 +296,7 @@ class LoadPlanner(abc.ABC):
     """Abstract base class for load planners."""
 
     @abc.abstractmethod
-    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs: Any) -> None:
         """
         Configure the planner with state dict and metadata.
 
@@ -356,11 +356,16 @@ class LoadPlanner(abc.ABC):
 
         Returns a tensor slice/view where data should be written.
 
+        The view must be **detached**: the caller writes the loaded slice into it in place,
+        and an in-place write into a view of a leaf parameter that requires grad raises
+        rather than loading. Detaching is left to the implementation because only it knows
+        how the destination was reached.
+
         Args:
             read_item (ReadItem): Read item to acquire tensor for.
 
         Returns:
-            Any: Acquired tensor slice/view (tensor-like object).
+            Any: Acquired tensor slice/view (tensor-like object), detached from autograd.
         """
 
     @abc.abstractmethod

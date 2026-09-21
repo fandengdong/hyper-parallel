@@ -323,14 +323,12 @@ def load_case_plan_from_package(pkg_path: str) -> List[OpShardCase]:
     """Build lightweight planning stubs by AST-parsing ``case_*.py``.
 
     Parent-side suite launchers only need name / tags / mesh metadata to
-    bucket cases. Importing the real case modules would pull ``mindspore`` /
-    ``torch`` into the pytest parent (and into forked ``msrun``/``torchrun``
-    wrappers). Workers still call :func:`load_cases_from_package` and execute
-    the real ``fn``.
+    bucket cases. Importing the real case modules would pull ``torch`` into
+    the pytest parent (and into forked ``torchrun`` wrappers). Workers still
+    call :func:`load_cases_from_package` and execute the real ``fn``.
 
     Resolves the package directory on disk without importing
-    ``tests.mindspore`` / ``tests.torch`` (their ``__init__`` side effects are
-    heavy).
+    ``tests.torch`` (its ``__init__`` side effects are heavy).
     """
     from pathlib import Path  # pylint: disable=C0415
 

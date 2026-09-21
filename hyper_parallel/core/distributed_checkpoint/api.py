@@ -14,6 +14,7 @@
 # ============================================================================
 """Hyper Parallel Checkpoint API"""
 
+import itertools
 import os
 import threading
 import multiprocessing as mp
@@ -22,6 +23,8 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Union
+
+import torch.distributed as dist
 
 from hyper_parallel.core.distributed_checkpoint.async_persist import (
     AsyncSaveResponse,
@@ -40,6 +43,7 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     Metadata,
 )
 from hyper_parallel.core.distributed_checkpoint.planner import (
+    SavePlan,
     SavePlanner,
     LoadPlanner,
 )
@@ -51,16 +55,18 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
     StorageReader,
     StorageWriter,
 )
-from hyper_parallel.core.distributed_checkpoint.util import (
-    all_gather_object,
+from hyper_parallel.core.distributed_checkpoint.broadcast import (
     broadcast_groups_for_load,
-    dcp_timer_decorator,
     DEFAULT_BROADCAST_BATCH_BYTES,
+)
+from hyper_parallel.core.distributed_checkpoint.utils import (
+    all_gather_object,
+    dcp_timer_decorator,
     logger,
-    platform,
 )
 
-_async_save_count = 0
+# Names the gloo persist process of each async save, so several in one job stay apart.
+_async_save_counter = itertools.count()
 
 
 @dcp_timer_decorator
@@ -104,8 +110,8 @@ def _save_impl(
     planner = StandardSavePlanner() if planner is None else planner
 
     # Get rank and coordinator info
-    rank = platform.get_rank()
-    world_size = platform.get_world_size()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     is_coordinator = rank == 0
 
     # Configure planner
@@ -124,7 +130,12 @@ def _save_impl(
     )
 
     @dcp_timer_decorator
-    def generate_final_plan_and_metadata():
+    def generate_final_plan_and_metadata() -> tuple[SavePlan, Metadata]:
+        """Build this rank's final plan and the checkpoint metadata, caching both.
+
+        Returns:
+            tuple[SavePlan, Metadata]: The finalized local plan and the global metadata.
+        """
         # Build local plan
         local_plan = planner.build_local_plan()
         local_plan = storage_writer.optimize_local_plan(local_plan)
@@ -214,7 +225,7 @@ def save(
         no_dist=no_dist,
         use_collectives=use_collectives,
     )
-    platform.barrier()
+    dist.barrier()
     return metadata
 
 
@@ -251,7 +262,7 @@ def _create_persist_process(
     Raises:
         AssertionError: If gloo communication is requested without MASTER_ADDR or MASTER_PORT.
     """
-    world_size = platform.get_world_size()
+    world_size = dist.get_world_size()
     need_comm = use_collectives and not no_dist and world_size > 1
     if not need_comm or not use_gloo:
         use_storage_comm = need_comm and not use_gloo
@@ -273,7 +284,7 @@ def _create_persist_process(
         )
 
     logger.info("use Gloo communication for dcp async save.")
-    rank = platform.get_rank()
+    rank = dist.get_rank()
     master_addr = os.environ.get("MASTER_ADDR", None)
     master_port = os.environ.get("MASTER_PORT", None)
     if master_addr is None:
@@ -281,7 +292,7 @@ def _create_persist_process(
     if master_port is None:
         raise AssertionError("Async DCP needs MASTER_PORT to use prefix store")
     master_port = int(master_port)
-    global _async_save_count
+    save_index = next(_async_save_counter)
     proc = mp.Process(
         target=execute_async_persist_with_gloo,
         args=(
@@ -295,9 +306,8 @@ def _create_persist_process(
             master_addr,
             master_port,
         ),
-        name=f"AsyncCheckpointPersistGloo_{_async_save_count}",
+        name=f"AsyncCheckpointPersistGloo_{save_index}",
     )
-    _async_save_count += 1
     return proc
 
 
@@ -369,7 +379,8 @@ def async_save(
     )
 
     # After the async save is completed, the user callback will be executed.
-    def async_callback():
+    def async_callback() -> None:
+        """Run the user callback once the save has been persisted, if one was given."""
         if callback is not None:
             callback()
 
@@ -494,8 +505,8 @@ def load(
     planner = StandardLoadPlanner() if planner is None else planner
 
     # Get rank and coordinator info
-    rank = platform.get_rank()
-    world_size = platform.get_world_size()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     is_coordinator = rank == 0
 
     # Open the checkpoint. One saved without collectives has no shared metadata to plan

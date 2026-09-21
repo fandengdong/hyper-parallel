@@ -40,6 +40,8 @@ Partitioning:
 - Backward: reduce_scatter gradients
 """
 
+__all__ = ["FSDPPass"]
+
 import logging
 from typing import Any, Dict, List, Optional, Set
 
@@ -48,9 +50,9 @@ from torch import fx, nn
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.ops import _c10d_functional
 
-from ...parallel_config import PassConfig
+from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...sharding_config import PassPlan
+from ...pass_plan import PassPlan
 
 _LOG = logging.getLogger(__name__)
 
@@ -424,7 +426,7 @@ class FSDPPass(GraphPass):
 
         return graph_module
 
-    def _insert_reduce_scatter_for_grads(
+    def _insert_reduce_scatter_for_grads(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
         sharded_param_indices: Set[int],
@@ -550,6 +552,3 @@ class FSDPPass(GraphPass):
         """Placeholder for a future reshard pass (release gathered params
         after forward to cut peak memory). Currently a no-op."""
         return graph_module
-
-
-__all__ = ["FSDPPass"]

@@ -16,7 +16,7 @@
 
 import pytest
 
-from hyper_parallel.platform.platform import _build_p2p_edge_rank_lists
+from hyper_parallel.core.pipeline_parallel._p2p import _build_p2p_edge_rank_lists
 
 
 def test_build_linear_p2p_edges_preserves_pipeline_adjacency() -> None:

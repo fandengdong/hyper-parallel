@@ -24,6 +24,7 @@ Core Features:
 
 Usage Example:
     from hyper_parallel.compile import (
+        GraphCompiler,
         GraphTrainer,
         PassConfig,
         PassPlan,
@@ -35,37 +36,45 @@ Usage Example:
     # Configure parallelism
     pass_config = PassConfig(enable_overlap=True)
 
-    # Configure sharding plan
+    # Build pass plan
     pass_plan = PassPlan()
     pass_plan.fsdp_wrap_pattern("layers.*")
 
-    # Create trainer
-    trainer = GraphTrainer(model, train_fn, pass_config, pass_plan)
+    # Compile + forward_backward only (no optimizer / training loop):
+    compiler = GraphCompiler(model, train_fn, pass_config, pass_plan)
+    compiler.compile(input_batch, label_batch)
+    loss = compiler.forward_backward(input_batch, label_batch)  # grads -> param.grad
 
-    # Training -- train compiles on the first batch, moves batches onto the
-    # trainer's device, and drives the whole train/optimize loop.
+    # Or drive the whole train/optimize loop -- the trainer composes a
+    # GraphCompiler, compiles on the first batch, moves batches onto its
+    # device, and owns the optimizer:
+    trainer = GraphTrainer(model, train_fn, pass_config, pass_plan)
     trainer.train(dataloader, max_steps=100, log_interval=10)
 """
 
-from .sharding_config import (
+from .compiler import GraphCompiler
+
+from .pass_plan import (
     PassPlan,
     FSDPModuleConfig,
-    create_sharding_plan_from_yaml,
-    create_simple_sharding_plan,
+    create_pass_plan_from_yaml,
+    create_simple_pass_plan,
 )
 
-from .parallel_config import PassConfig
+from .pass_config import PassConfig
 
 from .trainer import GraphTrainer
 
 __all__ = [
-    # Sharding
+    # Pass plan
     "PassPlan",
     "FSDPModuleConfig",
-    "create_sharding_plan_from_yaml",
-    "create_simple_sharding_plan",
+    "create_pass_plan_from_yaml",
+    "create_simple_pass_plan",
     # Config
     "PassConfig",
+    # Compiler (compile + forward_backward only)
+    "GraphCompiler",
     # Trainer
     "GraphTrainer",
 ]

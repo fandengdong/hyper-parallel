@@ -14,9 +14,8 @@
 # ============================================================================
 """Cross-platform shared utilities exclusively for shard ops ST.
 
-Scope discipline: this package serves only ``tests/torch/shard/ops/`` and
-``tests/mindspore/st/shard/ops/``. It must not import ``torch`` or
-``mindspore`` directly — platform-specific code lives under
+Scope discipline: this package serves only ``tests/torch/shard/ops/``. It
+must not import ``torch`` directly — platform-specific code lives under
 ``tests/<plat>/shard/ops/framework/`` and registers itself with the shared
 backend registry at import time.
 """

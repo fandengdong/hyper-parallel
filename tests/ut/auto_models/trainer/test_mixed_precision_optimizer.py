@@ -23,7 +23,6 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # Snapshot logging.Logger attributes before importing optimizer modules, whose
 # imports patch rank-aware helpers onto logging.Logger.
@@ -339,13 +338,13 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertFalse(torch.equal(model.low.main_param, model.low.float()))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
         return_value=1,
     )
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_rank",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
         return_value=0,
     )
     def test_dcp_round_trip_restores_explicit_fp32_main_param(
@@ -386,13 +385,13 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertTrue(torch.equal(restored_main_param, expected))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
         return_value=1,
     )
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_rank",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
         return_value=0,
     )
     def test_dcp_ordinary_optimizer_state_reloads_main_params(
@@ -445,13 +444,13 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         )
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
         return_value=1,
     )
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_rank",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
         return_value=0,
     )
     def test_dcp_partial_main_param_state_fails(
@@ -587,13 +586,13 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(state_dict["param_groups"][0]["step"], 1)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
         return_value=1,
     )
     @patch(
-        "hyper_parallel.core.distributed_checkpoint.api.platform.get_rank",
+        "hyper_parallel.core.distributed_checkpoint.api.dist.get_rank",
         return_value=0,
     )
     def test_adam_moments_muon_momentum_and_main_params_round_trip(

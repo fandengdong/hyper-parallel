@@ -38,7 +38,7 @@ For every FAILURE build, run the 3-question triage on each failure
 entry, bucket each as PR-INDUCED or UNRELATED, then route the
 **build as a whole** through this tree:
 
-```
+```text
 (a) Any failure PR-INDUCED?
     → Yes: fix the production code per
       [root-cause-fix.md](root-cause-fix.md).
@@ -102,7 +102,7 @@ touched.
 
 Grep the failing test file and the modules it imports for symbols
 defined in the PR diff. A failing `test_swiglu_*` for a PR that only
-touches `tests/st/networks/llm_parallel_feature/` shows no overlap —
+touches `tests/torch/llama3_examples/` shows no overlap —
 that's a real "no". A failing `test_with_stream.py` for a PR that
 adds a new ops entry in `mindspore/ops/api_def/` may overlap through
 the generated dispatch table — that's a "maybe yes".
@@ -152,7 +152,7 @@ last two entries is empty AND all failures are UNRELATED.
 When the agent detects a sticky upstream flake, post one comment per
 sticky cluster (deduplicate against prior posts). Use this template:
 
-```
+```text
 @<maintainer-or-blank> gate-doctor reports a sticky upstream flake
 on this PR:
 

@@ -268,40 +268,55 @@ class GroupedExperts(nn.Module):
         self._group_list = None
         self._tokens_per_expert_gmm = None
 
+        self._initialize_projection_layout(
+            source_gate_up, source_down, source_is_transposed, gated_linear_unit
+        )
+        self._initialize_biases(module)
+
+        self.has_gate = gated_linear_unit
+        self.has_bias = self.add_bias
+        self.is_concatenated = bool(getattr(module, "is_concatenated", True))
+        if self.has_gate and not self.is_concatenated:
+            raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
+        self.is_transposed = True
+        self.train(module.training)
+
+    def _initialize_projection_layout(
+        self, source_gate_up, source_down, source_is_transposed, gated_linear_unit,
+    ) -> None:
+        """Resolve expert weight layouts and initialize their target parameters."""
+        hidden_size = self.hidden_size
+        intermediate_size = self.intermediate_size
         fc1_output_size = intermediate_size
         if gated_linear_unit:
             fc1_output_size *= 2
-        fc1_output_size_per_partition = fc1_output_size
-
-        fc2_input_size = intermediate_size
-        fc2_input_size_per_partition = fc2_input_size
 
         npu_gate_up_shape = (
             self.num_local_experts,
             hidden_size,
-            fc1_output_size_per_partition,
+            fc1_output_size,
         )
         npu_down_shape = (
             self.num_local_experts,
-            fc2_input_size_per_partition,
+            intermediate_size,
             hidden_size,
         )
         transformers_gate_up_shape = (
             self.num_local_experts,
-            fc1_output_size_per_partition,
+            fc1_output_size,
             hidden_size,
         )
         transformers_down_shape = (
             self.num_local_experts,
             hidden_size,
-            fc2_input_size_per_partition,
+            intermediate_size,
         )
         experts_2d_gate_up_shape = (
             self.num_local_experts * hidden_size,
-            fc1_output_size_per_partition,
+            fc1_output_size,
         )
         experts_2d_down_shape = (
-            self.num_local_experts * fc2_input_size_per_partition,
+            self.num_local_experts * intermediate_size,
             hidden_size,
         )
         source_shapes = (tuple(source_gate_up.shape), tuple(source_down.shape))
@@ -315,15 +330,6 @@ class GroupedExperts(nn.Module):
         self._initialize_weights(
             source_gate_up, source_down, npu_gate_up_shape, npu_down_shape, gated_linear_unit
         )
-        self._initialize_biases(module)
-
-        self.has_gate = gated_linear_unit
-        self.has_bias = self.add_bias
-        self.is_concatenated = bool(getattr(module, "is_concatenated", True))
-        if self.has_gate and not self.is_concatenated:
-            raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
-        self.is_transposed = True
-        self.train(module.training)
 
     def reset_parameters(self) -> None:
         """Initialize grouped weights with the source model's configured standard deviation."""
@@ -383,11 +389,11 @@ class GroupedExperts(nn.Module):
 
         # up
         if permuted.nelement() != 0:
-            fc1_output = grouped_matmul(
+            fc1_output = grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b1 = self.bias1.view(self.num_local_experts, 1, -1)
+                b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
         else:
             gate_up_proj_2d = gate_up_proj.view(self.hidden_size, -1)
@@ -406,11 +412,11 @@ class GroupedExperts(nn.Module):
             down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
 
         if fc1_output.nelement() != 0:
-            fc2_output = grouped_matmul(
+            fc2_output = grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b2 = self.bias2.view(self.num_local_experts, 1, -1)
+                b2 = self.bias2.view(self.num_local_experts, -1)
                 fc2_output = fc2_output + torch.repeat_interleave(
                     b2, self._tokens_per_expert_gmm, dim=0,
                 )
@@ -453,7 +459,7 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(
+        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
             hidden_states_flat,
             top_k_index,
         )
@@ -470,7 +476,7 @@ class GroupedExperts(nn.Module):
             tokens_per_expert,
             permuted_probs,
         )
-        output = moe_token_unpermute(
+        output = moe_token_unpermute(  # pylint: disable=not-callable
             expert_outputs,
             sorted_indices,
             top_k_weights,

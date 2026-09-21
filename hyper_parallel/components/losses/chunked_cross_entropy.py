@@ -27,6 +27,12 @@ caller and reuses the vocab-parallel kernel in
 
 from __future__ import annotations
 
+__all__ = [
+    "ChunkedCausalLMLoss",
+    "ChunkedCausalLMOutput",
+    "chunked_cross_entropy",
+]
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -45,9 +51,7 @@ from hyper_parallel.components.losses._vocab_parallel_cross_entropy import (
     _resolve_class_mesh_dim,  # pylint: disable=protected-access
     vocab_parallel_cross_entropy_local,
 )
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
+from hyper_parallel.core.dtensor._utils import differentiable_all_reduce
 
 # Model attribute holding the mesh that shards the bound LM head vocabulary.
 _CHUNK_LOSS_TP_MESH_ATTR = "_hp_chunk_loss_tp_mesh"
@@ -153,7 +157,7 @@ def _chunk_grad_and_value(
     # gradient is a partial contribution. This loss keeps the Trainer's
     # non-loss-parallel contract of an LM head whose loss is identical on every
     # TP rank, which requires the full sum of those contributions.
-    grad_hidden = platform.differentiable_all_reduce(
+    grad_hidden = differentiable_all_reduce(
         grad_hidden,
         op="sum",
         group=context.group,

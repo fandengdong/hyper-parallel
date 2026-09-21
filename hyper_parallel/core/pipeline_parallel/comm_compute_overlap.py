@@ -49,23 +49,17 @@ Typical integration::
         bwd_fn=lambda: bwd_stage.backward_one_chunk(mb, loss=loss),
     )
 """
-import queue
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
+from hyper_parallel.core.pipeline_parallel._sync_hook import _SyncHookFunction
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator
-
-platform = get_platform()
-
-_WORKER_STOP = object()
 
 
 @dataclass
 class _BwdTask:
-    """One backward task submitted to the persistent overlap worker."""
+    """One backward task running in an overlap window."""
 
     bwd_fn: Callable[[], None]
     done: threading.Event
@@ -78,9 +72,8 @@ class CommComputeOverlap:
     Manages a :class:`HookCoordinator` and provides helpers to insert the
     four synchronization hooks (``A``, ``B``, ``C``, ``D``) around MoE
     dispatch / combine phases and to run forward + backward concurrently
-    with deterministic comm-first kernel launch ordering.  MindSpore reuses
-    one persistent backward worker to preserve its thread-bound autograd
-    state, while PyTorch uses an independent thread for each overlap window.
+    with deterministic comm-first kernel launch ordering. Each overlap window
+    runs backward in its own thread.
 
     Example:
         >>> overlap = CommComputeOverlap()
@@ -90,15 +83,8 @@ class CommComputeOverlap:
     """
 
     def __init__(self) -> None:
-        """Initialize backend-specific backward thread state."""
+        """Initialize the forward/backward coordinator."""
         self._coordinator = HookCoordinator()
-        self._use_persistent_worker = platform.platform_type == PlatformType.MINDSPORE
-        self._worker_queue: Optional[queue.Queue] = (
-            queue.Queue() if self._use_persistent_worker else None
-        )
-        self._worker_thread: Optional[threading.Thread] = None
-        self._worker_lock = threading.Lock()
-        self._run_lock = threading.Lock()
 
     @property
     def coordinator(self) -> HookCoordinator:
@@ -127,12 +113,12 @@ class CommComputeOverlap:
 
         def _wrapped(*args, **kwargs):
             first, rest = args[0], args[1:]
-            first = platform.differentiable_sync_hook(first, "A", coordinator)
+            first = _SyncHookFunction.apply(first, "A", coordinator)
             result = dispatch_fn(first, *rest, **kwargs)
             if isinstance(result, tuple):
-                hooked = platform.differentiable_sync_hook(result[0], "B", coordinator)
+                hooked = _SyncHookFunction.apply(result[0], "B", coordinator)
                 return (hooked,) + result[1:]
-            return platform.differentiable_sync_hook(result, "B", coordinator)
+            return _SyncHookFunction.apply(result, "B", coordinator)
 
         return _wrapped
 
@@ -162,12 +148,12 @@ class CommComputeOverlap:
 
         def _wrapped(*args, **kwargs):
             first, rest = args[0], args[1:]
-            first = platform.differentiable_sync_hook(first, "C", coordinator)
+            first = _SyncHookFunction.apply(first, "C", coordinator)
             result = combine_fn(first, *rest, **kwargs)
             if isinstance(result, tuple):
-                hooked = platform.differentiable_sync_hook(result[0], d_hook, coordinator)
+                hooked = _SyncHookFunction.apply(result[0], d_hook, coordinator)
                 return (hooked,) + result[1:]
-            return platform.differentiable_sync_hook(result, d_hook, coordinator)
+            return _SyncHookFunction.apply(result, d_hook, coordinator)
 
         return _wrapped
 
@@ -175,42 +161,11 @@ class CommComputeOverlap:
     # Execution
     # ------------------------------------------------------------------
 
-    def _ensure_worker(self) -> None:
-        """Start the persistent backward worker if it is not already alive."""
-        with self._worker_lock:
-            if self._worker_thread is not None and self._worker_thread.is_alive():
-                return
-            self._worker_thread = threading.Thread(
-                target=self._worker_loop,
-                name="hp-overlap-bwd-worker",
-                daemon=True,
-            )
-            self._worker_thread.start()
-
-    def _submit_bwd_task(self, task: _BwdTask) -> None:
-        """Submit one backward task to the persistent worker."""
-        self._ensure_worker()
-        self._worker_queue.put(task)
-
-    def _start_bwd_task(self, task: _BwdTask) -> Optional[threading.Thread]:
-        """Start a backward task using the backend-appropriate thread model."""
-        if self._use_persistent_worker:
-            self._submit_bwd_task(task)
-            return None
+    def _start_bwd_task(self, task: _BwdTask) -> threading.Thread:
+        """Start the backward thread for one overlap window."""
         thread = threading.Thread(target=self._run_bwd_task, args=(task,), daemon=True)
         thread.start()
         return thread
-
-    def _worker_loop(self) -> None:
-        """Run submitted backward tasks serially on the persistent worker."""
-        while True:
-            task = self._worker_queue.get()
-            try:
-                if task is _WORKER_STOP:
-                    return
-                self._run_bwd_task(task)
-            finally:
-                self._worker_queue.task_done()
 
     def _run_bwd_task(self, task: _BwdTask) -> None:
         """Execute one backward task and preserve the existing cleanup contract."""
@@ -236,29 +191,12 @@ class CommComputeOverlap:
         finally:
             task.done.set()
 
-    def close(self) -> None:
-        """Stop the persistent backward worker after its current task finishes."""
-        if not self._use_persistent_worker:
-            return
-        with self._worker_lock:
-            thread = self._worker_thread
-            if thread is None:
-                return
-            if not thread.is_alive():
-                self._worker_thread = None
-                return
-            self._worker_queue.put(_WORKER_STOP)
-        thread.join()
-        with self._worker_lock:
-            if self._worker_thread is thread:
-                self._worker_thread = None
-
     def _run(
         self,
         fwd_fn: Callable[[], None],
         bwd_fn: Callable[[], None],
     ) -> None:
-        """Run one overlap window using the selected backward thread model."""
+        """Run one overlap window and wait for both threads to finish."""
         self._coordinator.enable()
         done = threading.Event()
         exc_box: list[Exception] = []
@@ -303,10 +241,6 @@ class CommComputeOverlap:
     ) -> None:
         """Run ``fwd_fn`` and ``bwd_fn`` with comm/compute overlap.
 
-        MindSpore serializes overlap windows on its persistent backward
-        worker. PyTorch keeps the original per-window thread path and does not
-        add worker-queue coordination.
-
         Args:
             fwd_fn: Callable that executes the forward pass.
             bwd_fn: Callable that executes the backward pass.  If it needs
@@ -317,8 +251,4 @@ class CommComputeOverlap:
             RuntimeError: If the backward thread raises an exception, it
                 is re-raised on the main thread after the task finishes.
         """
-        if self._use_persistent_worker:
-            with self._run_lock:
-                self._run(fwd_fn, bwd_fn)
-            return
         self._run(fwd_fn, bwd_fn)

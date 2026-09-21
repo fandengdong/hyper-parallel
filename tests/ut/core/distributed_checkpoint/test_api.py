@@ -24,10 +24,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-import hyper_parallel.platform.platform as _platform_mod
 
-_platform_mod.platform = None
 
 import hyper_parallel.core.distributed_checkpoint.api as api_mod
 import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mod
@@ -39,7 +36,7 @@ from hyper_parallel.core.distributed_checkpoint.api import (
     load,
     save,
 )
-from hyper_parallel.core.distributed_checkpoint.util import all_gather_object
+from hyper_parallel.core.distributed_checkpoint.utils import all_gather_object
 from hyper_parallel.core.distributed_checkpoint.storage import METADATA_FILE_NAME
 
 
@@ -47,13 +44,12 @@ class TestApi(unittest.TestCase):
     """Tests for distributed checkpoint save/load API."""
 
     def setUp(self) -> None:
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
+        """Rebuild the api and planner modules so each case starts from a clean plan cache."""
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
         planner_mod.StandardSavePlanner.cached_save_result.clear()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     def test_save_requires_checkpoint_id_or_writer(self, mock_barrier):
         """
         Feature: save input validation.
@@ -65,7 +61,7 @@ class TestApi(unittest.TestCase):
         self.assertIn("checkpoint_id", str(ctx.exception))
         mock_barrier.assert_not_called()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
     def test_load_requires_checkpoint_id_or_reader(self, mock_rank):
         """
         Feature: load input validation.
@@ -77,9 +73,9 @@ class TestApi(unittest.TestCase):
         self.assertIn("checkpoint_id", str(ctx.exception))
         mock_rank.assert_not_called()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     def test_save_load_roundtrip_no_dist(self, mock_barrier, mock_rank, mock_world_size):
         """
         Feature: save and load round-trip in single-process mode.
@@ -101,9 +97,9 @@ class TestApi(unittest.TestCase):
         mock_rank.assert_called()
         mock_world_size.assert_called()
 
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size", return_value=1)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0)
-    @patch("hyper_parallel.core.distributed_checkpoint.api.platform.barrier")
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size", return_value=1)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0)
+    @patch("hyper_parallel.core.distributed_checkpoint.api.dist.barrier")
     def test_save_returns_metadata_with_tensor_entries(self, mock_barrier, mock_rank, mock_world_size):
         """
         Feature: save return value.
@@ -126,7 +122,7 @@ class TestApi(unittest.TestCase):
         result = all_gather_object({"plan": 1}, world_size=1, use_collectives=False)
         self.assertEqual(result, [{"plan": 1}])
 
-    @patch("hyper_parallel.core.distributed_checkpoint.util.platform.all_gather_object")
+    @patch("hyper_parallel.core.distributed_checkpoint.utils.dist.all_gather_object")
     def test_gather_from_all_ranks_uses_collectives(self, mock_all_gather):
         """
         Feature: all_gather_object collective path.
@@ -135,7 +131,8 @@ class TestApi(unittest.TestCase):
         """
         expected = [{"a": 1}, {"a": 2}]
 
-        def gather_side_effect(out, local_obj):
+        def gather_side_effect(out: list, local_obj: Any) -> None:
+            """Fill the output list as a real all-gather would, ignoring the local object."""
             del local_obj
             out[0] = expected[0]
             out[1] = expected[1]
@@ -159,8 +156,6 @@ class TestCreatePersistProcess(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the api module so the recorded targets are the objects it holds."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
 
@@ -175,9 +170,9 @@ class TestCreatePersistProcess(unittest.TestCase):
         """Build the persist process with a recording ``mp.Process`` and return that recorder."""
         recorder = Mock(name="Process")
         with patch("hyper_parallel.core.distributed_checkpoint.api.mp.Process", recorder), \
-                patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_world_size",
+                patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_world_size",
                       return_value=world_size), \
-                patch("hyper_parallel.core.distributed_checkpoint.api.platform.get_rank", return_value=0), \
+                patch("hyper_parallel.core.distributed_checkpoint.api.dist.get_rank", return_value=0), \
                 patch.dict(os.environ, env if env is not None else TestCreatePersistProcess._MASTER_ENV,
                            clear=True):
             api_mod._create_persist_process(
@@ -284,8 +279,6 @@ class TestSaveImplStorageComm(unittest.TestCase):
 
     def setUp(self) -> None:
         """Rebuild the api module before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
         importlib.reload(planner_mod)
         importlib.reload(api_mod)
 

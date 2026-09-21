@@ -16,7 +16,7 @@
 
 import unittest
 import warnings
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from hyper_parallel.core.pipeline_parallel import pipeline_swap
 
@@ -57,11 +57,9 @@ class TestUnregisterLayerSwapHooks(unittest.TestCase):
             stages[1].submodule: [("shared", second_module)],
         }
 
-        with patch.object(
-                pipeline_swap.platform,
-                "get_cells_and_names",
-                side_effect=lambda root: modules_by_root[root]), \
-                warnings.catch_warnings(record=True) as caught:
+        for stage in stages:
+            stage.submodule.named_modules.return_value = modules_by_root[stage.submodule]
+        with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             removed_count = pipeline_swap.unregister_layer_swap_hooks(stages)
 
@@ -78,16 +76,13 @@ class TestUnregisterLayerSwapHooks(unittest.TestCase):
         module, _ = self._module_with_hooks()
         stage = Mock(submodule=Mock())
 
-        with patch.object(
-                pipeline_swap.platform,
-                "get_cells_and_names",
-                return_value=[("", module)]):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                pipeline_swap.unregister_layer_swap_hooks([stage])
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                removed_count = pipeline_swap.unregister_layer_swap_hooks([stage])
+        stage.submodule.named_modules.return_value = [("", module)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pipeline_swap.unregister_layer_swap_hooks([stage])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            removed_count = pipeline_swap.unregister_layer_swap_hooks([stage])
 
         self.assertEqual(removed_count, 0)
         self.assertEqual(caught, [])

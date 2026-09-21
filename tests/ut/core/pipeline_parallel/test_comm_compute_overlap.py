@@ -12,90 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for CommComputeOverlap's backend-specific thread lifecycle."""
+"""Unit tests for CommComputeOverlap's Torch thread lifecycle."""
 import threading
 from unittest.mock import patch
 
 import pytest
 
-from hyper_parallel.core.pipeline_parallel import comm_compute_overlap
 from hyper_parallel.core.pipeline_parallel.comm_compute_overlap import CommComputeOverlap
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookRole
-from hyper_parallel.platform.platform import PlatformType
 
 
-def test_reuses_backward_worker_thread():
-    """Multiple overlap windows should reuse one persistent BWD worker thread."""
-    with patch.object(comm_compute_overlap.platform, "platform_type", PlatformType.MINDSPORE):
-        overlap = CommComputeOverlap()
-        worker_ids = []
-        main_id = threading.get_ident()
-        try:
-            for _ in range(3):
-                overlap.run(lambda: None, lambda: worker_ids.append(threading.get_ident()))
+def test_backward_exception_propagates_and_next_window_runs():
+    """A BWD exception is re-raised on the caller and a later window can still run."""
+    overlap = CommComputeOverlap()
+    worker_ids = []
 
-            assert len(set(worker_ids)) == 1
-            assert worker_ids[0] != main_id
-        finally:
-            overlap.close()
+    def _raising_bwd():
+        worker_ids.append(threading.get_ident())
+        raise ValueError("bwd failed")
 
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            overlap.run(lambda: None, _raising_bwd)
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
-def test_backward_exception_propagates_and_worker_survives():
-    """A BWD exception is re-raised on the caller while the worker stays reusable."""
-    with patch.object(comm_compute_overlap.platform, "platform_type", PlatformType.MINDSPORE):
-        overlap = CommComputeOverlap()
-        worker_ids = []
-
-        def _raising_bwd():
-            worker_ids.append(threading.get_ident())
-            raise ValueError("bwd failed")
-
-        try:
-            with pytest.raises(RuntimeError) as exc_info:
-                overlap.run(lambda: None, _raising_bwd)
-            assert isinstance(exc_info.value.__cause__, ValueError)
-
-            overlap.run(lambda: None, lambda: worker_ids.append(threading.get_ident()))
-            assert len(set(worker_ids)) == 1
-        finally:
-            overlap.close()
+        overlap.run(lambda: None, lambda: worker_ids.append(threading.get_ident()))
+        assert len(worker_ids) == 2
+    finally:
+        assert not overlap.coordinator.is_enabled()
 
 
 def test_forward_exception_unblocks_waiting_backward_worker():
-    """A FWD exception should abort rendezvous so the persistent BWD worker drains."""
-    with patch.object(comm_compute_overlap.platform, "platform_type", PlatformType.MINDSPORE):
-        overlap = CommComputeOverlap()
-        bwd_started = threading.Event()
-        bwd_finished = threading.Event()
+    """A FWD exception should abort rendezvous so the BWD thread drains."""
+    overlap = CommComputeOverlap()
+    bwd_started = threading.Event()
+    bwd_finished = threading.Event()
 
-        def _blocked_bwd():
-            bwd_started.set()
-            try:
-                overlap.coordinator.rendezvous(HookRole.COMPUTE)
-            finally:
-                bwd_finished.set()
-
-        def _raising_fwd():
-            if not bwd_started.wait(timeout=5.0):
-                raise AssertionError("backward worker did not start")
-            raise ValueError("fwd failed")
-
+    def _blocked_bwd():
+        bwd_started.set()
         try:
-            with pytest.raises(ValueError):
-                overlap.run(_raising_fwd, _blocked_bwd)
-            assert bwd_finished.is_set()
+            overlap.coordinator.rendezvous(HookRole.COMPUTE)
         finally:
-            overlap.close()
+            bwd_finished.set()
+
+    def _raising_fwd():
+        if not bwd_started.wait(timeout=5.0):
+            raise AssertionError("backward worker did not start")
+        raise ValueError("fwd failed")
+
+    try:
+        with pytest.raises(ValueError):
+            overlap.run(_raising_fwd, _blocked_bwd)
+        assert bwd_finished.is_set()
+    finally:
+        assert not overlap.coordinator.is_enabled()
 
 
 def test_torch_uses_one_backward_thread_per_overlap_window():
-    """PyTorch should not keep the MindSpore backward worker machinery alive."""
-    with patch.object(comm_compute_overlap.platform, "platform_type", PlatformType.PYTORCH):
-        with patch.object(threading, "Thread", wraps=threading.Thread) as thread_cls:
-            overlap = CommComputeOverlap()
-            for _ in range(3):
-                overlap.run(lambda: None, lambda: None)
+    """Each Torch overlap window creates and joins one backward thread."""
+    with patch.object(threading, "Thread", wraps=threading.Thread) as thread_cls:
+        overlap = CommComputeOverlap()
+        for _ in range(3):
+            overlap.run(lambda: None, lambda: None)
 
-            assert thread_cls.call_count == 3
-            assert overlap._worker_thread is None
-            overlap.close()
+        assert thread_cls.call_count == 3
+        assert not overlap.coordinator.is_enabled()

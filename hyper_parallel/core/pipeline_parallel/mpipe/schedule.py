@@ -21,22 +21,51 @@ registry, so the core ``scheduler`` module carries no MPipe-specific code.
 import logging
 from typing import Callable, Optional, TYPE_CHECKING
 
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.core.pipeline_parallel.scheduler import (
-    MetaStep,
-    MetaStepType,
-    ScheduleInterleaved1F1B,
-)
+from torch.nn import Module
+
+from hyper_parallel.core.pipeline_parallel.mpipe.executor import MPipeTransposeExecutor
+
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B
 from hyper_parallel.core.pipeline_parallel.mpipe.sampler import mpipe_owned_micros
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
+from hyper_parallel.core.pipeline_parallel.utils import MetaStep, MetaStepType
 
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 
-platform = get_platform()
-Module = platform.Module
 logger = logging.getLogger(__name__)
+
+# (data, features, graph input) step types of the transpose-prefix transfers.
+_PREFIX_SEND_TYPES = (MetaStepType.DATA_SEND, MpipeStepType.MPIPE_FWD_SEND, MpipeStepType.MPIPE_GRAPH_SEND)
+_PREFIX_RECV_TYPES = (MetaStepType.DATA_RECV, MpipeStepType.MPIPE_FWD_RECV, MpipeStepType.MPIPE_GRAPH_RECV)
+
+
+def _prefix_owned_micros(rank, num_transpose_micro_batches, micro_batch_num, overflow_mode):
+    """Micros ``rank`` transposes in its prefix (under ``"min"`` only ``rank``
+    itself; rank 0's overflow micros are loaded inline in its body order)."""
+    nt = num_transpose_micro_batches
+    if rank >= nt:
+        return []
+    if overflow_mode == "min":
+        return [rank]
+    return [m for m in range(micro_batch_num) if m % nt == rank]
+
+
+def _prefix_transfer_steps(micros, step_types, is_dataload_only, ship_graph):
+    """Type-major transfer block: all data, then all features, then all graph inputs.
+
+    The sending ranks and rank 0 both build their block here, so the send and
+    receive orders match; otherwise the meta recv drifts and decodes garbage
+    shapes. Dataload-only ships the data alone; ``ship_graph`` adds the input
+    ship-back for the centralized stage-0 backward.
+    """
+    data_type, fwd_type, graph_type = step_types
+    steps = [MetaStep(m, data_type, -1) for m in micros]
+    if not is_dataload_only:
+        steps += [MetaStep(m, fwd_type, -1) for m in micros]
+        if ship_graph:
+            steps += [MetaStep(m, graph_type, -1) for m in micros]
+    return steps
 
 
 class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
@@ -96,8 +125,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
 
     Note:
         This class builds the schedule ordering and registers the ``MPIPE_*``
-        execution handlers; the handlers themselves live in the platform
-        executors (see :class:`MPipeTransposeExecutorBase`).
+        execution handlers implemented by :class:`MPipeTransposeExecutor`.
     """
 
     # Each rank runs one transposed preprocess forward, so every rank needs its
@@ -147,7 +175,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
                 owner runs the tower backward in its cooldown (instead of the
                 centralized stage-0 backward); tower grads are SUM all-reduced
                 across the pp replicas. Ignored (stage-0 backward kept) for a frozen / param-free
-                preprocess and on MindSpore.
+                preprocess.
             overflow_mode (str): How to distribute the ``M > NT`` overflow micros.
                 ``"full"`` (default) — round-robin: each owner takes ``M/NT``
                 micros, ViT phase balanced. ``"min"`` — rank 0 absorbs the
@@ -179,19 +207,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         # Trainable preprocess -> broadcast + stage-0 backward; frozen or
         # param-free -> ship the output only (no broadcast, no recompute).
         self._has_trainable_preprocess = self._module_has_trainable_params(preprocess_module)
-        # Owner-does-backward needs a trainable preprocess AND torch (MindSpore's
-        # grad_fn is body-scoped); otherwise fall back to the stage-0 backward.
-        self._owner_backward = (
-            bool(owner_backward)
-            and self._has_trainable_preprocess
-            and platform.platform_type == PlatformType.PYTORCH
-        )
-        if owner_backward and self._has_trainable_preprocess and not self._owner_backward:
-            logger.warning(
-                "[mpipe] pp_mpipe_owner_backward requested but unsupported on "
-                "platform %s; falling back to the stage-0 backward.",
-                platform.platform_type,
-            )
+        self._owner_backward = bool(owner_backward) and self._has_trainable_preprocess
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
@@ -209,13 +225,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         """Whether ``module`` has any trainable (grad-requiring) parameter."""
         if module is None:
             return False
-        if platform.platform_type == PlatformType.PYTORCH:
-            return any(p.requires_grad for p in module.parameters())
-        if platform.platform_type == PlatformType.MINDSPORE:
-            return any(p.requires_grad for p in module.get_parameters())
-        raise NotImplementedError(
-            f"MPipe Transpose is not implemented for platform {platform.platform_type}."
-        )
+        return any(p.requires_grad for p in module.parameters())
 
     @property
     def preprocess_module(self) -> "Optional[Module]":
@@ -260,21 +270,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         return micro % nt
 
     def _setup_mpipe_execution(self) -> None:
-        """Build the platform execution backend and register the MPIPE_* handlers."""
-        # Lazy import: the backend executor pulls in torch/mindspore and is
-        # resolved only when a schedule is actually constructed.
-        if platform.platform_type == PlatformType.PYTORCH:
-            from hyper_parallel.platform.torch.pipeline_parallel.mpipe_transpose import (  # pylint: disable=C0415
-                MPipeTransposeExecutor,
-            )
-        elif platform.platform_type == PlatformType.MINDSPORE:
-            from hyper_parallel.platform.mindspore.pipeline_parallel.mpipe_transpose import (  # pylint: disable=C0415
-                MPipeTransposeExecutor,
-            )
-        else:
-            raise NotImplementedError(
-                f"MPipe Transpose execution is not implemented for platform {platform.platform_type}."
-            )
+        """Build the Torch executor and register the MPIPE_* handlers."""
         self._executor = MPipeTransposeExecutor(self)
         self._apply_backward_retain_flag()
         handlers = {
@@ -372,11 +368,11 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         if (not self._has_trainable_preprocess and
                 self._num_visual_layers is not None and
                 self._num_transpose_layers >= self._num_visual_layers):
-            self._DATA_KEYS = ("input_ids",) + tuple(
+            self._data_keys = ("input_ids",) + tuple(
                 k for k in self.kwargs_batch_dim if k != "pixel_values"
             )
         else:
-            self._DATA_KEYS = ("input_ids",) + tuple(self.kwargs_batch_dim)
+            self._data_keys = ("input_ids",) + tuple(self.kwargs_batch_dim)
 
         # Length-M so overflow micros and VPP chunks index in bounds; the
         # prefix key -1 ships owner to rank 0, body stages chain via stages[0].
@@ -418,12 +414,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         receives only the feature gradient later (``MPIPE_GRAD_RECV_WITH_BACKWARD``).
         """
         nt = num_transpose_micro_batches
-        if rank >= nt:
-            owned = []
-        elif overflow_mode == "min":
-            owned = [rank]
-        else:
-            owned = sorted(m for m in range(micro_batch_num) if m % nt == rank)
+        owned = _prefix_owned_micros(rank, nt, micro_batch_num, overflow_mode)
         is_dataload_only = num_transpose_layers == 0
         prefix = []
         if has_trainable and not is_dataload_only:
@@ -433,33 +424,16 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
             prefix.append(MetaStep(m, MetaStepType.DATA_LOAD, -1))
             if not is_dataload_only:
                 prefix.append(MetaStep(m, MpipeStepType.MPIPE_TRANSPOSE_FWD, -1))
-        # Type-major send order must match rank 0's receive block below, or
-        # the meta recv drifts and decodes garbage shapes.
+        ship_graph = has_trainable and not owner_backward
         if rank != 0:
-            for m in owned:
-                prefix.append(MetaStep(m, MetaStepType.DATA_SEND, -1))
-            if not is_dataload_only:
-                for m in owned:
-                    prefix.append(MetaStep(m, MpipeStepType.MPIPE_FWD_SEND, -1))
-                if has_trainable and not owner_backward:
-                    for m in owned:
-                        prefix.append(MetaStep(m, MpipeStepType.MPIPE_GRAPH_SEND, -1))
-        if rank == 0:
-            # Non-owned = micros rank 0 didn't transpose locally ("min":
-            # overflow micros load inline, so they are not received).
-            if overflow_mode == "min":
-                non_owned = list(range(1, nt))
-            else:
-                non_owned = [m for m in range(micro_batch_num) if m not in set(owned)]
-            for m in non_owned:
-                prefix.append(MetaStep(m, MetaStepType.DATA_RECV, -1))
-            if not is_dataload_only:
-                for m in non_owned:
-                    prefix.append(MetaStep(m, MpipeStepType.MPIPE_FWD_RECV, -1))
-                if has_trainable and not owner_backward:
-                    for m in non_owned:
-                        prefix.append(MetaStep(m, MpipeStepType.MPIPE_GRAPH_RECV, -1))
-        return prefix
+            return prefix + _prefix_transfer_steps(owned, _PREFIX_SEND_TYPES, is_dataload_only, ship_graph)
+        # Non-owned = micros rank 0 didn't transpose locally ("min":
+        # overflow micros load inline, so they are not received).
+        if overflow_mode == "min":
+            non_owned = list(range(1, nt))
+        else:
+            non_owned = [m for m in range(micro_batch_num) if m not in owned]
+        return prefix + _prefix_transfer_steps(non_owned, _PREFIX_RECV_TYPES, is_dataload_only, ship_graph)
 
     @staticmethod
     def _build_owner_backward_suffix(rank, num_transpose_micro_batches, micro_batch_num, overflow_mode):

@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, TextIO
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import numpy as np
 import torch

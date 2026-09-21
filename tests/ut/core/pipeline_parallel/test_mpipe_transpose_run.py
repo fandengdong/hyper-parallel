@@ -20,7 +20,7 @@ tests build the executor directly, so neither exercises the real
 registration) nor the ``run_with_dataiterator`` driver entry point.  These
 tests cover both without a distributed runtime:
 
-* Construction patches only the stage module's ``platform`` (the UT
+* Construction patches only the stage module's ``dist`` (the UT
   convention, see ``test_style.py``: no real process group in ``tests/ut``)
   so ``PipelineStage.init`` resolves its PP group single-process; everything
   else in the constructor chain is real.
@@ -34,7 +34,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402  pylint: disable=wrong-import-position
 from torch import nn  # noqa: E402  pylint: disable=wrong-import-position
@@ -46,7 +45,7 @@ from hyper_parallel.core.pipeline_parallel.mpipe import (  # noqa: E402  pylint:
     ScheduleMPipeTranspose,
 )
 from hyper_parallel.core.pipeline_parallel.scheduler import MetaStepType  # noqa: E402  pylint: disable=wrong-import-position
-from hyper_parallel.platform.torch.pipeline_parallel.mpipe_transpose import (  # noqa: E402  pylint: disable=wrong-import-position
+from hyper_parallel.core.pipeline_parallel.mpipe.executor import (  # noqa: E402  pylint: disable=wrong-import-position
     MPipeTransposeExecutor,
 )
 
@@ -71,20 +70,20 @@ _MPIPE_HANDLER_TYPES = frozenset({
 })
 
 
-def _stage_platform_patch(world_size):
-    """Patch the stage module's ``platform`` for single-process construction.
+def _stage_dist_patch(world_size):
+    """Patch the stage module's ``dist`` for single-process construction.
 
     ``PipelineStage.init`` resolves rank / world size / the PP group through
-    the stage module's ``platform`` binding; a real resolution would need
+    the stage module's ``dist`` binding; a real resolution would need
     ``init_process_group``, which ``tests/ut`` never does.  Scope the patch
     to construction only: the run path must see the real platform (tensor
     ops, sens building).
     """
-    mock_plat = MagicMock()
-    mock_plat.get_rank.return_value = 0
-    mock_plat.get_world_size.return_value = world_size
-    mock_plat.create_group.return_value = MagicMock(name="pp_group")
-    return patch.object(stage_module, "platform", mock_plat)
+    mock_dist = MagicMock()
+    mock_dist.get_rank.return_value = 0
+    mock_dist.get_world_size.return_value = world_size
+    mock_dist.new_group.return_value = MagicMock(name="pp_group")
+    return patch.object(stage_module, "dist", mock_dist)
 
 
 class _FrozenTower(nn.Module):
@@ -126,11 +125,11 @@ def _build_real_schedule(micro_batch_num, preprocess, submodule, stage_num=1,
                          **mpipe_kwargs):
     """Build a ScheduleMPipeTranspose through the REAL constructor chain.
 
-    Returns ``(schedule, stage)``.  Only stage-side platform resolution is
-    patched (see ``_stage_platform_patch``); the schedule, executor, and
+    Returns ``(schedule, stage)``.  Only stage-side rank and group resolution is
+    patched (see ``_stage_dist_patch``); the schedule, executor, and
     handler registration all run for real.
     """
-    with _stage_platform_patch(world_size=stage_num):
+    with _stage_dist_patch(world_size=stage_num):
         stage = PipelineStage(submodule, stage_index=0, stage_num=stage_num,
                               device=torch.device("cpu"))
         schedule = ScheduleMPipeTranspose(
@@ -184,7 +183,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         assert schedule.num_transpose_micro_batches == 4  # min(PP=4, M=8)
         assert schedule._overlap_b_f is False, \
             "MPipe must force overlap_b_f off on the base schedule"
-        assert schedule._DATA_KEYS == ("input_ids",)
+        assert schedule._data_keys == ("input_ids",)
         assert sorted(schedule.exec_order.keys()) == [0, 1, 2, 3]
         # Frozen: no broadcast, no stage-0-backward input transport, no retain.
         for order in schedule.exec_order.values():
@@ -250,7 +249,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
             constructor.
         Expectation: ``less_memory`` reaches the interleaved base, the
             consumer is exposed via the property, the overflow mode drives
-            ``owned_micros``, and the kwarg spec extends ``_DATA_KEYS``.
+            ``owned_micros``, and the kwarg spec extends ``_data_keys``.
         """
         consumer = lambda ctx, micro, out: None  # noqa: E731  pylint: disable=unnecessary-lambda-assignment
         schedule, _ = _build_real_schedule(
@@ -263,7 +262,7 @@ class TestMPipeTransposeRealConstructor(unittest.TestCase):
         # "min": rank 0 absorbs the overflow micros, other owners keep one.
         assert schedule.owned_micros(0) == frozenset({0, 4, 5, 6, 7})
         assert schedule.owned_micros(1) == frozenset({1})
-        assert schedule._DATA_KEYS == ("input_ids", "attention_mask")
+        assert schedule._data_keys == ("input_ids", "attention_mask")
 
 
 class TestMPipeTransposeRunWithDataIterator(unittest.TestCase):

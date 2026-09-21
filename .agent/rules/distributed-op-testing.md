@@ -3,7 +3,6 @@ name: distributed-op-testing
 description: Testing constraints for HyperParallel distributed operators. Covers UT and ST file structure, naming, forbidden patterns, and assertion format.
 paths:
   - tests/ut/core/shard/ops/**
-  - tests/mindspore/st/shard/ops/**
   - tests/torch/shard/ops/**
 ---
 
@@ -14,7 +13,6 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 | Layer | Directory | Purpose |
 |-------|-----------|---------|
 | UT | `tests/ut/core/shard/ops/` | CPU-only logic verification; covers all error paths |
-| ST (MindSpore) | `tests/mindspore/st/shard/ops/` | Real multi-card distributed execution; success paths only |
 | ST (PyTorch) | `tests/torch/shard/ops/` | Real multi-card distributed execution; success paths only |
 
 ---
@@ -32,7 +30,7 @@ Applies to all distributed operator tests under `tests/`. Two test layers are re
 
 **Must NOT:**
 
-- Call `get_platform()` or use any platform instance — platform is mocked via `@patch` in UT.
+- Reach for a real process group or device — the distributed calls are mocked via `@patch` in UT.
 - Add `@arg_mark` to UT tests — that decorator is for ST only.
 
 **infer_layout calls:** pass a single `cache_values` list — `op.infer_layout(cache_values)`, not `op.infer_layout(layouts, extra_args)`.
@@ -80,16 +78,6 @@ tests/torch/shard/ops/
 └── framework/                   # Torch-specific backend
     ├── __init__.py
     └── backend_torch.py
-
-tests/mindspore/st/shard/ops/    # same layout for MindSpore
-├── test_shard_ops_suite.py
-├── cases/
-│   ├── __init__.py
-│   ├── case_sort.py
-│   └── case_cat.py
-└── framework/
-    ├── __init__.py
-    └── backend_mindspore.py
 ```
 
 ### Case Definition
@@ -97,7 +85,7 @@ tests/mindspore/st/shard/ops/    # same layout for MindSpore
 Each `cases/case_{op}.py` defines test functions and registers cases:
 
 ```python
-import torch  # or mindspore as ms
+import torch
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from tests.shard_ops.framework import (
     CompareSpec, InputSpec, OpShardCase, register,
@@ -123,7 +111,7 @@ register(OpShardCase(
 | `inputs` | `InputSpec(shape, init, seed, dtype, data)` — declarative tensor specs (primary tensors only) |
 | `placements` | One placement tuple per input. **Tuple length == mesh ndim** (see Placement Convention below) |
 | `compare` | `CompareSpec.equal()` or `CompareSpec.allclose(rtol, atol)` |
-| `tags` | `("cpu_level0", "npu_level0")` for Torch; `("npu_level0",)` for MindSpore |
+| `tags` | `("cpu_level0", "npu_level0")` for Torch cases |
 | `mesh_shape` | No default — declare **explicitly** on every case. `(2,)` for 1D, `(2,2)` for 2D, `(2,2,2)` for 3D |
 | `mesh_dim_names` | e.g. `("dp","tp")`. Match mesh_shape cardinality. For ordinary ops these are **cosmetic** (placements act by axis index; the bucketer canonicalizes them by ndim, so naming is documentation-only). For MC2 ops (`needs_mesh=True`) they are **live** — the fn resolves its comm group via `get_group(group_dim)`, so keep real names and match the `group_dim` in `kwargs` |
 | `extra_inputs` | Non-tensor args (scalars, dims, seq-lens) passed through unchanged — not distributed |
@@ -173,15 +161,9 @@ _GROUPS_CPU_LEVEL0 = build_suite_groups(
 # Torch (CPU default)
 python -m tests.shard_ops.framework --case sort_ops_2d_dp --num-proc 4
 python -m tests.shard_ops.framework --device-type npu --case sort_ops_2d_dp --num-proc 4
-
-# MindSpore — set HYPER_PARALLEL_PLATFORM=mindspore (it overrides --framework)
-HYPER_PARALLEL_PLATFORM=mindspore \
-  python -m tests.shard_ops.framework --framework mindspore --device-type npu \
-  --case argsort_ops_dp --num-proc 4
 ```
 
 - `--num-proc` **must equal `math.prod(mesh_shape)`** (2 for `(2,)`, 4 for `(2,2)`, 8 for `(2,2,2)`); a mismatch makes ranks ≠ mesh size and HCCL hangs.
-- `HYPER_PARALLEL_PLATFORM` takes precedence over `--framework`; for MindSpore CLI runs set it to `mindspore` or the Torch cases load instead.
 
 **Mode 2 — Suite entry with env filter:** Run via pytest, filter cases within groups:
 

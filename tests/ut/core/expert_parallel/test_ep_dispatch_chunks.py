@@ -470,15 +470,13 @@ def _unchunked_reference(module, hidden_states, router_fn, ep_group, rank):
         ep_size=_EP_SIZE,
         ep_group=ep_group,
     )
-    (
-        source_indices,
-        flattened_weights,
-        dispatch_order,
-        dispatched_states,
-        dispatched_indices,
-        send_counts,
-        receive_counts,
-    ) = dispatch
+    source_indices = dispatch.source_indices
+    flattened_weights = dispatch.expert_weights
+    dispatch_order = dispatch.dispatch_order
+    dispatched_states = dispatch.states
+    dispatched_indices = dispatch.expert_indices
+    send_counts = dispatch.send_counts
+    receive_counts = dispatch.receive_counts
     combined = ep_experts._run_ep_local_experts(  # pylint: disable=protected-access
         module,
         dispatched_states,

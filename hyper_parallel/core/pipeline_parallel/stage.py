@@ -14,16 +14,15 @@
 # ============================================================================
 """pipeline stage"""
 from typing import Optional
-from types import SimpleNamespace
+
+import torch
+import torch.distributed as dist
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.api import HSDPModule
-from hyper_parallel.platform import get_platform
-from .utils import _RecvInfo  # pylint: disable=E0402
-
-platform = get_platform()
-PipelineStageBase = platform.PipelineStageBase
+from hyper_parallel.core.pipeline_parallel._stage import PipelineStageBase
+from hyper_parallel.core.pipeline_parallel.utils import _RecvInfo
 
 
 class SharedParameterInfo:
@@ -44,7 +43,7 @@ class SharedParameterInfo:
             ``owner_module`` (e.g. ``"weight"``).
     """
     def __init__(self, parameter, shared_stage, owner_module=None, param_name=None):
-        if not isinstance(parameter, platform.Parameter):
+        if not isinstance(parameter, torch.nn.Parameter):
             raise TypeError(f"Argument 'parameter' must be type of Parameter, \
                              but got type {type(parameter)}.")
         if not isinstance(shared_stage, (list, tuple)):
@@ -91,8 +90,7 @@ class PipelineStage(PipelineStageBase):
         device (Union[str, Device], optional): Device on which the P2P communication buffers are
             allocated. Default ``None``, resolved to the current accelerator device. Under PyTorch an
             explicit ``None`` would place the buffers on CPU, which HCCL/NCCL rejects (``No backend type
-            associated with device type cpu``); the fallback avoids that. MindSpore binds the device at
-            process init and ignores this argument.
+            associated with device type cpu``); the fallback avoids that.
         group (ProcessGroup): Group of p2p communication.
         src_stage (int, optional): Src stage index for recv. Default ``None``
         dst_stage (int, optional): Dst stage index for send. Default ``None``
@@ -110,10 +108,10 @@ class PipelineStage(PipelineStageBase):
     def __init__(self, submodule, stage_index: int, stage_num: int, device=None, group=None,
                  src_stage=None, dst_stage=None, dyn_shape=False, has_backward=True,
                  shared_parameters=None, mesh: Optional[DeviceMesh] = None):
-        super().__init__(submodule, stage_index, stage_num, group, has_backward)
+        super().__init__(submodule, stage_index, stage_num, group, dyn_shape, has_backward)
         self.submodule = submodule
         self.pp_group = self._check_pp_group(group)
-        self.device = device if device is not None else platform.device()
+        self.device = device if device is not None else (torch.accelerator.current_accelerator() or torch.device("cpu"))
         self.mesh = mesh
         self._has_backward = has_backward
         self._recv_info = []
@@ -126,7 +124,7 @@ class PipelineStage(PipelineStageBase):
         self.grad_recv_info = {}
         # micro_index -> list of metas (matching ``_extract_meta_from_tensor``).  Captured at fwd-send
         # time so backward can read each output's ``requires_grad`` flag after ``fwd_outputs_cache``
-        # is popped — needed to zero-pad sens on the MS GradOperation path.
+        # is popped.
         self._fwd_output_meta = {}
         self._meta_been_send = False
         self._meta_been_recv = False
@@ -157,13 +155,16 @@ class PipelineStage(PipelineStageBase):
         if self.mesh is not None:
             self.pp_group = self.mesh.get_group()
         else:
-            rank_id = platform.get_rank()
-            device_num = platform.get_world_size()
+            rank_id = dist.get_rank()
+            device_num = dist.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
             device_num_per_stage = device_num // real_stage_num
             index = self.stage_index % real_stage_num
             rank_ids = [rank_id + device_num_per_stage * (i - index) for i in range(real_stage_num)]
-            self.pp_group = platform.create_group(rank_ids)
+            self.pp_group = (
+                dist.group.WORLD if rank_ids == list(range(device_num))
+                else dist.new_group(rank_ids, use_local_synchronization=True)
+            )
 
     def clear_states(self):
         """clear fwd and bwd recv_info list."""
@@ -203,9 +204,10 @@ class PipelineStage(PipelineStageBase):
             shared_stage = shared_param_info.shared_stage
             group, group_ranks = self._init_shared_parameter_group(shared_stage)
             shared_param_info.group = group
-            # DTensor dispatch whitelists DistCommBroadcast and unwraps DTensor
-            # args to their local shards before invoking the backend collective.
-            platform.broadcast(param, group_ranks[0], group)
+            # Raw c10d collectives operate on the matching local TP/FSDP shard.
+            local_param = param.to_local() if isinstance(param, DTensor) else param
+            with torch.no_grad():
+                dist.broadcast(local_param, group_ranks[0], group)
 
     def _global_rank(self, stage_index):
         real_stage_num = self.stage_num // self._virtual_chunk_num
@@ -213,7 +215,7 @@ class PipelineStage(PipelineStageBase):
         if self.mesh is not None:
             # mesh is a 1-D PP sub-mesh; rank_list[i] is the global rank of stage i.
             return self.mesh.rank_list[real_stage_index]
-        return platform.get_global_rank(self.pp_group, real_stage_index)
+        return dist.get_global_rank(self.pp_group, real_stage_index)
 
     def _init_shared_parameter_group(self, shared_stage):
         """init group of shared parameter."""
@@ -224,7 +226,7 @@ class PipelineStage(PipelineStageBase):
         # FSDP where each dp line needs its own {stage0, stage1} group.
         if self.mesh is not None and len(group_ranks) == self.mesh.size():
             return self.mesh.get_group(), group_ranks
-        group = platform.create_group(group_ranks)
+        group = dist.new_group(group_ranks, use_local_synchronization=True)
         return group, group_ranks
 
     def sync_shared_parameters_grad(self) -> None:
@@ -257,11 +259,10 @@ class PipelineStage(PipelineStageBase):
                 # backward. Derive the zero contribution from the live local
                 # parameter shard so shape, dtype, and device match TP/FSDP.
                 local_param = param.to_local() if isinstance(param, DTensor) else param
-                local_grad = platform.full_like(local_param, 0)
+                local_grad = torch.full_like(local_param, 0)
 
-            # platform.all_reduce expects group_info (with .group for Torch, or str for MindSpore)
-            group_info = group if isinstance(group, str) else SimpleNamespace(group=group)
-            reduced_grad, handle = platform.all_reduce(local_grad, group_info, async_op=True)
+            reduced_grad = local_grad.contiguous()
+            handle = dist.all_reduce(reduced_grad, group=group, async_op=True)
             if handle is not None:
                 handle.wait()
 
@@ -270,7 +271,7 @@ class PipelineStage(PipelineStageBase):
                 # non-contiguous input. Preserve the original grad object (and
                 # DTensor layout) while copying the completed reduction back.
                 if reduced_grad is not local_grad:
-                    platform.load_into_param(local_grad, reduced_grad)
+                    local_grad.copy_(reduced_grad)
             elif param.requires_grad:
                 if isinstance(param, DTensor):
                     param.grad = DTensor.from_local(reduced_grad, param.device_mesh, param.placements)
@@ -310,7 +311,7 @@ class PipelineStage(PipelineStageBase):
         if self.mesh is not None:
             rank_list = self._get_layout_rank_list(layout, sender_rank)
         else:
-            device_num = platform.get_world_size()
+            device_num = dist.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
             device_num_per_stage = device_num // real_stage_num
             index = self.stage_index % real_stage_num
@@ -335,7 +336,7 @@ class PipelineStage(PipelineStageBase):
             # stages by a fixed rank block and the within-stage tile is identical
             # across stages, so this receiver's submesh is the sender's submesh
             # (layout.rank_list) shifted by the P2P offset (me - sender_rank).
-            me = platform.get_rank()
+            me = dist.get_rank()
             cur_ranks = tuple(layout.rank_list or ())
             # The cached layout is reused across microbatches/steps and
             # _update_layout mutates it in place, so re-resolution must be
@@ -353,33 +354,13 @@ class PipelineStage(PipelineStageBase):
             name for name in (layout.alias_name or ()) if name not in pp_dim_names
         )
         if not layout_dim_names:
-            return (platform.get_rank(),)
+            return (dist.get_rank(),)
         if len(layout_dim_names) == 1:
             submesh = root[layout_dim_names[0]]
         else:
             submesh = root[layout_dim_names]
         return tuple(submesh.rank_list)
 
-    def get_last_stage_sens(self, last_stage_outputs):
-        """Get last stage sens"""
-        p_sens = None
-        if isinstance(last_stage_outputs, (list, tuple)):
-            p_sens = []
-            for _, out_i in enumerate(last_stage_outputs):
-                if isinstance(out_i, DTensor):
-                    repeat_num = out_i.layout.repeat_num()
-                    sens_i = platform.full_like(out_i.to_local(), 1.0 / repeat_num)
-                else:
-                    sens_i = platform.full_like(out_i, 1.0)
-                p_sens.append(sens_i)
-        else:
-            if isinstance(last_stage_outputs, DTensor):
-                repeat_num = last_stage_outputs.layout.repeat_num()
-                p_sens = platform.full_like(last_stage_outputs.to_local(), 1.0 / repeat_num)
-            else:
-                p_sens = platform.full_like(last_stage_outputs, 1.0)
-
-        return p_sens
 
     def _construct_forward_recv_info(self, micro_index, idx, global_rank, meta):
         """construct forward recv info.
@@ -393,10 +374,10 @@ class PipelineStage(PipelineStageBase):
         requires_grad = bool(meta[-1])
         if len(meta) == 4:
             self._update_layout(meta[2], global_rank)
-            buffer = DTensor.from_local(platform.empty(meta[0], dtype=meta[1],
-                                                       device=self.device), meta[2].mesh, meta[2].alias_placements)
+            buffer = DTensor.from_local(torch.empty(meta[0], dtype=meta[1], device=self.device),
+                                        meta[2].mesh, meta[2].alias_placements)
         else:
-            buffer = platform.empty(meta[0], dtype=meta[1], device=self.device)
+            buffer = torch.empty(meta[0], dtype=meta[1], device=self.device)
         buffer.requires_grad = requires_grad
         if micro_index in self.args_recv_info:
             recv_info = self.args_recv_info[micro_index][idx]
@@ -409,13 +390,13 @@ class PipelineStage(PipelineStageBase):
         """communicate meta."""
         if meta_send is not None:
             if self._dyn_shape or not self._meta_been_send:
-                platform.send_object_list([meta_send], global_rank)
+                dist.send_object_list([meta_send], global_rank)
                 self._meta_been_send = True
             return None
 
         if self._dyn_shape or not self._meta_been_recv:
             obj_list = [None]
-            platform.recv_object_list(obj_list, global_rank)
+            dist.recv_object_list(obj_list, global_rank)
             self._meta_been_recv = True
             if not self._dyn_shape:
                 self._meta_cache = obj_list
@@ -427,8 +408,8 @@ class PipelineStage(PipelineStageBase):
         """Prepare forward-recv buffers (+ bookkeeping) without launching.
 
         Returns a list of ``(op_type, tensor, peer_global_rank)`` tuples (all
-        ``"irecv"``) ready to feed ``platform.irecv`` one-by-one or to pack
-        into ``platform.batch_isend_irecv``.  Side effects (meta exchange,
+        ``"irecv"``) ready to feed ``dist.irecv`` one-by-one or to pack
+        into ``dist.batch_isend_irecv``.  Side effects (meta exchange,
         ``args_recv_info`` population) match :meth:`exec_fwd_recv_ops` so the
         two paths stay interchangeable.
         """
@@ -441,14 +422,16 @@ class PipelineStage(PipelineStageBase):
             recv_info = self._construct_forward_recv_info(micro_index, idx, global_rank, meta)
             if micro_index not in self.args_recv_info:
                 recv_infos.append(recv_info)
-            specs.append(("irecv", recv_info.buffer, global_rank))
+            buffer = recv_info.buffer
+            local_buffer = buffer.to_local() if isinstance(buffer, DTensor) else buffer
+            specs.append(("irecv", local_buffer, global_rank))
         if recv_infos:
             self.args_recv_info[micro_index] = recv_infos
         return specs
 
     def exec_fwd_recv_ops(self, micro_index):
         """Execute the forward recv operation."""
-        return [platform.irecv(tensor, rank) for _, tensor, rank in self.fwd_recv_specs(micro_index)]
+        return [dist.irecv(tensor, rank) for _, tensor, rank in self.fwd_recv_specs(micro_index)]
 
     def _construct_backward_recv_info(self, micro_index, idx, global_rank):
         """Reserve backward recv bookkeeping without allocating its device buffer."""
@@ -490,10 +473,9 @@ class PipelineStage(PipelineStageBase):
         keeps aligned across micro-batches.
 
         The full output meta list is also stashed in ``_fwd_output_meta``
-        so ``backward_one_chunk`` (esp. on MindSpore) can rebuild a
-        zero-padded sens matching the wrapped forward's output structure.
+        so backward receive buffers match the grad-requiring output slots.
         """
-        return [platform.isend(tensor, rank) for _, tensor, rank in self.fwd_send_specs(micro_index)]
+        return [dist.isend(tensor, rank) for _, tensor, rank in self.fwd_send_specs(micro_index)]
 
     def fwd_send_specs(self, micro_index):
         """Prepare forward-send tensors (+ bookkeeping) without launching.
@@ -514,13 +496,14 @@ class PipelineStage(PipelineStageBase):
         global_rank = self._global_rank(self.dst_stage)
         self._communicate_meta(global_rank, output_meta)
         bwd_idx = 0
-        for idx, cur_out in enumerate(out):
+        for cur_out in out:
             if self._has_backward and bool(getattr(cur_out, "requires_grad", False)):
                 recv_info = self._construct_backward_recv_info(micro_index, bwd_idx, global_rank)
                 if recv_info is not None:
                     bwd_recv_infos.append(recv_info)
                 bwd_idx += 1
-            specs.append(("isend", out[idx], global_rank))
+            local_output = cur_out.to_local() if isinstance(cur_out, DTensor) else cur_out
+            specs.append(("isend", local_output, global_rank))
         if bwd_recv_infos:
             self.grad_recv_info[micro_index] = bwd_recv_infos
         return specs
@@ -543,13 +526,13 @@ class PipelineStage(PipelineStageBase):
         specs = []
         for recv_info, meta in zip(recv_infos, grad_metas):
             if recv_info.buffer is None:
-                recv_info.buffer = platform.empty(meta[0], dtype=meta[1], device=self.device)
+                recv_info.buffer = torch.empty(meta[0], dtype=meta[1], device=self.device)
             specs.append(("irecv", recv_info.buffer, recv_info.global_rank))
         return specs
 
     def exec_bwd_recv_ops(self, micro_index):
         """Execute the backward recv operation."""
-        return [platform.irecv(tensor, rank) for _, tensor, rank in self.bwd_recv_specs(micro_index)]
+        return [dist.irecv(tensor, rank) for _, tensor, rank in self.bwd_recv_specs(micro_index)]
 
     def exec_bwd_send_ops(self, micro_index):
         """Execute the backward send operation.
@@ -560,7 +543,7 @@ class PipelineStage(PipelineStageBase):
         ``grad_recv_info``).  Pairing via ``zip`` keeps send count and
         peer irecv count consistent.
         """
-        return [platform.isend(tensor, rank) for _, tensor, rank in self.bwd_send_specs(micro_index)]
+        return [dist.isend(tensor, rank) for _, tensor, rank in self.bwd_send_specs(micro_index)]
 
     def bwd_send_specs(self, micro_index):
         """Prepare backward-send (input-grad) tensors without launching.
@@ -573,13 +556,16 @@ class PipelineStage(PipelineStageBase):
             return []
         out = self.bwd_cache.pop(micro_index)
         rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
-        return [("isend", cur_out, info.global_rank) for cur_out, info in zip(out, rg_infos)]
+        return [
+            ("isend", grad.to_local() if isinstance(grad, DTensor) else grad, info.global_rank)
+            for grad, info in zip(out, rg_infos)
+        ]
 
     def execute_reduce_grad(self) -> None:
         """Reduce nested FSDP gradients and finalize every HSDP root in the stage."""
         fsdp_schedulers = []
         seen_scheduler_ids = set()
-        for _, submod in platform.get_cells_and_names(self.submodule):
+        for _, submod in self.submodule.named_modules():
             if not isinstance(submod, HSDPModule):
                 continue
             scheduler = submod.hsdp_scheduler
@@ -602,7 +588,7 @@ class PipelineStage(PipelineStageBase):
 
         # A plain pipeline-stage root may contain one or more independently
         # wrapped HSDP child roots. Finalize every runtime root so each context
-        # clears its backward state; the platform hook also drains the global
+        # clears its backward state; the HSDP hook also drains the global
         # fused reduction queues. A pre-forward fallback retains the historical
         # single-root behavior for callers that invoke this method directly.
         root_schedulers = [
@@ -615,42 +601,3 @@ class PipelineStage(PipelineStageBase):
             # No public API exposes root backward finalization. The hook drains
             # unconditionally, so a differentiable PP input cannot defer it.
             scheduler._root_backward_hook()  # pylint: disable=protected-access
-
-    def _build_padded_sens(self, micro_index):
-        """Build an N-length sens list aligned with the forward output structure.
-
-        MindSpore's GradOperation requires sens to match the wrapped forward's
-        output signature.  ``grad_recv_info[mi]`` only holds K = rg-true slots,
-        so the remaining N - K slots are filled with zero placeholders sized
-        from the recorded meta.
-
-        Returns:
-            list: sens tensors, length equal to the forward output count.
-                Empty if no meta is recorded (e.g. last stage or unknown mi).
-        """
-        metas = self._fwd_output_meta.get(micro_index)
-        if not metas:
-            return []
-        grad_recv = self.grad_recv_info.get(micro_index, [])
-        sens = []
-        grad_idx = 0
-        for meta in metas:
-            if bool(meta[-1]):
-                sens.append(grad_recv[grad_idx].buffer)
-                grad_idx += 1
-            else:
-                # meta is [shape, dtype, rg] or [local_shape, dtype, layout, rg]
-                sens.append(platform.zeros(meta[0], dtype=meta[1], device=self.device))
-        return sens
-
-    def _output_requires_grad_mask(self, micro_index):
-        """Return the requires_grad mask for forward outputs at ``micro_index``.
-
-        For non-last stages the mask is read from ``_fwd_output_meta`` (recorded
-        during ``exec_fwd_send_ops``).  For the last stage no fwd-send runs, so
-        the caller should derive the mask from ``last_stage_outputs`` instead.
-        """
-        metas = self._fwd_output_meta.get(micro_index)
-        if not metas:
-            return None
-        return [bool(meta[-1]) for meta in metas]

@@ -126,7 +126,10 @@ def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfi
         state_keys=config.state_keys,
         min_numel=config.min_numel,
         include_master_params=config.include_master_params,
-        packed_swap=config.packed_swap,
+        # ``None`` means "leave it to the backend default", not "off": the core
+        # config declares ``packed_swap: bool = True``, so pass that default
+        # through rather than letting ``None`` read as a hard False.
+        packed_swap=True if config.packed_swap is None else config.packed_swap,
     )
 
 

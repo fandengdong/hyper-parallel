@@ -15,6 +15,7 @@
 """Unit tests for pipeline-stage P2P buffer lifecycle."""
 # pylint: disable=protected-access
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import hyper_parallel.core.pipeline_parallel.stage as stage_module
@@ -39,6 +40,11 @@ class _FakeDTensor(_FakeTensor):
         super().__init__(shape, dtype, requires_grad=True)
         self.local_shape = local_shape
         self.layout = object()
+        self.local_tensor = _FakeTensor(local_shape, dtype, requires_grad=True)
+
+    def to_local(self) -> _FakeTensor:
+        """Expose the local tensor used by native P2P operations."""
+        return self.local_tensor
 
 
 def _make_stage(outputs: tuple[_FakeTensor, ...], micro_index: int = 0) -> PipelineStage:
@@ -66,7 +72,7 @@ def test_backward_recv_buffer_is_allocated_when_recv_is_posted() -> None:
 
     with patch.object(stage, "_global_rank", return_value=1), \
             patch.object(stage, "_communicate_meta"), \
-            patch.object(stage_module.platform, "empty", return_value=recv_buffer) as empty_mock:
+            patch.object(stage_module.torch, "empty", return_value=recv_buffer) as empty_mock:
         send_specs = stage.fwd_send_specs(0)
 
         assert empty_mock.call_count == 0, (
@@ -108,7 +114,7 @@ def test_reused_micro_index_allocates_from_latest_output_meta() -> None:
     with patch.object(stage, "_global_rank", return_value=1), \
             patch.object(stage, "_communicate_meta"), \
             patch.object(stage_module, "DTensor", _FakeDTensor), \
-            patch.object(stage_module.platform, "empty", side_effect=[first_buffer, second_buffer]) as empty_mock:
+            patch.object(stage_module.torch, "empty", side_effect=[first_buffer, second_buffer]) as empty_mock:
         stage.fwd_send_specs(0)
         first_specs = stage.bwd_recv_specs(0)
         stage._clear_recv_buffer(stage.grad_recv_info, 0)
@@ -134,3 +140,27 @@ def test_reused_micro_index_allocates_from_latest_output_meta() -> None:
         f"Expected latest dtype/device={{'dtype': {second_output.dtype}, 'device': {stage.device}}}, "
         f"got={second_call.kwargs}"
     )
+
+
+def test_forward_specs_transport_local_dtensor_and_keep_layout_metadata() -> None:
+    """Native c10d receives a local tensor while the stage retains its DTensor."""
+    output = _FakeDTensor((8, 4), (4, 4), "float32")
+    sender = _make_stage((output,))
+    receiver = _make_stage(())
+    receiver.src_stage = 0
+    receiver.args_recv_info = {}
+    recv_info = SimpleNamespace(buffer=output)
+
+    with patch.object(stage_module, "DTensor", _FakeDTensor), \
+            patch.object(sender, "_global_rank", return_value=1), \
+            patch.object(sender, "_communicate_meta") as send_meta, \
+            patch.object(receiver, "_global_rank", return_value=0), \
+            patch.object(receiver, "_communicate_meta", return_value=[["tensor_meta"]]), \
+            patch.object(receiver, "_construct_forward_recv_info", return_value=recv_info):
+        send_specs = sender.fwd_send_specs(0)
+        recv_specs = receiver.fwd_recv_specs(0)
+
+    assert send_specs == [("isend", output.local_tensor, 1)]
+    assert recv_specs == [("irecv", output.local_tensor, 0)]
+    assert receiver.args_recv_info[0][0].buffer is output
+    send_meta.assert_called_once_with(1, [[output.local_shape, output.dtype, output.layout, True]])

@@ -23,7 +23,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.core.activation_memory.swap import SwapManager
 from hyper_parallel.core.pipeline_parallel import pipeline_swap, scheduler as scheduler_module
 from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     PipelineSwapSession,
@@ -45,7 +45,6 @@ from hyper_parallel.core.pipeline_parallel.scheduler import (
     _P2P_STEP_TYPES,
     _RECV_STEP_TYPES,
 )
-from hyper_parallel.platform.platform import PlatformType
 
 sys.setrecursionlimit(10000)
 
@@ -730,8 +729,7 @@ class TestParseAndValidate(unittest.TestCase):
     def test_pipeline_swap_accepts_pytorch_backend(self):
         """The PyTorch backend builds the same swap metastep lifecycle."""
         stage = Mock(stage_index=0, stage_num=4, submodule=Mock(), pp_group=None)
-        with patch.object(scheduler_module.platform, "platform_type", PlatformType.PYTORCH), \
-             patch.object(Schedule1F1B, "_check_stages", return_value=[stage]), \
+        with patch.object(Schedule1F1B, "_check_stages", return_value=[stage]), \
              patch.object(scheduler_module, "unregister_layer_swap_hooks"), \
              patch.object(Schedule1F1B, "_inject_local_fsdp_actions"):
             schedule = Schedule1F1B(stage, 4, swap=True)
@@ -766,13 +764,13 @@ class TestParseAndValidate(unittest.TestCase):
         step = MetaStep(2, MetaStepType.SWAP_LAUNCH_OFFLOAD, 1)
 
         with patch.object(pipeline_swap, "SwapManager", return_value=manager), \
-             patch.object(pipeline_swap.platform, "parameters_dict", return_value=(("weight", parameter),)), \
+             patch.object(stage.submodule, "parameters", return_value=(parameter,)), \
              patch.object(
-                 pipeline_swap.platform,
-                 "buffers_dict",
+                 stage.submodule,
+                 "buffers",
                  return_value=(
-                     ("running_state", persistent_buffer),
-                     ("scratch", non_persistent_buffer),
+                     persistent_buffer,
+                     non_persistent_buffer,
                  ),
              ):
             pipeline_swap._protect_pipeline_owned_tensors(  # pylint: disable=protected-access
@@ -795,8 +793,8 @@ class TestParseAndValidate(unittest.TestCase):
         step = MetaStep(1, MetaStepType.SWAP_LAUNCH_OFFLOAD, 0)
 
         with patch.object(pipeline_swap, "SwapManager", return_value=manager), \
-             patch.object(pipeline_swap.platform, "parameters_dict", return_value=(("weight", parameter),)), \
-             patch.object(pipeline_swap.platform, "buffers_dict", return_value=()):
+             patch.object(stage.submodule, "parameters", return_value=(parameter,)), \
+             patch.object(stage.submodule, "buffers", return_value=()):
             pipeline_swap._protect_pipeline_owned_tensors(  # pylint: disable=protected-access
                 step,
                 schedule,

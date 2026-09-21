@@ -26,7 +26,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 op = SortDistributedOp("sort")
 op_ms = SortDistributedOp("SortExt")
 
@@ -56,7 +56,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
                                 mesh_dim_names=("dp", "mp"), init_backend=False)
 
@@ -64,7 +63,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 4
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2),
                                 mesh_dim_names=("dp", "tp"), init_backend=False)
 
@@ -72,7 +70,6 @@ class TestParallelSort(unittest.TestCase):
         """Mock a 2x2x2 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
-        mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
 

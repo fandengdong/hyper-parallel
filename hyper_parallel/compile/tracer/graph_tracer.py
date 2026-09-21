@@ -44,6 +44,13 @@ contains the explicit backward ops, and a redundant autograd graph on top
 would keep every forward intermediate alive via ``grad_fn`` references.
 """
 
+__all__ = [
+    "JointGraph",
+    "trace_model_graph",
+    "run_traced_graph",
+    "extract_module_state",
+]
+
 import contextlib
 import copy
 import inspect
@@ -388,11 +395,11 @@ def _input_meta(x: Any) -> Any:
     return x
 
 
-def trace_model_graph(
+def trace_model_graph(  # pylint: disable=too-many-locals
     model: torch.nn.Module,
     train_fn: Callable,
-    sample_input: torch.Tensor,
-    sample_label: torch.Tensor,
+    input_batch: torch.Tensor,
+    label_batch: torch.Tensor,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -400,8 +407,8 @@ def trace_model_graph(
     Args:
         model: Model (no parallel wrapping)
         train_fn: Training function signature: train_fn(model, input, label) -> loss
-        sample_input: Sample input (for tracing)
-        sample_label: Sample label (for tracing)
+        input_batch: Input batch used to trace the joint graph
+        label_batch: Label batch used to trace the joint graph
 
     Returns:
         JointGraph: Joint forward-backward computation graph
@@ -427,9 +434,9 @@ def trace_model_graph(
     state_is_param = [fqn in param_fqns for fqn in state_fqns]
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
-    # user_inputs is a plain tuple (sample_input, sample_label) so the traced
+    # user_inputs is a plain tuple (input_batch, label_batch) so the traced
     # closure unpacks it back into the two positional args of train_fn.
-    user_inputs = (sample_input, sample_label)
+    user_inputs = (input_batch, label_batch)
     user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
 
     for leaf in [*state_flat, *user_inputs_flat]:
@@ -549,7 +556,7 @@ def trace_model_graph(
 
     return JointGraph(
         graph_module=traced_graph,
-        inputs=[_input_meta(sample_input), _input_meta(sample_label)],
+        inputs=[_input_meta(input_batch), _input_meta(label_batch)],
         outputs=[],
         param_names=param_names,
         param_shapes=param_shapes,
@@ -601,11 +608,3 @@ def run_traced_graph(
     else:
         loss, grads = outputs, []
     return loss, grads
-
-
-__all__ = [
-    "JointGraph",
-    "trace_model_graph",
-    "run_traced_graph",
-    "extract_module_state",
-]

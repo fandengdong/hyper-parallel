@@ -21,14 +21,16 @@ can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree``
 / ``tp_size`` being present without each pass re-declaring the contract.
 """
 
+__all__ = ["GraphPass"]
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from ..parallel_config import PassConfig
+from ..pass_config import PassConfig
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import PassPlan
+    from ..pass_plan import PassPlan
 
 
 class GraphPass(ABC):
@@ -65,6 +67,3 @@ class GraphPass(ABC):
     def __repr__(self) -> str:
         """Return a developer-facing representation of the pass."""
         return f"{self.__class__.__name__}(name={self.name})"
-
-
-__all__ = ["GraphPass"]

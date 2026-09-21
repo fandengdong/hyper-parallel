@@ -14,7 +14,7 @@
 1. **正确性**：与非 overlap 路径数值完全一致。
 2. **可组合**：保持现有 `PipelineStage` / `ScheduleInterleaved1F1B` 抽象，新增 flag + 通过 callback 注册扩展，不污染调度核心。
 3. **机制与调度解耦**：`CommComputeOverlap` 是独立的双线程协调器，未来可用于 TP+CP、FSDP prefetch 等其他场景，不绑定 PP。
-4. **跨平台基础**：上层抽象（`HookCoordinator` / `CommComputeOverlap`）平台无关；同步原语下沉到 `platform.differentiable_sync_hook`。
+4. **Torch 原生实现**：PP 仅支持 PyTorch；`CommComputeOverlap` 直接使用 PP 内部的 `torch.autograd.Function` 同步钩子。
 
 ---
 
@@ -26,11 +26,8 @@ hyper_parallel/core/pipeline_parallel/
 ├── stage.py                    # PipelineStage
 ├── hook_coordinator.py         # NEW：双线程 COMM-first rendezvous
 ├── comm_compute_overlap.py     # NEW：CommComputeOverlap orchestrator + A/B/C/D wrap
+├── _sync_hook.py               # _SyncHookFunction (torch.autograd.Function)
 └── __init__.py                 # 导出新增 API
-
-hyper_parallel/platform/
-├── platform.py                 # 抽象基类新增 differentiable_sync_hook
-└── torch/platform.py           # 增加 _TorchSyncHookFunction (autograd.Function)
 
 examples/torch/pp_overlap/
 └── pp_overlap_moe_example.py   # 端到端示例：PP + EP + 通算掩盖 + MoE
@@ -104,7 +101,7 @@ SEND 在 `overlap_p2p=True` 下追加到 `send_handles` 列表，在 `run_microb
 [A] ─► dispatch(A2A) ─► [B] ─► expert(compute) ─► [C] ─► combine(A2A) ─► [D] ─► (Attention)
 ```
 
-`CommComputeOverlap` 提供 `wrap_dispatch` / `wrap_combine`，调用 `platform.differentiable_sync_hook` 把 A、B、C、D 4 个钩子点插到张量计算图里。Backward 自动得到对称的 D'、C'、B'、A' 触发顺序。
+`CommComputeOverlap` 提供 `wrap_dispatch` / `wrap_combine`，调用 `_SyncHookFunction.apply` 把 A、B、C、D 4 个钩子点插到张量计算图里。Backward 自动得到对称的 D'、C'、B'、A' 触发顺序。
 
 ### 4.2 HookCoordinator：COMM-first rendezvous
 
@@ -268,14 +265,15 @@ losses = schedule.run(*inputs)
 
 ---
 
-## 8. 平台抽象
+## 8. Torch 原生同步钩子
 
-新增 `platform.differentiable_sync_hook(tensor, hook_name, coordinator)`：
+`core/pipeline_parallel/_sync_hook.py` 中的 `_SyncHookFunction` 直接继承
+`torch.autograd.Function`。前向时根据 `hook_name`（`A`/`B`/`C`/`D`）计算
+COMM/COMPUTE role 并调用 `coordinator.rendezvous`；反向时角色对称翻转。
+`D_LAST` 保留最后一层的通知语义并跳过边界 rendezvous。
 
-- Torch backend：`_SyncHookFunction(autograd.Function)`，前向时根据 `hook_name`（`A`/`B`/`C`/`D`）计算 COMM/COMPUTE role 并调 `coordinator.rendezvous`；反向时角色对称翻转。
-- MindSpore backend：默认实现为 noop（不支持 dual-pipe overlap，将来可扩展）。
-
-通过 `get_platform()` 获取，符合 `code-style.md` 平台抽象约定。
+`CommComputeOverlap` 直接调用此钩子；每个 overlap window 新建并等待一个
+反向线程。PP 不再经过 Platform，也不提供 MindSpore 实现。
 
 ---
 
@@ -284,7 +282,6 @@ losses = schedule.run(*inputs)
 ### 当前限制
 
 - **MoE 层数对齐**：FWD 与 BWD chunk 层数不等时，多余的 hook 落在没有配对的一侧 → barrier 死等。当前实现假设 FWD/BWD chunk 层数一致；不一致时需要在装钩时按短边对齐（多余层不装钩），框架不会自动处理。
-- **MindSpore 暂不支持**：仅做了 noop 占位，需要补 autograd 兼容层。
 - **FWD/BWD compute 不并行**：autograd 的 stream 行为决定了 BWD 必然跑在 forward 流上，目前接受这个事实。
 - **OVERLAP_F_B 未对 P2P 适配**：本 PR 只完成了 OVERLAP_B_F 路径的 `overlap_p2p=True` 适配，对称的 F_B 需类似改造。
 
@@ -292,8 +289,7 @@ losses = schedule.run(*inputs)
 
 1. **FWD/BWD 双向独立 PG**：避免 HCCL P2P group 内序列化，让 FWD-RECV 与 BWD-RECV 在两条 HCCL 流上真正并发。
 2. **CUDA Graph / 静态化**：把 OVERLAP_B_F 内的 dispatch/combine/compute kernel 序列做成 graph，进一步降低 host 侧 dispatch overhead。
-3. **MindSpore 适配**：实现 `differentiable_sync_hook` MindSpore 版（autograd 兼容层）。
-4. **FWD compute 与 BWD compute 真并行**：方案上需要重新设计 forward 时的 stream 分配（比如 forward 时就把 chunk 分到两条流上），属于较大改动。
+3. **FWD compute 与 BWD compute 真并行**：方案上需要重新设计 forward 时的 stream 分配（比如 forward 时就把 chunk 分到两条流上），属于较大改动。
 
 ---
 

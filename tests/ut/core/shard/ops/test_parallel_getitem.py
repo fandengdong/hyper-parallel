@@ -32,7 +32,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
 
 getitem_op = GetItemDistributedOp("__getitem__")
@@ -59,12 +59,13 @@ class TestGetItemDistributedOp(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+    def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes used across tests."""
-        if platform_type is not None:
-            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x2_mesh(self, mock_platform):
         """Set up mock and return a standard 2x2 (dp, mp) mesh."""
@@ -826,8 +827,7 @@ class TestGetItemDistributedOp(unittest.TestCase):
     # ===== preprocess tests =====
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    @patch("hyper_parallel.core.shard.ops.parallel_getitem.platform")
-    def test_preprocess_basic(self, mock_op_platform, mock_dt_platform):
+    def test_preprocess_basic(self, mock_dt_platform):
         """
         Feature: preprocess for basic indexing.
         Description: Verify preprocess normalizes args and builds cache_values.
@@ -835,9 +835,6 @@ class TestGetItemDistributedOp(unittest.TestCase):
         """
         mesh = self._make_2x2_mesh(mock_dt_platform)
         self_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-
-        mock_bool = MagicMock()
-        mock_op_platform.bool = mock_bool
 
         mock_tensor = self._make_mock_dtensor(self_layout, "local_tensor_data")
         local_args, local_kwargs, cache_values = getitem_op.preprocess(
