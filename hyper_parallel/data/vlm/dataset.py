@@ -176,8 +176,46 @@ def build_vlm_dataset(
         raise ValueError(f"Unsupported VLM source type: {data_config.get('source_type')!r}")
     if data_path is None:
         raise ValueError("online VLM dataset requires data_path")
-    return _TransformDataset(VLMDataset(data_path), transform,
-                             filter_trainable=filter_trainable)
+    dataset = _TransformDataset(VLMDataset(data_path), transform,
+                                filter_trainable=filter_trainable)
+    repeat = int(data_config.get("repeat", 1) or 1)
+    return _RepeatedDataset(dataset, repeat) if repeat > 1 else dataset
+
+
+class _RepeatedDataset(Dataset):
+    """Repeat a map-style dataset over a multiplied index space.
+
+    The dynamic batch loader defines no ``__len__``, so the trainer falls back to
+    "one epoch = ``train_iters`` steps" (``TrainerBase._resolve_train_plan``).  A
+    source that holds fewer steps than that exhausts mid-schedule, and because ranks
+    run out at slightly different steps the job does not stop -- it deadlocks in the
+    next collective (observed: COCO's 157,712 records at ~3k samples/step exhausted
+    after 51 of 1800 steps, then an ALLREDUCE dispatch timeout).  Repeating the index
+    space keeps the source ahead of the schedule.
+    """
+
+    def __init__(self, dataset: Dataset, repeat: int) -> None:
+        """Wrap ``dataset`` so it can be read ``repeat`` times over.
+
+        Args:
+            dataset: Map-style source dataset.
+            repeat: Number of passes to expose; must be positive.
+        """
+        if repeat < 1:
+            raise ValueError(f"repeat must be positive, got {repeat}")
+        self.dataset = dataset
+        self.repeat = int(repeat)
+
+    def __len__(self) -> int:
+        """Return the multiplied length of the wrapped dataset."""
+        return len(self.dataset) * self.repeat
+
+    def __getitem__(self, index: int) -> Any:
+        """Map an index onto the wrapped dataset, wrapping around each pass."""
+        length = len(self.dataset)
+        if length <= 0:
+            raise IndexError("cannot index an empty dataset")
+        return self.dataset[index % length]
 
 
 __all__ = ["VLMDataset", "build_vlm_dataset"]
