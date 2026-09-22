@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,14 @@ is explicit, never inferred. Each adapter maps
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+import math
+from typing import Optional
+
 import torch
+
+# float32 represents every integer up to 2**24 exactly, so a smaller expert count
+# can use the AICore float sort (see ``experts._SORT_KEY_FP32_LIMIT``).
+_SORT_KEY_FP32_LIMIT = 1 << 24
 
 
 def _softmax_topk_router(module, hidden_states):
@@ -134,6 +141,90 @@ def _sigmoid_group_router(module, hidden_states):
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
     topk_w = topk_w * float(_attr("routed_scaling_factor", 1.0))
     return topk_idx, topk_w
+
+
+def apply_capacity_limit(
+    topk_idx: "torch.Tensor",
+    capacity_factor: Optional[float],
+    num_experts: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """First-come capacity mask for a routed assignment (MoE token dropping).
+
+    Real routing is skewed: on the 2-SN benchmark the busiest rank has been measured at
+    **6x** the mean token count.  A rank's expert buffers are sized by the rows it
+    receives, so that skew -- not the balanced case -- decides whether the step fits in
+    memory: at GBS 256 / seq 8192 the balanced peak is 41.5 GB while real routing reached
+    55.3 GiB and failed to allocate a 5.23 GiB expert output.  Every *switch* that does not
+    change the routed row count (GBS, prefetch depth, ``swap_inputs``, ``overlap_shared_expert``,
+    even a 25% shorter sequence) bought at most 1.8 GB, because none of them bound the
+    busiest rank.
+
+    Capping each expert at ``capacity_factor x (T*K / E)`` slots bounds it directly, which is
+    the standard GShard/Switch/Megatron answer to routing skew.  Tokens beyond capacity are
+    *dropped* (their contribution is removed), so this changes the model, exactly as it does
+    in those implementations; the returned drop rate is what makes the trade measurable.
+
+    The policy is deterministic and cheap: an expert-major sort gives every slot a rank inside
+    its expert, and the first ``capacity`` slots of each expert are kept.  Which slots inside an
+    expert survive is decided by that sort, so it is not necessarily "first in token order" --
+    see :func:`_expert_major_order`; the *count* kept per expert, which is what bounds the
+    busiest rank, is unaffected.  No host synchronisation is needed for the mask itself.
+
+    Args:
+        topk_idx: Routed expert per slot, shape ``[T, K]``.
+        capacity_factor: Multiplier on the mean load, or ``None`` to disable the cap.
+        num_experts: Total routed experts ``E``.
+
+    Returns:
+        ``(keep, dropped)`` where ``keep`` is a bool tensor shaped like ``topk_idx`` and
+        ``dropped`` is the number of dropped slots as a 0-dim tensor on the plan's device.
+        Draining it costs a host sync, so callers must not read it on the hot path -- the one
+        caller logs it once and then sparsely (see ``ep_routed_dispatch``).
+    """
+    if capacity_factor is None or float(capacity_factor) <= 0:
+        return (
+            torch.ones_like(topk_idx, dtype=torch.bool),
+            torch.zeros((), dtype=torch.int64, device=topk_idx.device),
+        )
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+
+    flat_expert = topk_idx.reshape(-1).to(torch.int64)
+    slots = flat_expert.numel()
+    capacity = int(math.ceil(float(capacity_factor) * slots / float(num_experts)))
+    keep_flat = torch.zeros_like(flat_expert, dtype=torch.bool)
+    if capacity > 0:
+        order = _expert_major_order(flat_expert, num_experts)
+        counts = torch.bincount(flat_expert, minlength=num_experts)
+        starts = torch.cumsum(counts, dim=0) - counts
+        ranks = torch.arange(slots, device=flat_expert.device) - starts[flat_expert[order]]
+        keep_flat[order] = ranks < capacity
+    # ``dropped`` stays a device tensor on purpose: draining it costs a host sync, and this
+    # runs once per MoE layer, so callers that want the number must ask for it explicitly
+    # (they log it once, see ``ep_routed_dispatch``) instead of paying it every layer.
+    return keep_flat.view_as(topk_idx), (~keep_flat).sum()
+
+
+def _expert_major_order(flat_expert: "torch.Tensor", num_experts: int) -> "torch.Tensor":
+    """Return the permutation that groups slots by expert.
+
+    Integer ``argsort`` has no AICore kernel on this stack (the same reason
+    ``HP_EP_SORT_FP32`` exists for the dispatch sort), so keys are cast to float32 when the
+    expert count is exactly representable.  Ties inside one expert may then be ordered
+    arbitrarily rather than by token: the *count* kept per expert -- which is what bounds the
+    busiest rank's memory -- is unaffected, and the result is still deterministic for a given
+    input and backend.
+
+    Args:
+        flat_expert: Expert index of every routed slot, shape ``[T*K]``.
+        num_experts: Size of the expert index space.
+
+    Returns:
+        An int64 permutation of ``range(flat_expert.numel())`` ordering slots by expert.
+    """
+    if 0 < num_experts <= _SORT_KEY_FP32_LIMIT:
+        return flat_expert.to(torch.float32).argsort()
+    return torch.argsort(flat_expert, stable=True)
 
 
 def _global_expert_count(module):

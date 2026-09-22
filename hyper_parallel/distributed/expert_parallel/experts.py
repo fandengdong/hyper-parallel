@@ -53,6 +53,9 @@ from hyper_parallel.core.expert_parallel.static_splits import (
     static_plan_key,
     store_static_plan,
 )
+from hyper_parallel.distributed.expert_parallel.routing import (
+    apply_capacity_limit,
+)
 from hyper_parallel.distributed.expert_parallel.collectives import (
     ep_all_to_all,
     ep_all_to_all_async,
@@ -162,6 +165,8 @@ _DISPATCH_CHUNKS_RAW = os.environ.get("HP_EP_DISPATCH_CHUNKS", "1")
 # the eager kernel spent ~half of its span overlapped with communication.
 _SOURCE_INDEX_MODES = ("legacy", "expand", "div")
 _SOURCE_INDEX_MODE = os.environ.get("HP_EP_SOURCE_INDEX", "expand").lower()
+# Dispatch counter for the sparse capacity-limit log (see ep_routed_dispatch).
+_CAPACITY_SYNC_COUNT = 0
 
 
 def _argsort_keys(keys: torch.Tensor, *, bound: int) -> torch.Tensor:
@@ -327,6 +332,36 @@ def bind_local_expert_forward(
     _install_bound_forward(module.experts, _local_swiglu_expert_forward)
 
 
+def _resolve_capacity_factor(module: Any) -> Optional[float]:
+    """Return the configured expert capacity factor, or ``None`` when it is off.
+
+    Resolution order: the ``HP_EP_CAPACITY_FACTOR`` env override (handy for a sweep without
+    editing YAML), then the MoE block's own ``capacity_factor`` attribute (set by the EP recipe
+    from ``plan_overrides[].local_compute_fn``), then off.  Off is the default, so an
+    unconfigured run keeps the previous behaviour exactly.
+
+    Args:
+        module: MoE block (``None`` is tolerated for callers without one).
+
+    Returns:
+        A positive float, or ``None`` when the capacity limit is disabled.
+    """
+    override = os.environ.get("HP_EP_CAPACITY_FACTOR", "").strip()
+    if override:
+        try:
+            value = float(override)
+        except ValueError:
+            logger.warning(
+                "HP_EP_CAPACITY_FACTOR=%r is not a number; capacity limit stays off", override)
+            return None
+        return value if value > 0 else None
+    value = getattr(getattr(module, "experts", None), "capacity_factor", None)
+    if value is None:
+        return None
+    value = float(value)
+    return value if value > 0 else None
+
+
 def _routed_slot_token_ids(token_count: int, experts_per_token: int, device: Any) -> torch.Tensor:
     """Return the source token of every routed slot, as an index tensor.
 
@@ -375,14 +410,32 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
+    keep: Optional[torch.Tensor] = None,
 ) -> _EPDispatch:
-    """Sort routed tokens and exchange per-rank dispatch counts."""
+    """Sort routed tokens and exchange per-rank dispatch counts.
+
+    ``keep`` is an optional ``[T, K]`` bool mask (see
+    :func:`routing.apply_capacity_limit`).  It compacts the routed slots *before* anything is
+    exchanged: dropped slots never become rows, which is the entire point of a capacity limit,
+    because a rank's expert buffers are sized by the rows it receives.  The rest of the
+    pipeline is already ragged-safe -- the expert compute is row-based, and the combine
+    accumulates with ``index_add_`` over ``source_indices`` -- so a token with fewer than ``K``
+    surviving slots simply receives fewer contributions.
+    """
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     token_count = flattened_states.shape[0]
     experts_per_token = topk_indices.shape[1]
-    expert_indices = topk_indices.reshape(-1)
-    expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
-    source_indices = _routed_slot_token_ids(token_count, experts_per_token, flattened_states.device)
+    if keep is None:
+        expert_indices = topk_indices.reshape(-1)
+        expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
+        source_indices = _routed_slot_token_ids(
+            token_count, experts_per_token, flattened_states.device)
+    else:
+        flat_keep = keep.reshape(-1)
+        expert_indices = topk_indices.reshape(-1)[flat_keep]
+        expert_weights = topk_weights.reshape(-1)[flat_keep].to(flattened_states.dtype)
+        source_indices = _routed_slot_token_ids(
+            token_count, experts_per_token, flattened_states.device)[flat_keep]
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = _argsort_keys(
         destination_ranks * global_expert_count + expert_indices,
@@ -1099,6 +1152,24 @@ def ep_routed_dispatch(
 
     batch_size, sequence_length, hidden_size = hidden_states.shape
     topk_indices, topk_weights = router_fn(module, hidden_states)
+    capacity_factor = _resolve_capacity_factor(module)
+    keep = None
+    if capacity_factor is not None:
+        keep, dropped = apply_capacity_limit(
+            topk_indices, capacity_factor, global_expert_count)
+        # Draining the drop count is a host sync, so pay it on the first dispatch and then
+        # sparsely -- never once per layer, which is what made the first sweep look +90%.
+        global _CAPACITY_SYNC_COUNT  # pylint: disable=global-statement
+        _CAPACITY_SYNC_COUNT += 1
+        if _CAPACITY_SYNC_COUNT == 1 or _CAPACITY_SYNC_COUNT % 200 == 0:
+            total_slots = topk_indices.numel()
+            dropped_slots = int(dropped.item())
+            logger.info(
+                "EP capacity limit: factor=%s dropped %.2f%% of routed slots (%d experts, "
+                "call %d)",
+                capacity_factor, 100.0 * dropped_slots / max(total_slots, 1),
+                global_expert_count, _CAPACITY_SYNC_COUNT,
+            )
     dispatch = _prepare_ep_dispatch(
         hidden_states,
         topk_indices,
@@ -1107,6 +1178,7 @@ def ep_routed_dispatch(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        keep=keep,
     )
     source_token_indices = dispatch.source_indices
     flattened_expert_weights = dispatch.expert_weights

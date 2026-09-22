@@ -145,6 +145,7 @@ def build_ep_compute(
     expected_attrs,
     combine: Callable,
     use_grouped_gemm: bool = False,
+    capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
@@ -179,6 +180,11 @@ def build_ep_compute(
         # Keep the established call contract unchanged for every reference
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
+
+    if capacity_factor is not None:
+        # Read back by ``experts._resolve_capacity_factor``; bounds each expert's routed slots
+        # so the busiest rank's buffers cannot blow up under a skewed real router.
+        module.experts.capacity_factor = float(capacity_factor)
 
     if overlap_fn is None:
         def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -315,6 +321,7 @@ def deepseekv3_ep_compute_fn(
     use_grouped_gemm: bool = False,
     overlap_shared_expert: bool = False,
     fix_router: bool = False,
+    capacity_factor: Optional[float] = None,
 ) -> Callable:
     """Archetype ``deepseekv3_sigmoid_group_shared``: sigmoid group-limited
     routing (with e_score_correction_bias / routed_scaling_factor, already
@@ -368,6 +375,7 @@ def deepseekv3_ep_compute_fn(
         expected_attrs=["gate", "experts", "shared_experts"],
         combine=combine,
         use_grouped_gemm=use_grouped_gemm,
+        capacity_factor=capacity_factor,
         overlap_fn=overlap_shared if overlap_shared_expert else None,
     )
 
