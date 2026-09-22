@@ -146,3 +146,24 @@ model/tokenizer loading into `local_files_only` mode. The Offline launcher also
 validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
+
+## Performance reproduction package
+
+`examples/training_demo/perf_kimi_k26_2sn/` collects the current best Kimi-K2.6
+VLM configuration at every measured scale, together with the numbers they were
+measured at and the scoreboard:
+
+- `configs/256card_2sn/gbs4096_rbwd_true.yaml` — 256-card (2 super-node) champion;
+  GBS 4096, 18.364 s equivalent GBS-256 step, 113,400 padded tok/s, MFU 28.05%
+- `configs/512card_4sn/`, `configs/384card_3sn/`, `configs/128card_1sn/` — the same
+  at the other scales
+- `configs/realdata_2sn/coco2017_2sn_8k_packed_cap45.yaml` — the real-data 8K
+  packing line (a different measurement basis from the synthetic throughput arms)
+- `reports/CURRENT_BEST.md` — full scoreboard, including the directions that are
+  already closed with measurements
+
+Its `README.md` lists the prerequisites (the model directory and dataset paths are
+absolute and must be edited), the exact `torchrun` invocation, and the criteria for
+confirming a reproduction. Note that these throughput configs read only the model's
+`config.json` and processor files — the 1.9T weights are not loaded unless
+`load_pretrained: true` is added.
