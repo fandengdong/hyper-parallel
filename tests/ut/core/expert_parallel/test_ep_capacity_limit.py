@@ -41,6 +41,7 @@ import torch
 
 from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 from hyper_parallel.distributed.expert_parallel.experts import (
+    _aggregate_ep_outputs,
     _prepare_ep_dispatch,
     _resolve_capacity_factor,
     _routed_slot_token_ids,
@@ -80,6 +81,14 @@ def _counts_per_expert(keep, topk_idx, num_experts):
 def _capacity_of(factor, slots, num_experts):
     """The cap ``apply_capacity_limit`` documents: ``ceil(factor * slots / E)``."""
     return int(math.ceil(float(factor) * slots / float(num_experts)))
+
+
+def _assignment(counts):
+    """Build a ``[T, 1]`` assignment whose per-expert hit counts match ``counts``."""
+    experts = []
+    for expert, count in enumerate(counts):
+        experts.extend([expert] * count)
+    return torch.tensor(experts, dtype=torch.int64).unsqueeze(1)
 
 
 # Skewed plan: expert 0 draws 4 of the 8 slots, expert 3 draws none.
@@ -177,6 +186,32 @@ class TestApplyCapacityLimit(unittest.TestCase):
         second, second_dropped = apply_capacity_limit(_SKEWED, 0.75, _SKEWED_EXPERTS)
         self.assertTrue(torch.equal(first, second))
         self.assertEqual(int(first_dropped), int(second_dropped))
+
+    def test_a_larger_factor_drops_less(self):
+        """Feature: capacity limit monotonicity.
+
+        Description: Raise the factor from below the mean load to well above the skew.
+        Expectation: The dropped count never grows with the factor, and a factor above
+            the skew drops nothing -- so the knob moves in one direction only.
+        """
+        plan = _assignment([8, 0, 0, 0])
+        dropped = [
+            int(apply_capacity_limit(plan, factor, 4)[1])
+            for factor in (0.5, 1.0, 2.0, 4.0, 8.0)
+        ]
+        self.assertEqual(dropped, sorted(dropped, reverse=True))
+        self.assertEqual(dropped[-1], 0)
+
+    def test_a_token_keeps_a_slot_while_an_expert_has_room(self):
+        """Feature: capacity limit per-expert policy.
+
+        Description: Give every token the same two-expert assignment.
+        Expectation: The cap is applied per expert, so a token routed to two experts
+            still contributes through whichever slot survived.
+        """
+        plan = torch.tensor([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=torch.int64)
+        keep, _ = apply_capacity_limit(plan, 1.0, 2)
+        self.assertTrue(bool((keep.sum(dim=1) >= 1).all()))
 
     def test_mask_shape_follows_the_routed_shape(self):
         """Feature: capacity limit shape contract.
@@ -314,6 +349,9 @@ class TestDispatchCapacityCompaction(unittest.TestCase):
         for patcher in self._patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
+        # One fixed hidden batch: ``states`` can then be compared between calls.
+        torch.manual_seed(7)
+        self.hidden = torch.randn(4, self._HIDDEN)
 
     @staticmethod
     def _identity_exchange(output_tensor, input_tensor, group=None):
@@ -323,9 +361,8 @@ class TestDispatchCapacityCompaction(unittest.TestCase):
 
     def _dispatch(self, topk_indices, topk_weights, keep=None):
         """Run ``_prepare_ep_dispatch`` on a small CPU plan and keep the input too."""
-        hidden = torch.randn(4, self._HIDDEN)
         dispatch = _prepare_ep_dispatch(
-            hidden,
+            self.hidden,
             topk_indices,
             topk_weights,
             local_expert_count=self._LOCAL_EXPERTS,
@@ -334,7 +371,7 @@ class TestDispatchCapacityCompaction(unittest.TestCase):
             ep_group="ep-group",
             keep=keep,
         )
-        return hidden, dispatch
+        return self.hidden, dispatch
 
     def _plan(self):
         """A skewed ``[T, K]`` top-k plan with float weights."""
@@ -392,6 +429,64 @@ class TestDispatchCapacityCompaction(unittest.TestCase):
         self.assertTrue(torch.equal(
             dispatch.states, hidden[expected_sources[order]]))
         self.assertEqual(sum(dispatch.send_counts), total)
+
+    def test_an_all_true_mask_is_bit_identical_to_no_mask(self):
+        """Feature: capacity limit off by default.
+
+        Description: Dispatch once with ``keep=None`` and once with an all-True mask.
+        Expectation: Every field is bit-identical, so "off" is a true no-op rather than
+            an extra identity-selection pass.
+        """
+        topk_indices, topk_weights = self._plan()
+        _, dense = self._dispatch(topk_indices, topk_weights, keep=None)
+        _, all_keep = self._dispatch(
+            topk_indices,
+            topk_weights,
+            keep=torch.ones_like(topk_indices, dtype=torch.bool),
+        )
+        for field in ("source_indices", "expert_weights", "expert_indices",
+                      "dispatch_order", "states"):
+            self.assertTrue(
+                torch.equal(getattr(dense, field), getattr(all_keep, field)),
+                f"{field} differs between the dense and all-True dispatches",
+            )
+
+    def test_aggregation_matches_the_dense_drop_reference(self):
+        """Feature: capacity-limited aggregation.
+
+        Description: Aggregate synthetic expert outputs over the compacted dispatch and
+            compare against the dense reference with every dropped slot's weight zeroed.
+        Expectation: The two agree, so dropping removes a slot's contribution and
+            nothing else -- the surviving arithmetic is unchanged.
+        """
+        topk_indices, topk_weights = self._plan()
+        keep, _ = apply_capacity_limit(topk_indices, 1.0, self._GLOBAL_EXPERTS)
+        _, dispatch = self._dispatch(topk_indices, topk_weights, keep=keep)
+
+        rows = dispatch.source_indices.numel()
+        expert_out = torch.arange(rows, dtype=torch.float32).unsqueeze(1) * torch.ones(
+            1, self._HIDDEN)
+        aggregated = _aggregate_ep_outputs(
+            expert_out,
+            dispatch.expert_weights,
+            dispatch.source_indices,
+            dispatch.dispatch_order,
+            (1, 4, self._HIDDEN),
+        )
+
+        flat_keep = keep.reshape(-1)
+        kept_positions = flat_keep.nonzero().reshape(-1)
+        order = dispatch.dispatch_order
+        # ``expert_out`` arrives in exchange order, so it lands on the slots ``order`` names.
+        dense_rows = torch.zeros(topk_indices.numel(), self._HIDDEN)
+        dense_rows[kept_positions[order]] = expert_out
+        dense_weights = torch.zeros(topk_indices.numel(), dtype=self.hidden.dtype)
+        dense_weights[kept_positions[order]] = dispatch.expert_weights[order]
+        dense_source = _routed_slot_token_ids(
+            4, topk_indices.shape[1], topk_indices.device)
+        reference = torch.zeros(4, self._HIDDEN)
+        reference.index_add_(0, dense_source, dense_rows * dense_weights.unsqueeze(-1))
+        self.assertTrue(torch.allclose(aggregated.view(4, self._HIDDEN), reference))
 
     def test_dropping_does_not_change_the_surviving_rows(self):
         """Feature: capacity-limited dispatch equivalence.
