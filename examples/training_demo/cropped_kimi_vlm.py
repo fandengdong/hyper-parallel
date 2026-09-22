@@ -16,13 +16,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from transformers import AutoConfig, PreTrainedModel
 
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models._transformers import HyperAutoModelForImageTextToText
+from hyper_parallel.models._transformers.checkpoint_loader import load_pretrained_weights
 from hyper_parallel.models.build_options import CompileConfig
+
+logger = logging.getLogger(__name__)
 
 
 def build_cropped_kimi_vlm(
@@ -42,8 +46,13 @@ def build_cropped_kimi_vlm(
         activation_swap: str = "none",
         swap_inputs: bool = False,
         freeze_patterns: list[str] | None = None,
+        load_pretrained: bool = False,
 ) -> PreTrainedModel:
-    """Create a randomly initialized Kimi-K2.5/K2.6 VLM with a cropped text tower.
+    """Create a Kimi-K2.5/K2.6 VLM with a cropped text tower.
+
+    Weights are randomly initialized by default (the throughput arms only need the
+    geometry); pass ``load_pretrained=True`` together with a checkpoint path to
+    load the real weights instead.
 
     Reads the top-level ``Kimi_K25Config`` natively (never the repo's
     remote-code classes), crops only the nested text tower, keeps the 27-layer
@@ -81,6 +90,12 @@ def build_cropped_kimi_vlm(
             host memory during the forward pass. Independent of
             ``activation_swap``; requires ``activation_checkpoint`` to be
             ``"full"`` or ``"selective"``.
+        load_pretrained: Load the Hugging Face weights from ``model_dir`` instead
+            of keeping the random initialization. ``config_path`` still selects
+            the configuration, so a cropped geometry with full weights would be a
+            mismatch: use this with ``num_hidden_layers`` / ``n_routed_experts``
+            matching the checkpoint. Loading is strict -- a partially matching
+            checkpoint raises rather than silently training a half-random model.
         freeze_patterns: Module-name globs whose parameters are frozen
             (``requires_grad = False``) before plan/FSDP derivation, applied with
             ``fnmatch`` against each module's fully qualified name. Freezing the
@@ -89,7 +104,9 @@ def build_cropped_kimi_vlm(
             like-for-like comparison against a pipeline that freezes it.
 
     Returns:
-        A parallelized, randomly initialized ``KimiK25ForConditionalGeneration``.
+        A parallelized ``KimiK25ForConditionalGeneration``, loaded from
+        ``model_dir`` when ``load_pretrained`` is set and randomly initialized
+        otherwise.
 
     Note:
         The demo drives the model with an offline content-list dataset (see
@@ -168,6 +185,13 @@ def build_cropped_kimi_vlm(
         )
     finally:
         _kimi_mod.Kimi_K25PreTrainedModel._init_weights = _orig_init_weights
+
+    if load_pretrained:
+        # ``from_config`` never loads weights by design, so a real training run has
+        # to say so explicitly.  This is the same load the ``from_pretrained`` entry
+        # point performs internally, applied to the already-sharded model.
+        load_pretrained_weights(model, model_dir, strict=True)
+        logger.info("Loaded pretrained weights for the Kimi VLM from %s", model_dir)
 
     mesh_context = getattr(distributed_setup, "mesh_context", None)
     if mesh_context is not None and int(getattr(mesh_context, "cp_size", 1)) > 1:
