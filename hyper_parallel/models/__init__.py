@@ -41,9 +41,12 @@ from hyper_parallel.models.build_options import (
     normalize_build_options,
 )
 from hyper_parallel.models.flops import (
+    VisionFlopsEstimate,
     batch_seq_len,
     estimate_flops_per_token,
+    estimate_vision_flops,
     resolve_flops_per_token,
+    resolve_vision_flops,
 )
 
 if TYPE_CHECKING:
@@ -69,12 +72,15 @@ __all__ = [
     "HyperAutoModelForSequenceClassification",
     "ModelAdapterSpec",
     "ModelBuildOptions",
+    "VisionFlopsEstimate",
     "batch_seq_len",
     "estimate_flops_per_token",
+    "estimate_vision_flops",
     "get_model_adapter",
     "normalize_build_options",
     "register_model_adapter",
     "resolve_flops_per_token",
+    "resolve_vision_flops",
 ]
 
 

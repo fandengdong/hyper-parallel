@@ -37,10 +37,18 @@ Qwen-MoE (``num_experts`` / ``num_experts_per_tok`` /
 both accepted. The estimate is architecture-agnostic and approximate by
 design — model families that need an exact value may expose
 ``model.hp_flops_per_token``, which :func:`resolve_flops_per_token` prefers.
+
+Vision towers are accounted separately, because their cost scales with the image
+patches in the batch rather than with ``input_ids``: :func:`estimate_vision_flops`
+returns a per-patch cost model that the environment meter evaluates against the
+patches actually seen in each step.  Without it a VLM step that pushes 10 images
+(16,560 patches) through the tower per rank is charged only for its language
+tokens, which understates TFLOPS/MFU/HFU and makes image-heavy and text-only
+configurations incomparable.
 """
 
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 
 _LAYER_FIELDS = ("num_hidden_layers", "n_layers", "num_layers")
@@ -49,6 +57,14 @@ _HEAD_FIELDS = ("num_attention_heads", "n_heads", "n_head")
 _KV_HEAD_FIELDS = ("num_key_value_heads", "n_kv_heads")
 _ROUTED_EXPERT_FIELDS = ("n_routed_experts", "num_experts")
 _TOPK_FIELDS = ("num_experts_per_tok", "moe_topk", "moe_router_topk", "top_k", "topk")
+
+# Vision-tower geometry.  Multimodal configs keep it in a sub-config whose field
+# names are family specific: Kimi-K2.x uses ``vt_*``, most others HF defaults.
+_VISION_CONFIG_FIELDS = ("vision_config", "vision_tower_config", "vision_encoder_config")
+_VISION_LAYER_FIELDS = ("vt_num_hidden_layers", "num_hidden_layers", "n_layers", "depth", "num_layers")
+_VISION_HIDDEN_FIELDS = ("vt_hidden_size", "hidden_size", "mm_hidden_size", "embed_dim", "dim")
+_VISION_INTER_FIELDS = ("vt_intermediate_size", "intermediate_size", "mlp_hidden_size", "ffn_dim")
+_VISION_HEAD_FIELDS = ("vt_num_attention_heads", "num_attention_heads", "n_heads", "num_heads")
 
 
 def _read(config: Any, *names: str) -> Optional[Any]:
@@ -232,6 +248,110 @@ def resolve_flops_per_token(
     if model_config is None:
         return None
     return estimate_flops_per_token(model_config, seq_len)
+
+
+class VisionFlopsEstimate(NamedTuple):
+    """Vision-tower training FLOPs, split into a per-patch and a quadratic part.
+
+    The tower runs dense ops over every patch of every image in the batch, so its
+    cost does not scale with ``input_ids`` and cannot be folded into
+    ``flops_per_token``; it is accounted separately and added to the TFLOPS
+    numerator by the environment meter.
+
+    Evaluation is ``per_patch * total_patches + attention_coefficient * sum(p_i**2)``
+    where ``p_i`` is the patch count of image *i*.  Attention is computed inside one
+    image only, so the quadratic term uses each image's own patch count rather than
+    the batch-wide patch total -- a batch of 10 x 1656 patches is 10x cheaper in
+    attention than one 16560-patch image, and folding it into a single number would
+    overstate the tower by the average patch count.
+    """
+
+    per_patch: float
+    attention_coefficient: float
+    total_params: float
+
+    def flops(self, total_patches: int, patch_square_sum: Optional[int] = None) -> float:
+        """Return training FLOPs for a batch of ``total_patches`` vision patches.
+
+        Args:
+            total_patches: Patch rows processed by the tower in the step.
+            patch_square_sum: ``sum(p_i ** 2)`` over the batch's images; when
+                omitted the attention part is skipped rather than guessed.
+
+        Returns:
+            Estimated forward+backward FLOPs for the vision tower.
+        """
+        flops = self.per_patch * float(total_patches)
+        if patch_square_sum:
+            flops += self.attention_coefficient * float(patch_square_sum)
+        return flops
+
+
+def estimate_vision_flops(config: Any) -> Optional[VisionFlopsEstimate]:
+    """Estimate vision-tower FLOPs per patch from a multimodal config's geometry.
+
+    Uses the same 6N convention as :func:`estimate_flops_per_token`: every matmul
+    parameter costs ``6 * params`` FLOPs per patch (forward + backward), with a
+    ViT layer counted as ``4 * hidden**2`` (q/k/v/out projections) plus
+    ``2 * hidden * intermediate`` (ungated MLP).  The attention score/weight
+    matmuls contribute ``6 * layers * heads * (qk_dim + v_dim) * p_i`` per patch,
+    i.e. a quadratic term over each image's own patch count.  Patch-embedding,
+    position embeddings (including Kimi's divided-fixed 2D/3D scheme) and the
+    multimodal projector are not counted; they are a small constant next to the
+    tower's depth.
+
+    Args:
+        config: HF-style multimodal config; attribute access or plain mapping.
+            Text-only configs have no vision sub-config and yield ``None``, which
+            keeps the metric unchanged for language-only training.
+
+    Returns:
+        The per-patch cost model, or ``None`` when no vision geometry is present.
+    """
+    if config is None:
+        return None
+    vision = _read(config, *_VISION_CONFIG_FIELDS)
+    if vision is None:
+        return None
+    layers = _read_float(vision, *_VISION_LAYER_FIELDS)
+    hidden = _read_float(vision, *_VISION_HIDDEN_FIELDS)
+    if not layers or not hidden:
+        return None
+    intermediate = _read_float(vision, *_VISION_INTER_FIELDS) or 4.0 * hidden
+    heads = _read_float(vision, *_VISION_HEAD_FIELDS) or 0.0
+    layers = int(layers)
+    params_per_layer = 4.0 * hidden * hidden + 2.0 * hidden * intermediate
+    # heads * (qk_dim + v_dim) == 2 * hidden for a standard ViT, so the quadratic
+    # coefficient needs only the head count being present, not its value.
+    head_dim_sum = 2.0 * hidden if heads else 0.0
+    return VisionFlopsEstimate(
+        per_patch=6.0 * params_per_layer * layers,
+        attention_coefficient=6.0 * layers * head_dim_sum if heads else 0.0,
+        total_params=params_per_layer * layers,
+    )
+
+
+def resolve_vision_flops(
+    model: Any,
+    model_config: Any = None,
+) -> Optional[VisionFlopsEstimate]:
+    """Resolve the vision-tower cost model: the model's own value wins, else estimate.
+
+    Args:
+        model: Built model instance; a family may expose ``hp_vision_flops`` with
+            an exact derivation.
+        model_config: HF-style config used by the generic estimator; defaults to
+            ``model.config``.
+
+    Returns:
+        The cost model, or ``None`` for a text-only model.
+    """
+    value = getattr(model, "hp_vision_flops", None) if model is not None else None
+    if isinstance(value, VisionFlopsEstimate):
+        return value
+    if model_config is None and model is not None:
+        model_config = getattr(model, "config", None)
+    return estimate_vision_flops(model_config)
 
 
 def resolve_recompute_factor(

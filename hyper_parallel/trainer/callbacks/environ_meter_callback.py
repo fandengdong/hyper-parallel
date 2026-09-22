@@ -18,7 +18,12 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
 
-from hyper_parallel.models.flops import batch_seq_len, resolve_flops_per_token, resolve_recompute_factor
+from hyper_parallel.models.flops import (
+    batch_seq_len,
+    resolve_flops_per_token,
+    resolve_recompute_factor,
+    resolve_vision_flops,
+)
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -48,6 +53,12 @@ class EnvironMeterCallback(Callback):
         # dense ops over the padded batch, so this is the TFLOPS/MFU basis.
         self._local_step_padded_tokens = 0
         self._local_step_samples = 0
+        # Vision patches are the tower's analogue of padded tokens: the tower runs
+        # over every patch of every image, so its FLOPs scale with this count and
+        # not with ``input_ids``.  ``_local_step_vision_patches_sq`` accumulates
+        # ``sum(p_i ** 2)`` because attention is computed inside one image only.
+        self._local_step_vision_patches = 0
+        self._local_step_vision_patches_sq = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
         self.trainer.step_train_metrics = {}
@@ -58,6 +69,8 @@ class EnvironMeterCallback(Callback):
         # length observed from the first training batch. Resolution is lazy
         # so callback-vs-model init order does not matter.
         self._flops_per_token: Optional[float] = None  # resolved lazily
+        self._vision_flops: Any = None  # resolved lazily; None = text-only model
+        self._vision_flops_resolved = False
         self._seq_len: Optional[int] = None  # captured from the first batch
         self._peak_tflops = trainer.config.training.peak_tflops
 
@@ -73,6 +86,23 @@ class EnvironMeterCallback(Callback):
         if value:
             self._flops_per_token = value
         return self._flops_per_token
+
+    def _resolve_vision_flops(self) -> Any:
+        """Resolve the vision-tower cost model lazily, once.
+
+        Returns:
+            A ``VisionFlopsEstimate`` for a multimodal model, else ``None``; the
+            result is cached including the ``None`` case so a text-only model does
+            not re-probe its config every step.
+        """
+        if self._vision_flops_resolved:
+            return self._vision_flops
+        self._vision_flops = resolve_vision_flops(
+            getattr(self.trainer, "model", None),
+            model_config=getattr(self.trainer, "model_config", None),
+        )
+        self._vision_flops_resolved = True
+        return self._vision_flops
 
     def _resolve_seq_len(self) -> Optional[int]:
         """Return the observed batch sequence length or a config fallback."""
@@ -147,6 +177,52 @@ class EnvironMeterCallback(Callback):
         if numel is not None:
             return numel
         return cls._batch_tokens(batch)
+
+    @classmethod
+    def _vision_patch_counts(cls, batch: Mapping[str, Any]) -> Optional[tuple[int, int]]:
+        """Return ``(total_patches, sum(p_i ** 2))`` for one micro-batch.
+
+        ``image_grid_thw`` / ``video_grid_thw`` carry one ``(t, h, w)`` row per
+        media item, so a row's product is that item's patch count -- and hence the
+        tower's sequence length for it.  The square sum is what the attention term
+        needs, because the tower attends within each item only.
+
+        Args:
+            batch: One micro-batch mapping.
+
+        Returns:
+            Patch totals, or ``None`` when the batch carries no vision media.
+        """
+        total = 0
+        square_sum = 0
+        found = False
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = batch.get(key)
+            if grid is None:
+                continue
+            shape = getattr(grid, "shape", None)
+            reshape = getattr(grid, "reshape", None)
+            if shape is None or not callable(reshape) or len(shape) != 2 or int(shape[-1]) != 3:
+                continue
+            counts = reshape(-1, 3)
+            prod = getattr(counts, "prod", None)
+            tolist = getattr(counts, "tolist", None)
+            if not callable(prod) or not callable(tolist):
+                continue
+            for count in prod(1).tolist():
+                count = int(count)
+                total += count
+                square_sum += count * count
+            found = True
+        if found:
+            return total, square_sum
+        # Fallback: the patch rows themselves.  Without a grid, every row is assumed
+        # to belong to one image, which overstates only the attention term.
+        shape = getattr(batch.get("pixel_values"), "shape", None)
+        if shape is not None and len(shape) > 0:
+            total = int(shape[0])
+            return total, total * total
+        return None
 
     @staticmethod
     def _batch_samples(batch: Mapping[str, Any]) -> int:
@@ -301,6 +377,10 @@ class EnvironMeterCallback(Callback):
         self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
         self._local_step_padded_tokens = sum(self._batch_padded_tokens(batch) for batch in batches)
         self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
+        if self._resolve_vision_flops() is not None:
+            counts = [self._vision_patch_counts(batch) for batch in batches]
+            self._local_step_vision_patches = sum(count[0] for count in counts if count)
+            self._local_step_vision_patches_sq = sum(count[1] for count in counts if count)
         self._step_start_time = time.perf_counter()
 
     def on_step_end(
@@ -353,15 +433,34 @@ class EnvironMeterCallback(Callback):
             "data/consumed_samples": float(self._consumed_samples),
             **self._memory_metrics(),
         }
-        if self._resolve_flops_per_token():
-            # Observed TFLOPS = padded tokens/sec x flops/token / 1e12 (6N
-            # convention).  The hardware executes dense ops over the padded
-            # batch, so dividing by only the non-padding tokens would understate
-            # throughput by the padding ratio (severely so for VLM data);
-            # activation-checkpoint recompute is still not useful FLOPs.
-            env_metrics["performance/tflops"] = (
-                padded_tokens_per_second * self._flops_per_token / 1e12
-            )
+        flops_per_token = self._resolve_flops_per_token()
+        vision = self._resolve_vision_flops()
+        global_vision_patches = 0
+        vision_tflops = 0.0
+        if vision is not None:
+            global_vision_patches = int(self._reduce(self._local_step_vision_patches, op="sum"))
+            patch_square_sum = int(self._reduce(self._local_step_vision_patches_sq, op="sum"))
+            env_metrics["data/step_vision_patches"] = float(global_vision_patches)
+            if global_step_time > 0 and global_vision_patches:
+                vision_tflops = (
+                    vision.flops(global_vision_patches, patch_square_sum)
+                    / global_step_time
+                    / 1e12
+                )
+        if flops_per_token or vision_tflops:
+            # Observed TFLOPS = (padded tokens/sec x flops/token) + vision tower,
+            # both in the 6N convention.  The hardware executes dense ops over the
+            # padded batch, so dividing by only the non-padding tokens would
+            # understate throughput by the padding ratio (severely so for VLM
+            # data); activation-checkpoint recompute is still not useful FLOPs.
+            # The vision tower's cost scales with image patches rather than with
+            # input_ids, so it is evaluated from the patches this step actually
+            # carried -- omitting it would make an image-heavy configuration look
+            # slower than an identical text-only one at the same real work.
+            llm_tflops = padded_tokens_per_second * flops_per_token / 1e12 if flops_per_token else 0.0
+            env_metrics["performance/tflops"] = llm_tflops + vision_tflops
+            if vision_tflops:
+                env_metrics["performance/tflops_vision"] = vision_tflops
             if self._peak_tflops:
                 env_metrics["performance/mfu"] = env_metrics["performance/tflops"] / (
                     self._peak_tflops * max(get_world_size_safe(), 1)
