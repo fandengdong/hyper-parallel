@@ -219,6 +219,10 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             group_name = swap_manager.get_current_group_name()
             if not group_name:
                 return tensor
+            if swap_manager.is_last_group(group_name):
+                # Not the group that owns the offload, so the tensor stays on device --
+                # and the original goes back for the same reason as every other path.
+                return tensor
             funcname = f"{group_name}::{tensor.shape}"
             self.storage[self.count_idx].append(
                 SwapTensor(tensor.detach(), funcname, group_swap=group_swap, cpu_pool=cpu_pool)

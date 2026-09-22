@@ -51,7 +51,7 @@ def _make_model() -> nn.Linear:
     return nn.Linear(4, 4)
 
 
-def _mse_train_fn(model, x, y) -> torch.Tensor:
+def _mse_train_fn(model, *, x, y) -> torch.Tensor:
     """Training function: mean-squared error between prediction and target."""
     return ((model(x) - y) ** 2).mean()
 
@@ -80,7 +80,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = comp.forward_backward(torch.randn(2, 4), torch.randn(2, 4))
+        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsNotNone(
             comp._joint_graph, "compile should populate the joint graph"
@@ -100,14 +100,14 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        comp.compile(torch.randn(2, 4), torch.randn(2, 4))
-        loss = comp.forward_backward(torch.randn(2, 4), torch.randn(2, 4))
+        comp.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsInstance(loss, torch.Tensor)
         self.assertIsNotNone(model.weight.grad)
         # An explicit compile must NOT be re-triggered by forward_backward.
         joint = comp._joint_graph
-        comp.forward_backward(torch.randn(2, 4), torch.randn(2, 4))
+        comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
         self.assertIs(comp._joint_graph, joint)
 
     def test_grads_accumulate_across_forward_backward_calls(self):
@@ -125,11 +125,11 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         )
         x, y = _fixed_batch()
 
-        comp.forward_backward(x, y)
+        comp.forward_backward(x=x, y=y)
         first = comp.model.weight.grad.clone()
         self.assertIsNotNone(first)
 
-        comp.forward_backward(x, y)
+        comp.forward_backward(x=x, y=y)
         self.assertTrue(
             torch.allclose(comp.model.weight.grad, 2 * first),
             "an identical second step must double the accumulated gradient",
@@ -148,13 +148,13 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             pass_config=PassConfig(fsdp_enabled=False),
             device=torch.device("cpu"),
         )
-        comp.compile(torch.randn(2, 4), torch.randn(2, 4))
+        comp.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         # Linear has exactly two parameters (weight, bias): hiding one makes
         # the expected trainable count diverge from the graph's grad count.
         comp._joint_graph.graph_module.state_is_param[0] = False
         with self.assertRaises(ValueError):
-            comp.forward_backward(torch.randn(2, 4), torch.randn(2, 4))
+            comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
 
 class TestGraphCompilerDevice(unittest.TestCase):

@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 from hyper_parallel.distributed.context_parallel.collectives import (
     _ULYSSES_WRAPPED_FLAG,
     _gather_sequence,
@@ -302,7 +302,7 @@ def head_tail_load_balance_attention(
         )
 
     peer_rank = _head_tail_peer_rank(cp_mesh)
-    query_peer = _collectives.p2p_exchange(
+    query_peer = communication.p2p_exchange(
         query.narrow(2, local_q_len // 2, local_q_len // 2), peer_rank)
     global_key, global_value = flex_cp_allgather(key, value, 2, cp_mesh)
     keep_output = _run_head_tail_half(
@@ -313,7 +313,7 @@ def head_tail_load_balance_attention(
         attention_kwargs if peer_attention_kwargs is None else peer_attention_kwargs,
     )
     return torch.cat(
-        [keep_output, _collectives.p2p_exchange(peer_output, peer_rank)], dim=2)
+        [keep_output, communication.p2p_exchange(peer_output, peer_rank)], dim=2)
 
 
 def _cp_offset_causal_mask(q_len: int, kv_len: int, lo: int,

@@ -42,6 +42,7 @@ wrong number.  The platform's stream/event API is faked by a double that traces
 what was recorded and waited where, so the laziness is checked as a schedule
 rather than inferred from the code.
 """
+import collections
 import contextlib
 import os
 import threading
@@ -806,10 +807,13 @@ class TestEqualA2ADispatch(unittest.TestCase):
         issued = {rank: run.world.calls(rank) for rank in range(_EP_SIZE)}
         self.assertEqual(issued, {rank: [] for rank in range(_EP_SIZE)},
                          f"no bare collective may be issued, but the ranks issued {issued}")
+        # ``lazy_calls`` is appended from each rank's own thread, so compare as a
+        # multiset -- the ranks are what matter, not the order they finished in.
         self.assertEqual(
-            run.lazy_calls,
-            [(rank, (_UNIFORM_ROWS,) * _EP_SIZE, (_UNIFORM_ROWS,) * _EP_SIZE)
-             for rank in range(_EP_SIZE)],
+            collections.Counter(run.lazy_calls),
+            collections.Counter(
+                (rank, (_UNIFORM_ROWS,) * _EP_SIZE, (_UNIFORM_ROWS,) * _EP_SIZE)
+                for rank in range(_EP_SIZE)),
             f"the lazy exchange must take every rank's counts, got {run.lazy_calls}")
 
     @arg_mark(**_CPU_MARKS)
@@ -825,7 +829,8 @@ class TestEqualA2ADispatch(unittest.TestCase):
         send_plan = [[2, 2], [4, 0]]
         run = _drive(send_plan, "1", entry=_ASYNC)
         self.assertEqual(
-            run.lazy_calls, [(0, (2, 2), (2, 4)), (1, (4, 0), (2, 0))],
+            collections.Counter(run.lazy_calls),
+            collections.Counter([(0, (2, 2), (2, 4)), (1, (4, 0), (2, 0))]),
             f"the lazy exchange must take the uneven counts, got {run.lazy_calls}")
         issued = {rank: run.world.calls(rank) for rank in range(len(send_plan))}
         self.assertEqual(issued, {rank: [] for rank in range(len(send_plan))},

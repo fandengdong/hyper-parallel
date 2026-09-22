@@ -1316,17 +1316,27 @@ class OptimizerSwapAdapter:
         PyTorch's ``load_state_dict`` eagerly restores tensors into the
         optimizer state.  For swap-managed Adam buffers, that would bypass the
         adapter/runtime bookkeeping and can place large tensors directly on the
-        device.  This method therefore deep-copies the checkpoint state dict,
-        removes the Adam buffers that may be swap-managed, and returns them in a
-        side table keyed by the checkpoint parameter id.
+        device.  This method therefore copies the checkpoint state dict's
+        *containers*, removes the Adam buffers that may be swap-managed, and
+        returns them in a side table keyed by the checkpoint parameter id.
+
+        Only the container skeleton is rebuilt: leaf tensors are shared with the
+        caller's checkpoint instead of being duplicated.  The removed buffers are
+        consumed by :meth:`load_swappable_state`, which either takes a reference
+        to the checkpoint storage (CPU checkpoints, where ``to(device="cpu")`` is
+        a no-op) or copies it once into a host mirror.  Deep-copying the whole
+        state dict would hold one extra full copy of every optimizer tensor on
+        host memory for the duration of the load, which for large models is a
+        needless doubling of the checkpoint-loading peak.
 
         The stripped state dict is safe to pass to the wrapped optimizer's
         ``load_state_dict`` for ordinary fields such as parameter groups and
-        step counters.  The removed tensors must be handed to
-        ``load_swappable_state`` afterwards so they can be restored with the
-        correct CPU mirror/device placeholder layout.
+        step counters: Torch does not mutate the tensors it reads from it.  The
+        removed tensors must be handed to ``load_swappable_state`` afterwards so
+        they can be restored with the correct CPU mirror/device placeholder
+        layout.
         """
-        stripped = copy.deepcopy(state_dict)
+        stripped = self._copy_state_dict_containers(state_dict)
         removed: Dict[int, Dict[str, Any]] = {}
         swappable_keys = self._configured_state_keys()
         for param_id, saved_state in list(stripped.get("state", {}).items()):
@@ -1336,6 +1346,35 @@ class OptimizerSwapAdapter:
                 if key in saved_state:
                     removed.setdefault(param_id, {})[key] = saved_state.pop(key)
         return stripped, removed
+
+    @staticmethod
+    def _copy_state_dict_containers(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Shallow-copy a checkpoint state dict, sharing every leaf tensor.
+
+        Rebuilds only the nesting Torch's ``load_state_dict`` walks: the top
+        level, the ``state`` per-parameter mappings, and the ``param_groups``
+        entries.  Do not add tensor copies here: this helper exists to keep the
+        checkpoint-loading host peak free of a duplicate optimizer state.
+        """
+        state = state_dict.get("state")
+        copied_state = (
+            {param_id: dict(saved_state) if isinstance(saved_state, dict) else saved_state
+             for param_id, saved_state in state.items()}
+            if isinstance(state, dict)
+            else state
+        )
+        param_groups = state_dict.get("param_groups")
+        copied_groups = (
+            [dict(group) if isinstance(group, dict) else group for group in param_groups]
+            if isinstance(param_groups, list)
+            else param_groups
+        )
+        copied = {key: value for key, value in state_dict.items() if key not in ("state", "param_groups")}
+        if state is not None:
+            copied["state"] = copied_state
+        if param_groups is not None:
+            copied["param_groups"] = copied_groups
+        return copied
 
     def load_swappable_state(self, original_state_dict: Dict[str, Any], removed: Dict[int, Dict[str, Any]]) -> None:
         """Restore removed Adam buffers under swap runtime control.

@@ -153,7 +153,7 @@ def build_mesh_context(parallel_cfg: dict, device_type: str) -> MeshContext:
     return ctx
 
 
-def train_fn(model, input_ids, labels):
+def train_fn(model, *, input_ids, labels):
     """Standard CE loss on the boundary-wrapped model forward.
 
     In SP mode the lm_head boundary all-gathers hidden_states to full
@@ -322,7 +322,7 @@ def main():  # pylint: disable=too-many-locals
             "reduce-scatter)",
             input_batch.shape[1],
         )
-    trainer.compile(input_batch, label_batch)
+    trainer.compile(input_ids=input_batch, labels=label_batch)
     inspect_graph(trainer)
 
     # 7. Training data iterator (DataSampler yields full-sequence batches)

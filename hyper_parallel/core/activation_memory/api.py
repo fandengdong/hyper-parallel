@@ -280,6 +280,69 @@ def clear_recompute_session(session_id):
     return _clear(session_id)
 
 
+def _validate_compile_checkpoint_options(
+    swap_inputs: bool,
+    group_swap: bool,
+    cpu_pool: Any,
+    context_fn: Optional[Callable],
+    use_reentrant: bool,
+) -> None:
+    """Reject eager-only checkpoint options before compile capture."""
+    unsupported = []
+    if swap_inputs:
+        unsupported.append("swap_inputs")
+    if group_swap:
+        unsupported.append("group_swap")
+    if cpu_pool is not None:
+        unsupported.append("cpu_pool")
+    if context_fn is not None:
+        unsupported.append("custom context_fn")
+    if use_reentrant:
+        unsupported.append("use_reentrant=True")
+    if unsupported:
+        raise ValueError(
+            "HyperParallel checkpoint compile mode does not support: "
+            + ", ".join(unsupported)
+            + ". Use Torch-native non-reentrant checkpointing with optional "
+            "SAVE/RECOMPUTE selective policies."
+        )
+
+
+def _make_checkpoint_context_fn(
+    policy_fn: Optional[Callable],
+    context_fn: Optional[Callable],
+    group_swap: bool,
+    cpu_pool: Any,
+) -> Callable:
+    """Compose eager recompute, selective, and caller-provided contexts."""
+    factories: list = [create_recompute_contexts]
+    if policy_fn is not None:
+        selective_kwargs = {"group_swap": group_swap}
+        if cpu_pool is not None:
+            selective_kwargs["cpu_pool"] = cpu_pool
+        factories.append(partial(create_selective_checkpoint_contexts, policy_fn, **selective_kwargs))
+    if context_fn is not None:
+        factories.append(context_fn)
+    if len(factories) == 1:
+        return factories[0]
+    return _compose_context_fns(tuple(factories))
+
+
+def _checkpoint_input_context(swap_inputs: bool) -> Any:
+    """Create the optional context that offloads the checkpoint boundary input.
+
+    ``group_swap`` / ``cpu_pool`` configure the selective-policy swap path (see
+    ``_make_checkpoint_context_fn``); the boundary-input swap always runs through the native
+    save-on-cpu context.  That context releases the device original through the allocator's
+    normal refcount tracking, whereas the SwapManager path shrank its storage with
+    ``resize_(0)`` -- which deterministically corrupts the backward pass on this platform,
+    turning every parameter gradient into NaN.
+    """
+    if not swap_inputs:
+        return contextlib.nullcontext()
+    return native_save_on_cpu()
+
+
 def checkpoint(
     function,
     *args,
@@ -324,55 +387,18 @@ def checkpoint(
         raise ValueError(f"early_stop must be bool, but got {type(early_stop).__name__}.")
 
     if is_compiling():
-        unsupported = []
-        if swap_inputs:
-            unsupported.append("swap_inputs")
-        if group_swap:
-            unsupported.append("group_swap")
-        if cpu_pool is not None:
-            unsupported.append("cpu_pool")
-        if context_fn is not None:
-            unsupported.append("custom context_fn")
-        if kwargs.get("use_reentrant", False):
-            unsupported.append("use_reentrant=True")
-        if unsupported:
-            raise ValueError(
-                "HyperParallel checkpoint compile mode does not support: "
-                + ", ".join(unsupported)
-                + ". Use Torch-native non-reentrant checkpointing with optional "
-                "SAVE/RECOMPUTE selective policies."
-            )
+        _validate_compile_checkpoint_options(
+            swap_inputs, group_swap, cpu_pool, context_fn, kwargs.get("use_reentrant", False)
+        )
         composed_context_fn = (
             partial(create_native_selective_checkpoint_contexts, policy_fn)
             if policy_fn is not None
             else None
         )
     else:
-        factories: list = [create_recompute_contexts]
-        if policy_fn is not None:
-            selective_kwargs = {"group_swap": group_swap}
-            if cpu_pool is not None:
-                selective_kwargs["cpu_pool"] = cpu_pool
-            factories.append(partial(create_selective_checkpoint_contexts, policy_fn, **selective_kwargs))
-        if context_fn is not None:
-            factories.append(context_fn)
+        composed_context_fn = _make_checkpoint_context_fn(policy_fn, context_fn, group_swap, cpu_pool)
 
-        if len(factories) == 1:
-            composed_context_fn = factories[0]
-        else:
-            composed_context_fn = _compose_context_fns(tuple(factories))
-
-    if swap_inputs:
-        # Native save-on-cpu: the boundary input is moved to (pinned) CPU as the
-        # saved object and moved back at recompute; the device original is
-        # released by the allocator's normal refcount tracking.  The previous
-        # SwapManager/async path kept the device tensor and shrank its storage
-        # with resize_(0), which deterministically corrupts the backward pass on
-        # this platform (all parameter grads become NaN).
-        context = partial(native_save_on_cpu)
-    else:
-        context = contextlib.nullcontext
-    with context():
+    with _checkpoint_input_context(swap_inputs):
         checkpoint_kwargs = {**kwargs, "use_reentrant": False, "early_stop": early_stop}
         if composed_context_fn is not None:
             checkpoint_kwargs["context_fn"] = composed_context_fn

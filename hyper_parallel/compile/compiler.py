@@ -100,12 +100,16 @@ class GraphCompiler:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
 
-    def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
+    def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
 
         Users can explicitly call this, or it will be automatically compiled
         at first forward_backward
+
+        Args:
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments and used to trace the joint graph
         """
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
@@ -114,9 +118,7 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        joint_graph = trace_model_graph(
-            self.model, self.train_fn, input_batch, label_batch
-        )
+        joint_graph = trace_model_graph(self.model, self.train_fn, inputs)
 
         pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
 
@@ -128,9 +130,7 @@ class GraphCompiler:
 
         self._joint_graph = joint_graph
 
-    def forward_backward(
-        self, input_batch: torch.Tensor, label_batch: torch.Tensor
-    ) -> Any:
+    def forward_backward(self, **inputs: Any) -> Any:
         """
         Execute one compiled forward+backward step.
 
@@ -139,16 +139,16 @@ class GraphCompiler:
         run before the caller's optimizer step / zero_grad.
 
         Args:
-            input_batch: Input batch (must live on the compiler's device)
-            label_batch: Label batch (must live on the compiler's device)
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments (must live on the compiler's device)
 
         Returns:
             loss: Loss value
         """
         if self._joint_graph is None:
-            self.compile(input_batch, label_batch)
+            self.compile(**inputs)
 
-        loss, grads = self._run_graph(input_batch, label_batch)
+        loss, grads = self._run_graph(**inputs)
 
         self._accumulate_grads(grads)
 
@@ -224,7 +224,7 @@ class GraphCompiler:
 
         return kwargs
 
-    def _run_graph(self, input_batch, label_batch):
+    def _run_graph(self, **inputs):
         """Execute compiled graph"""
         if self._joint_graph is None:
             raise RuntimeError(
@@ -237,8 +237,7 @@ class GraphCompiler:
         return run_traced_graph(
             self._joint_graph,
             self.model,
-            input_batch,
-            label_batch,
+            inputs,
         )
 
     def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:

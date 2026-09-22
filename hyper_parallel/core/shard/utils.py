@@ -16,7 +16,6 @@
 
 from typing import Any, Optional, Tuple
 
-import os
 import torch
 import torch.distributed.nn.functional as dist_func
 from torch import nn
@@ -27,6 +26,7 @@ from torch._ops import OpOverload, OpOverloadPacket
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.layout import _get_slice_tensor_by_layout
+from hyper_parallel.core.utils.communication import get_group_local_rank
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_strict
 from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import (
     _check_context_and_layout,
@@ -39,21 +39,25 @@ from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import (
 )
 
 
-def get_world_size() -> int:
-    """Return Torch distributed world size, or WORLD_SIZE before init."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return int(os.environ.get("WORLD_SIZE", "1"))
+def get_op_name(func):
+    """Return the registry name for a Torch callable or operator overload."""
+    if hasattr(func, "__name__"):
+        return func.__name__
+    if isinstance(func, OpOverload):
+        return func.name.split("::")[-1].split(".")[0]
+    if isinstance(func, OpOverloadPacket):
+        return func.name.split("::")[-1]
+    func_str = str(func)
+    if "built-in function" in func_str:
+        return func_str.split()[-1].strip(">")
+    if "function" in func_str:
+        return func_str.split()[1]
+    return "unknown_op"
 
 
 def get_cell_construct(cell):
     """Return the Torch module forward callable."""
     return cell.forward
-
-
-def get_cells_and_names(cell):
-    """Return Torch module names and instances."""
-    return cell.named_modules()
 
 
 def search_parameter_by_name(cell, param_name: str):
@@ -100,40 +104,6 @@ def update_parameter_by_name(result: tuple, new_param) -> bool:
     else:
         parent_cell.register_parameter(param_key, new_param)
     return True
-
-
-def get_op_name(func):
-    """Return the registry name for a Torch callable or operator overload."""
-    if hasattr(func, "__name__"):
-        return func.__name__
-    if isinstance(func, OpOverload):
-        return func.name.split("::")[-1].split(".")[0]
-    if isinstance(func, OpOverloadPacket):
-        return func.name.split("::")[-1]
-    func_str = str(func)
-    if "built-in function" in func_str:
-        return func_str.split()[-1].strip(">")
-    if "function" in func_str:
-        return func_str.split()[1]
-    return "unknown_op"
-
-
-def get_rank() -> int:
-    """Return the current Torch distributed rank, or 0 before distributed init."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-    return 0
-
-
-def get_group_local_rank(group=None) -> int:
-    """Return local rank in a Torch process group, or 0 before distributed init."""
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return 0
-    if group is None:
-        return torch.distributed.get_rank()
-    if hasattr(group, "rank"):
-        return group.rank()
-    return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
 
 
 def _differentiable_all_reduce(tensor: Tensor, op: str, group) -> Tensor:
@@ -437,3 +407,22 @@ def distributed_cross_entropy_from_op_call(
         reduction=reduction,
         label_smoothing=label_smoothing,
     )
+
+
+__all__ = [
+    # Op-name resolution.
+    "get_op_name",
+    # Cell/parameter plumbing used by the shard API.
+    "get_cell_construct",
+    "search_parameter_by_name",
+    "set_layout_into_parameter",
+    "update_parameter_by_name",
+    # Distributed cross-entropy implementation and its op-call entry point.
+    "distributed_log_softmax",
+    "distributed_nll_loss_forward",
+    "DistributedCrossEntropyFunction",
+    "distributed_cross_entropy",
+    "distributed_cross_entropy_from_op_call",
+    # Re-exported from :mod:`hyper_parallel.core.utils.communication`.
+    "get_group_local_rank",
+]

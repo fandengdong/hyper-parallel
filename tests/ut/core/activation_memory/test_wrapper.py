@@ -336,6 +336,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         original = expected.clone()
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
@@ -368,12 +369,37 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         x = torch.randn(2, requires_grad=True)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             with AsyncSaveOnCpu(policy_fn=lambda tensor: CheckpointPolicy.MUST_SWAP, group_swap=True):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_skips_storage_registration_for_last_group(self):
+        """Last groups keep saved tensors on device without registering swap storage.
+
+        Only the *registration* is skipped here: the saved tensor still has to be the
+        original object, for the reason in
+        :meth:`test_pack_hook_keeps_the_original_and_storage_aliases_it` -- a detached
+        alias traps the input gradient on the alias, so the upstream FSDP
+        post-backward/reduce never sees it.
+        """
+        tensor = torch.randn(2, requires_grad=True)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = True
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
+            saved_tensors = AsyncSaveOnCpu(group_swap=True)
+            packed = saved_tensors.pack_hook(tensor)
+
+        self.assertIs(packed, tensor)
+        self.assertTrue(packed.requires_grad)
+        self.assertTrue(torch.equal(packed, tensor))
+        fake_manager.is_last_group.assert_called_once_with("group0")
+        fake_manager.add_storage.assert_not_called()
 
 
 class TestSwapTensorWrapper(unittest.TestCase):

@@ -46,7 +46,7 @@ from hyper_parallel.trainer.config import (
     Target,
     TrainerConfig,
 )
-from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_root
+from hyper_parallel.trainer.config.resolver import ConfigResolutionError, resolve_config
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 
 _MARK = {
@@ -203,7 +203,7 @@ class TestOptimizerSwapConfig(unittest.TestCase):
             "include_master_params": False,
             "packed_swap": False,
         }
-        config = resolve_root({
+        config = resolve_config({
             "model": {"_target_": "torch.nn.Linear", "in_features": 2, "out_features": 2},
             "optimizer": {
                 "_target_": _ADAMW_TARGET,
@@ -231,15 +231,15 @@ class TestOptimizerSwapConfig(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(ValueError, "swap_times"):
-            resolve_root(root)
+            resolve_config(root)
 
         root["optimizer"]["swap"] = {"state_keys": ["momentum_buffer"]}
         with self.assertRaisesRegex(ValueError, "state_keys"):
-            resolve_root(root)
+            resolve_config(root)
 
         root["optimizer"]["swap"] = {"unknown": 1}
         with self.assertRaisesRegex(ConfigResolutionError, "unknown configuration fields"):
-            resolve_root(root)
+            resolve_config(root)
 
 
 class TestOptimizerSwapBuildPath(unittest.TestCase):

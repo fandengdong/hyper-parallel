@@ -17,19 +17,18 @@ from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     OffloadPolicy,
     SourceShardMetaInfo,
-    get_cells_and_names,
-    get_device_handle,
-    get_world_size,
     load_into_param,
     parameters_dict,
     wait_grad_handle,
 )
+from hyper_parallel.core.utils.communication import get_device_handle
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.state_dict_utils import (
     get_model_state_dict as get_model_state_dict_impl,
@@ -181,7 +180,7 @@ def get_fully_shard_units(model: nn.Module) -> List[FSDPUnit]:
     """
     units: List[FSDPUnit] = []
     seen_schedulers: set = set()
-    for module_name, module in get_cells_and_names(model):
+    for module_name, module in model.named_modules():
         scheduler = getattr(module, "hsdp_scheduler", None)
         if scheduler is None or id(scheduler) in seen_schedulers:
             continue
@@ -238,7 +237,7 @@ class HSDPModule:
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
 
-        for _, module in get_cells_and_names(self):
+        for _, module in self.named_modules():
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
@@ -363,7 +362,7 @@ class HSDPModule:
         # so external hooks can safely read .missing_keys/.unexpected_keys.
         _IK = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
         incompatible_keys = _IK([], [])
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules():
             hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
             for hook in hooks.values():
                 hook(module, incompatible_keys)
@@ -389,7 +388,7 @@ class HSDPModule:
             raise ValueError(f"recursive should be a bool, got {type(recursive)}")
         self_module = cast(nn.Module, self)
         modules = (
-            [module for _, module in get_cells_and_names(self_module)]
+            [module for _, module in self_module.named_modules()]
             if recursive
             else [self_module]
         )
@@ -409,7 +408,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules():
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
@@ -425,7 +424,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules():
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
@@ -441,7 +440,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules():
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
@@ -452,7 +451,7 @@ class HSDPModule:
         """
         self_module = cast(nn.Module, self)
         if recurse:
-            sub_modules = [m for _, m in get_cells_and_names(self_module)]
+            sub_modules = [m for _, m in self_module.named_modules()]
         else:
             sub_modules = [self_module]
         for module in sub_modules:
@@ -825,7 +824,7 @@ def fully_shard(
     replicate_params = _normalize_replicate_params(replicate_params)
 
     if mesh is None:
-        mesh = init_device_mesh(device_type="npu", mesh_shape=(get_world_size(),))
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(dist.get_world_size(),))
         if has_dtensor_param:
             raise ValueError(
                 "fully_shard does not support mesh=None with a native DTensor parameter; "

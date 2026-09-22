@@ -184,8 +184,14 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 tree_map(lambda x: _VersionWrapper(_maybe_detach(x, has_alias)), out)
             )
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
+            group_name = self._swap_manager.get_current_group_name()
+            if not group_name:
+                raise RuntimeError(
+                    f"{func} selected MUST_SWAP but no swap group is active. "
+                    "Enter a swap context around the checkpointed region, or "
+                    "select MUST_SAVE/MUST_RECOMPUTE instead."
+                )
             if not self.add_to_storage:
-                group_name = self._swap_manager.get_current_group_name()
                 self._group_prefix = f"{group_name}::"
                 self._swap_manager.add_storage(group_name, self.swap_storage)
                 self.add_to_storage = True

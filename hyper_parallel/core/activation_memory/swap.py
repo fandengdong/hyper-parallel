@@ -676,6 +676,20 @@ class SwapGroup:
             )
         return group_device_bufs
 
+    @staticmethod
+    def _protect_device_bufs(group_device_bufs, copy_stream):
+        """Keep staging device buffers reserved for the copy stream.
+
+        A staging buffer is otherwise referenced only by a local, so a failure
+        part-way through the copy loop can drop the last reference while the
+        copy stream is still reading it -- and the caching allocator may then
+        hand that memory to the compute stream.
+        """
+        for buf in group_device_bufs.values():
+            device = getattr(buf, "device", None)
+            if device is not None and device.type not in ("cpu", "meta"):
+                buf.record_stream(copy_stream)
+
     def _acquire_bucket_cpu_buf(self, bucket_key, bucket):
         """Acquire the pinned CPU buffer that receives one bucket's D2H copy."""
         numel = bucket["total_numel"]
@@ -770,8 +784,13 @@ class SwapGroup:
             compute_event.wait(copy_stream)
 
             if total_bytes > 0:
-                self._group_cpu_buf = self._offload_buckets_d2h(group_device_bufs, copy_stream)
+                # Publish and protect the staging buffers before the first async
+                # D2H: if the copy loop fails part-way, the stack unwinding must
+                # not drop the last reference to memory the copy stream is still
+                # reading.
                 self._group_device_buf = group_device_bufs
+                self._protect_device_bufs(group_device_bufs, copy_stream)
+                self._group_cpu_buf = self._offload_buckets_d2h(group_device_bufs, copy_stream)
 
             # Slice tensors use the existing per-tensor path.
             # Group-managed tensors are already STATE_D2H so async_offload is a no-op.
@@ -888,9 +907,20 @@ class SwapGroup:
                     group_device_bufs[bucket_key] = _backend.alloc_tensor_buffer(
                         numel, bucket["dtype"], bucket["device"]
                     )
-                    # One-shot H2D per packed bucket.
-                    group_device_bufs[bucket_key].copy_(cpu_buf[:numel], non_blocking=True)
+                # Publish and protect the staging buffers before the first async
+                # H2D, for the same reason as launch_offload.
                 self._group_device_buf = group_device_bufs
+                self._protect_device_bufs(group_device_bufs, copy_stream)
+
+                for bucket_key, bucket in self._packed_buckets.items():
+                    group_device_buf = group_device_bufs.get(bucket_key)
+                    if group_device_buf is None:
+                        continue
+                    # One-shot H2D per packed bucket.
+                    group_device_buf.copy_(
+                        self._group_cpu_buf[bucket_key][:bucket["total_numel"]],
+                        non_blocking=True,
+                    )
 
                 # Unpack with D2D copies into the original storages. Rebinding
                 # st.val with set_() would leave existing aliases on freed storage.

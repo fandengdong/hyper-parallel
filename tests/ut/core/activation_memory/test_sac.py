@@ -219,6 +219,25 @@ class TestTorchDispatchModes(unittest.TestCase):
 
         fake_manager.add_storage.assert_called_once()
 
+    def test_must_swap_without_group_raises(self):
+        """MUST_SWAP without an active swap group must not register to the empty-named group."""
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = ""
+
+        with patch.object(sac, "SwapManager", return_value=fake_manager):
+            caching, _ = create_selective_checkpoint_contexts(
+                lambda ctx, op, *args, **kwargs: CheckpointPolicy.MUST_SWAP,
+                group_swap=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "no swap group is active"):
+                with caching:
+                    torch.add(torch.tensor([1.0]), torch.tensor([2.0]))
+
+        fake_manager.add_storage.assert_not_called()
+        # Nothing was registered, so the empty-named global group stays untouched.
+        self.assertFalse(caching.storage)
+        self.assertEqual(len(caching.swap_storage._data), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

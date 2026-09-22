@@ -91,7 +91,7 @@ class GraphTrainer:
         self.optimizer_config = optimizer_config or {}
         self.optimizer = None
 
-    def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
+    def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
 
@@ -99,13 +99,13 @@ class GraphTrainer:
         at first train_step
 
         Args:
-            input_batch: Input batch used to trace the joint graph
-            label_batch: Label batch used to trace the joint graph
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments and used to trace the joint graph
         """
-        self._compiler.compile(input_batch, label_batch)
+        self._compiler.compile(**inputs)
         self._init_optimizer()
 
-    def train_step(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> Any:
+    def train_step(self, **inputs: Any) -> Any:
         """
         Execute one training step
 
@@ -114,16 +114,16 @@ class GraphTrainer:
         do that, because the optimizer belongs to the trainer.
 
         Args:
-            input_batch: Input batch
-            label_batch: Label batch
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments
 
         Returns:
             loss: Loss value
         """
         if self._compiler.is_compiled is False:
-            self.compile(input_batch, label_batch)
+            self.compile(**inputs)
 
-        return self._compiler.forward_backward(input_batch, label_batch)
+        return self._compiler.forward_backward(**inputs)
 
     def to(self, device: torch.device) -> "GraphTrainer":
         """Move the model to ``device`` and remember it for batch placement.
@@ -150,13 +150,15 @@ class GraphTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-    def _place_on_device(self, batch):
-        """Move a ``(input, label)`` batch onto the compiler's device."""
+    def _place_on_device(self, inputs: dict) -> dict:
+        """Move a dict of model inputs onto the compiler's device."""
         device = self._compiler.device
         if device is None:
-            return batch
-        moved = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
-        return moved
+            return inputs
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
 
     def train(
         self,
@@ -167,14 +169,15 @@ class GraphTrainer:
     ) -> List[Any]:
         """Run the full training loop over ``data_iterable``.
 
-        The data iterator must yield ``(input, label)`` pairs (the same two
-        positional arguments ``train_fn`` and ``train_step`` consume). Each
-        batch is moved onto the compiler's device, then ``train_step`` +
+        The data iterator must yield dicts of model inputs (the keyword
+        arguments ``train_fn`` and ``train_step`` consume, e.g.
+        ``{"input_ids": ..., "labels": ...}``). Each batch is moved onto the
+        compiler's device, then ``train_step(**inputs)`` +
         ``optimizer_step`` are driven. The graph is compiled lazily on the
         first batch via ``train_step``.
 
         Args:
-            data_iterable: An iterable / iterator of ``(input, label)`` pairs.
+            data_iterable: An iterable / iterator of model-input dicts.
             max_steps: Stop after this many steps. Runs the whole iterator when
                 ``None``.
             log_interval: Log a loss every ``log_interval`` steps (requires
@@ -194,10 +197,9 @@ class GraphTrainer:
             if max_steps is not None and step >= max_steps:
                 break
 
-            input_batch, label_batch = batch
-            input_batch, label_batch = self._place_on_device((input_batch, label_batch))
+            inputs = self._place_on_device(batch)
 
-            loss = self.train_step(input_batch, label_batch)
+            loss = self.train_step(**inputs)
             self.optimizer_step()
             losses.append(loss)
 

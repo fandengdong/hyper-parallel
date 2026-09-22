@@ -40,14 +40,15 @@ Usage Example:
     pass_plan = PassPlan()
     pass_plan.fsdp_wrap_pattern("layers.*")
 
-    # Compile + forward_backward only (no optimizer / training loop):
+    # Compile + forward_backward only (no optimizer / training loop); model
+    # inputs travel as kwargs, forwarded to train_fn(model, **inputs):
     compiler = GraphCompiler(model, train_fn, pass_config, pass_plan)
-    compiler.compile(input_batch, label_batch)
-    loss = compiler.forward_backward(input_batch, label_batch)  # grads -> param.grad
+    compiler.compile(input_ids=input_ids, labels=labels)
+    loss = compiler.forward_backward(input_ids=input_ids, labels=labels)  # grads -> param.grad
 
     # Or drive the whole train/optimize loop -- the trainer composes a
-    # GraphCompiler, compiles on the first batch, moves batches onto its
-    # device, and owns the optimizer:
+    # GraphCompiler, compiles on the first batch, moves each input dict onto
+    # its device, and owns the optimizer. data_iterable yields input dicts:
     trainer = GraphTrainer(model, train_fn, pass_config, pass_plan)
     trainer.train(dataloader, max_steps=100, log_interval=10)
 """
