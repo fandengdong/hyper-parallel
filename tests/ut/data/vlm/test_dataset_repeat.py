@@ -40,8 +40,8 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.data.vlm.dataset import _RepeatedDataset, build_vlm_dataset
 
-_CPU_MARKS = dict(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-                  card_mark="allcards", essential_mark="essential")
+_CPU_MARKS = {"plat_marks": ["cpu_linux", "cpu_macos"], "level_mark": "level0",
+              "card_mark": "allcards", "essential_mark": "essential"}
 
 
 class _CountingSource(Dataset):
@@ -143,14 +143,94 @@ class TestRepeatedDataset(unittest.TestCase):
             _ = wrapped[0]
 
 
+class TestRepeatedDatasetShuffle(unittest.TestCase):
+    """``shuffle`` visits the source in a fixed random order."""
+
+    _BIG = 64
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_defaults_off(self):
+        """Feature: shuffle default.
+
+        Description: Wrap a source without asking for shuffle.
+        Expectation: The natural order is preserved and ``shuffle`` reads back False,
+            so the default path is unchanged.
+        """
+        wrapped = _RepeatedDataset(_CountingSource(8), 1)
+        self.assertFalse(wrapped.shuffle)
+        self.assertEqual(
+            [wrapped[i] for i in range(8)], [f"record-{i}" for i in range(8)])
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_visits_every_record_exactly_once(self):
+        """Feature: shuffle is a permutation.
+
+        Description: Read the whole shuffled index space of a 64-record source.
+        Expectation: Every record appears exactly once and the order is no longer the
+            natural one -- shuffling reorders an epoch, it never drops or duplicates.
+        """
+        wrapped = _RepeatedDataset(_CountingSource(self._BIG), 1, shuffle=True)
+        visited = [wrapped[i] for i in range(self._BIG)]
+        self.assertEqual(
+            sorted(visited), sorted(f"record-{i}" for i in range(self._BIG)))
+        self.assertNotEqual(visited, [f"record-{i}" for i in range(self._BIG)])
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_order_is_reproducible_for_a_seed(self):
+        """Feature: shuffle reproducibility.
+
+        Description: Build the order twice with the same seed, then with another seed.
+        Expectation: The same seed replays the order exactly (a resumed run sees the
+            same batches); a different seed does not.
+        """
+        def _order(seed):
+            """Return the served record order for one shuffle seed."""
+            wrapped = _RepeatedDataset(
+                _CountingSource(self._BIG), 1, shuffle=True, seed=seed)
+            return [wrapped[i] for i in range(self._BIG)]
+
+        self.assertEqual(_order(1234), _order(1234))
+        self.assertNotEqual(_order(1234), _order(4321))
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_repeats_the_same_order_on_every_pass(self):
+        """Feature: shuffle with repeat.
+
+        Description: Wrap with ``repeat=2`` and shuffle, then read both passes.
+        Expectation: The second pass repeats the first pass's order -- repeating
+            multiplies the epoch, it does not reshuffle between passes.
+        """
+        wrapped = _RepeatedDataset(_CountingSource(8), 2, shuffle=True)
+        first = [wrapped[i] for i in range(8)]
+        second = [wrapped[8 + i] for i in range(8)]
+        self.assertEqual(first, second)
+        self.assertEqual(sorted(first), sorted(f"record-{i}" for i in range(8)))
+        self.assertEqual(len(wrapped), 16)
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_still_rejects_a_non_positive_repeat(self):
+        """Feature: shuffle validation.
+
+        Description: Construct a shuffling wrapper with ``repeat`` 0.
+        Expectation: The repeat check still fires before any permutation is built.
+        """
+        with self.assertRaisesRegex(ValueError, "repeat must be positive"):
+            _RepeatedDataset(_CountingSource(4), 0, shuffle=True)
+
+
 class TestBuildVlmDatasetRepeat(unittest.TestCase):
     """``data_config['repeat']`` reaches the wrapper through the builder."""
 
     @staticmethod
     def _write_list(path: str, count: int) -> None:
-        """Write a LLaVA-style JSON list of ``count`` empty records."""
+        """Write a LLaVA-style JSON list of ``count`` records, each with a distinct id."""
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump([{"messages": []} for _ in range(count)], handle)
+            json.dump([{"messages": [], "id": index} for index in range(count)], handle)
+
+    @staticmethod
+    def _ids(dataset: object, count: int) -> list:
+        """Return the ids of the first ``count`` records served by ``dataset``."""
+        return [dataset[index]["id"] for index in range(count)]
 
     def _build(self, data_path: str, data_config: dict) -> object:
         """Build a lazy dataset (no transform, no trainable filter)."""
@@ -195,6 +275,42 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
                     built = self._build(data_path, config)
                     self.assertNotIsInstance(built, _RepeatedDataset)
                     self.assertEqual(len(built), 2)
+
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_config_wraps_even_without_repeat(self):
+        """Feature: shuffle wiring.
+
+        Description: Build with ``shuffle`` set and ``repeat`` left at its default.
+        Expectation: The dataset is wrapped -- shuffling needs the wrapper even for a
+            single pass -- and every record id is still served exactly once.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = os.path.join(tmp, "data.json")
+            self._write_list(data_path, 8)
+            built = self._build(data_path, {"source_type": "online", "shuffle": True})
+            self.assertIsInstance(built, _RepeatedDataset)
+            self.assertEqual(len(built), 8)
+            served = self._ids(built, 8)
+            self.assertEqual(sorted(served), list(range(8)))
+            self.assertNotEqual(served, list(range(8)))
+
+    @arg_mark(**_CPU_MARKS)
+    def test_shuffle_absent_keeps_the_source_order(self):
+        """Feature: shuffle wiring default.
+
+        Description: Build with ``shuffle`` false and with it absent.
+        Expectation: Neither is wrapped, so the ordering stays the file's.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = os.path.join(tmp, "data.json")
+            self._write_list(data_path, 4)
+            for config in ({"source_type": "online"},
+                           {"source_type": "online", "shuffle": False}):
+                with self.subTest(config=config):
+                    built = self._build(data_path, config)
+                    self.assertNotIsInstance(built, _RepeatedDataset)
+                    self.assertEqual(self._ids(built, 4), list(range(4)))
 
 
 if __name__ == "__main__":

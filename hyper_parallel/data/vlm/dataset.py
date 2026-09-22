@@ -19,6 +19,7 @@ import os
 from collections.abc import Callable
 from typing import Any, Optional, TypeAlias
 
+import torch
 from torch.utils.data import Dataset
 
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -179,7 +180,10 @@ def build_vlm_dataset(
     dataset = _TransformDataset(VLMDataset(data_path), transform,
                                 filter_trainable=filter_trainable)
     repeat = int(data_config.get("repeat", 1) or 1)
-    return _RepeatedDataset(dataset, repeat) if repeat > 1 else dataset
+    shuffle = bool(data_config.get("shuffle", False))
+    if repeat > 1 or shuffle:
+        return _RepeatedDataset(dataset, repeat, shuffle=shuffle)
+    return dataset
 
 
 class _RepeatedDataset(Dataset):
@@ -194,17 +198,30 @@ class _RepeatedDataset(Dataset):
     space keeps the source ahead of the schedule.
     """
 
-    def __init__(self, dataset: Dataset, repeat: int) -> None:
+    def __init__(self, dataset: Dataset, repeat: int, shuffle: bool = False, seed: int = 1234) -> None:
         """Wrap ``dataset`` so it can be read ``repeat`` times over.
 
         Args:
             dataset: Map-style source dataset.
             repeat: Number of passes to expose; must be positive.
+            shuffle: Visit the source in a fixed random order instead of file order.
+                The dynamic batch loader reads its source sequentially (no batch
+                sampler is built for it), so without this the step composition tracks
+                the JSON's ordering -- COCO's records ~57k-81k have 37% shorter
+                captions, which packs more samples (and so +38% vision patches) into
+                each 8K window and bends the loss curve at steps 22-29.
+            seed: Permutation seed; fixed so a run stays reproducible.
         """
         if repeat < 1:
             raise ValueError(f"repeat must be positive, got {repeat}")
         self.dataset = dataset
         self.repeat = int(repeat)
+        self.shuffle = bool(shuffle)
+        self.perm = None
+        if self.shuffle:
+            length = len(dataset)
+            generator = torch.Generator().manual_seed(int(seed))
+            self.perm = torch.randperm(length, generator=generator).tolist()
 
     def __len__(self) -> int:
         """Return the multiplied length of the wrapped dataset."""
@@ -215,7 +232,10 @@ class _RepeatedDataset(Dataset):
         length = len(self.dataset)
         if length <= 0:
             raise IndexError("cannot index an empty dataset")
-        return self.dataset[index % length]
+        position = index % length
+        if self.perm is not None:
+            position = self.perm[position]
+        return self.dataset[position]
 
 
 __all__ = ["VLMDataset", "build_vlm_dataset"]
