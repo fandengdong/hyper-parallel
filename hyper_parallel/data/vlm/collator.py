@@ -41,39 +41,71 @@ class VLMCollator:
     variable-length images batch correctly. This temporary implementation does
     not depend on the LLM batching pipeline.
 
-    With ``pad_to_batch`` the collator pads every sequence field up to the
-    longest sample in the micro-batch (rounded up to ``pad_granularity``)
-    instead of requiring the transform to pre-pad everything to
-    ``max_seq_len``. The transform must be built with a matching
-    ``pad_granularity``, otherwise its fixed ``max_seq_len`` padding already
-    made all samples equal length and this is a no-op.
+    With ``pad_to_batch`` the collator pads every sequence field up to
+    ``max_seq_len`` (rounded up to ``pad_granularity``) instead of requiring the
+    transform to pre-pad everything to that length. The transform must be built
+    with the same ``max_seq_len`` and a matching ``pad_granularity``, otherwise
+    its own padding already made all samples equal length. A fixed padded length
+    keeps the shape of every step identical; it also means ``pad_granularity``
+    saves no compute, because each micro-batch still pays ``max_seq_len``.
     """
 
     def __init__(self, *, pad_to_batch: bool = False,
-                 pad_granularity: int = 1) -> None:
+                 pad_granularity: int = 1,
+                 max_seq_len: Optional[int] = None) -> None:
         """Store the batch-padding policy.
 
         Args:
-            pad_to_batch: Pad the micro-batch to its longest sample.
+            pad_to_batch: Pad the micro-batch up to ``max_seq_len``.
             pad_granularity: Round the padded length up to a multiple of this
                 value (keep it a multiple of the parallel sequence alignment).
+            max_seq_len: Hard cap used as the padded length. Required when
+                ``pad_to_batch`` is set.
 
         Raises:
-            ValueError: If ``pad_granularity`` is not a positive integer.
+            ValueError: If ``pad_granularity`` or ``max_seq_len`` is not a
+                positive integer, or if ``pad_to_batch`` is enabled without
+                ``max_seq_len``.
         """
         if isinstance(pad_granularity, bool) or not isinstance(pad_granularity, int) \
                 or pad_granularity <= 0:
             raise ValueError(
                 f"pad_granularity must be a positive integer, got {pad_granularity!r}"
             )
+        if max_seq_len is not None and (
+                isinstance(max_seq_len, bool) or not isinstance(max_seq_len, int)
+                or max_seq_len <= 0):
+            raise ValueError(
+                f"max_seq_len must be a positive integer, got {max_seq_len!r}"
+            )
+        if pad_to_batch and max_seq_len is None:
+            raise ValueError(
+                "max_seq_len is required when pad_to_batch is enabled; set "
+                "collate_fn.max_seq_len to the transform's max_seq_len"
+            )
         self.pad_to_batch = pad_to_batch
         self.pad_granularity = pad_granularity
+        self.max_seq_len = max_seq_len
 
     def _batch_target_len(self, samples: list[dict[str, Any]]) -> int:
-        """Return the sequence length the whole micro-batch pads up to."""
-        longest = max(int(sample["input_ids"].shape[0]) for sample in samples)
+        """Return the sequence length the whole micro-batch pads up to.
+
+        The target is ``max_seq_len`` rounded up to ``pad_granularity``, not the
+        longest member, so every micro-batch in a run has the same shape.
+
+        Raises:
+            ValueError: If a sample is longer than the target, which means the
+                transform cap and this collator disagree.
+        """
         granularity = self.pad_granularity
-        return -(-longest // granularity) * granularity
+        target_len = -(-self.max_seq_len // granularity) * granularity
+        longest = max(int(sample["input_ids"].shape[0]) for sample in samples)
+        if longest > target_len:
+            raise ValueError(
+                f"sample length {longest} exceeds the padded length {target_len}; "
+                "build the transform with the same max_seq_len"
+            )
+        return target_len
 
     @staticmethod
     def _pad_sequence_field(value: torch.Tensor, seq_len: int,
@@ -143,6 +175,7 @@ def build_vlm_collator(
         pad_to_length: Optional[int] = None,
         pad_to_batch: bool = False,
         pad_granularity: int = 1,
+        max_seq_len: Optional[int] = None,
 ) -> VLMCollator:
     """Build the VLM micro-batch collator.
 
@@ -150,19 +183,39 @@ def build_vlm_collator(
         packing: Reserved switch for VeOmni-style text packing.
         pad_token_id: Reserved padding value for text input IDs.
         ignore_index: Reserved label value excluded from loss computation.
-        pad_to_length: Reserved packed text sequence length.
-        pad_to_batch: Pad each micro-batch to its own longest sample. Pair with
-            a data transform built with a matching ``pad_granularity``.
+        pad_to_length: Reserved packed text sequence length. The fixed padded
+            length used outside packing is ``max_seq_len``.
+        pad_to_batch: Pad each micro-batch up to ``max_seq_len``. Pair with a
+            data transform built with a matching ``pad_granularity`` and the same
+            ``max_seq_len``.
         pad_granularity: Round the batch-padded length up to this multiple.
+        max_seq_len: Hard cap used as the padded length. Required when
+            ``pad_to_batch`` is set.
 
     Returns:
         A collator producing one VLM micro-batch dictionary.
+
+    Raises:
+        NotImplementedError: If a reserved option is requested.
+        ValueError: If ``pad_to_batch`` is set without ``max_seq_len``, or a
+            padding option is invalid.
     """
     if packing:
-        raise NotImplementedError("The temporary VLM collator does not support packing")
+        # One step = one packed window (see ``data/vlm/packing.py``): the dynamic batch sampler
+        # selects samples up to the token budget, then this packs them and pads the remainder.
+        from hyper_parallel.data.vlm.packing import (  # pylint: disable=import-outside-toplevel
+            VlmPackingCollator,
+        )
+
+        return VlmPackingCollator(
+            max_seq_len=max_seq_len or pad_to_length,
+            pad_to_length=pad_to_length,
+            ignore_index=ignore_index,
+        )
     if pad_token_id != 0 or ignore_index != IGNORE_INDEX or pad_to_length is not None:
         raise NotImplementedError("The temporary VLM collator does not support custom text padding")
-    return VLMCollator(pad_to_batch=pad_to_batch, pad_granularity=pad_granularity)
+    return VLMCollator(pad_to_batch=pad_to_batch, pad_granularity=pad_granularity,
+                       max_seq_len=max_seq_len)
 
 
 __all__ = ["VLMCollator", "build_vlm_collator"]
