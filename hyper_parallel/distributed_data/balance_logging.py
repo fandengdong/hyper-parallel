@@ -20,7 +20,9 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from hyper_parallel.tools.logging import get_logger
+
+logger = get_logger("DPBalance")
 
 
 def _layout_lines(label: str, ranks: Sequence[int], layout: Sequence[Any]) -> list[str]:
@@ -89,7 +91,8 @@ def log_balance_stats(stats: dict[str, Any], step: int, max_steps: int | None = 
         step: One-based delivered step number.
         max_steps: Optional training step limit.
     """
-    logger.info("%s", format_balance_stats(stats, step, max_steps))
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("%s", format_balance_stats(stats, step, max_steps))
 
 
 __all__ = ["format_balance_stats", "log_balance_stats"]

@@ -268,7 +268,7 @@ class LocalBalancingDataLoader:
         self._iterator: _LocalBalancingIterator | None = None
         self._device_prefetch = device_prefetch
         self._data_stream = None
-        self._balance_stats_callback = balance_stats_callback
+        self._balance_stats_callback = balance_stats_callback if config.dp_balance_log else None
 
     @property
     def _uses_synchronous_collectives(self) -> bool:
@@ -472,7 +472,7 @@ class LocalBalancingDataLoader:
                     samples.append(BufferedSampleMetadata(key, metadata, len(samples)))
             plan = self._planner.plan(samples, reference_bins=reference_bins, step=step)
             stats = self._statistics(plan, step)
-            if self._global_rank == 0:
+            if self._global_rank == 0 and self.config.dp_balance_log:
                 stats.update(self._bin_statistics(gathered, plan))
             result = (plan, stats)
         return result
@@ -575,7 +575,7 @@ def build_local_balancing_dataloader(
         local_dataloader: Each yield contains exactly local_batch_size non-empty
             raw-sample bins. The source owns sampling and worker prefetch.
         mesh: WORLD-covering named mesh with model-parallel dimensions of size one.
-        config: Packing limits and the minimum relative improvement required.
+        config: Packing limits, minimum relative improvement and dp_balance_log.
         metadata_fn: CPU-only per-sample metadata and cost features.
         pack_fn: Construct one packed sequence from its assigned raw samples.
         collate_fn: Assemble the local step as a sequence of microbatches.

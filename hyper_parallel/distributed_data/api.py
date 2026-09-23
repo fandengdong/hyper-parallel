@@ -127,6 +127,9 @@ class DistributedDatasetConfig:
             is the default for NPU training and serializes control objects into
             accelerator tensors. ``gloo`` keeps control and CPU payload
             communication on Gloo. HCCL requires an NPU communication device.
+        dp_balance_log: ``1`` enables node-local before/after and transfer logs;
+            ``0`` skips their output and per-bin diagnostic aggregation without
+            changing planning, communication or device prefetch.
     """
 
     seq_len: int
@@ -145,6 +148,7 @@ class DistributedDatasetConfig:
     min_balance_gain: float = 0.0
     packing_budgets: dict[str, float] | None = None
     communication_backend: Literal["gloo", "hccl"] = "hccl"
+    dp_balance_log: Literal[0, 1] = 1
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -182,6 +186,8 @@ class DistributedDatasetConfig:
             raise ValueError("min_balance_gain must be in [0, 1).")
         if self.communication_backend not in ("gloo", "hccl"):
             raise ValueError("communication_backend must be 'gloo' or 'hccl'.")
+        if type(self.dp_balance_log) is not int or self.dp_balance_log not in (0, 1):
+            raise ValueError("dp_balance_log must be 0 or 1.")
         if not self.drop_last:
             raise ValueError(
                 "Dynamic distributed packing currently requires drop_last=True so every DP rank receives the "
@@ -345,6 +351,8 @@ def _config_fingerprint(
         uses_default_collate: bool,
 ) -> str:
     stable_config = asdict(config)
+    # Logging does not change data order or checkpoint compatibility.
+    stable_config.pop("dp_balance_log")
     if config.packing_budgets is None:
         stable_config.pop("packing_budgets")
     else:

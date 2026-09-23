@@ -18,6 +18,7 @@ Run with ``torchrun --master-addr=127.0.0.1 --nproc-per-node=2
 examples/torch/distributed_data/external_dataset.py``.
 """
 
+import argparse
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -60,8 +61,21 @@ def collate_tokens(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def token_metadata(sample: dict[str, Any]) -> SampleMetadata:
+    """Derive metadata without adding custom objects to exchanged payloads.
+
+    Args:
+        sample: One CPU token sequence from the selected step.
+    """
+    length = sample["input_ids"].numel()
+    return SampleMetadata(pack_tokens=length, features={"P": length, "D": 0})
+
+
 def main() -> None:
     """Bind already-selected steps and consume batches with a normal loop."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dp-balance-log", type=int, choices=(0, 1), default=1)
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     dist.init_process_group("gloo")
     rank = dist.get_rank()
@@ -70,13 +84,15 @@ def main() -> None:
     source = [
         [[{
             "input_ids": torch.full((length,), rank + step, dtype=torch.int64),
-            "metadata": SampleMetadata(pack_tokens=length, features={"P": length, "D": 0}),
         } for length in lengths]]
         for step in range(3)
     ]
-    config = DistributedDatasetConfig(seq_len=300, local_batch_size=1, min_balance_gain=0.0)
+    config = DistributedDatasetConfig(
+        seq_len=300, local_batch_size=1, min_balance_gain=0.0,
+        communication_backend="gloo", dp_balance_log=args.dp_balance_log,
+    )
     dataset = build_distributed_dataset(
-        source, metadata="metadata", collate_fn=collate_tokens,
+        source, metadata=token_metadata, collate_fn=collate_tokens,
         cpu_fields=("offsets",), log_fields=("P", "D"),
     )
     try:

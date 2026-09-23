@@ -1,5 +1,7 @@
 # Node-local balancing
 
+中文上手说明（含完整的自定义 cost / 蛇形分配示例）：[使用说明](distributed_dataloader_doc.md)。
+
 Dataset-owned or external raw-step loading uses default backbone FLOPs,
 capacity-constrained LPT, configurable node-local data exchange, automatic
 one-step buffering, and final H2D on a copy stream. Set
@@ -69,10 +71,11 @@ config = DistributedDatasetConfig(
     local_batch_size=microbatches_per_step,
     packing_budgets=packing_budgets,
     min_balance_gain=0.0,
+    dp_balance_log=1,  # 0 hides the complete per-DP balance report
 )
 dataset = build_distributed_dataset(
     source,
-    metadata="metadata",       # SampleMetadata already produced by the transform
+    metadata=sample_metadata,  # CPU callback returning SampleMetadata
     collate_fn=model_collator,  # Existing collator, called once per accepted bin
     cpu_fields=("cu_seqlens",),
     log_fields=("P", "D"),     # Optional additive metadata.features fields
@@ -93,16 +96,20 @@ with build_distributed_dataloader(
   Each source output is `[[sample, ...], ...]`, with one bin per microbatch.
   Use the original loader with final collation disabled to retain its selection
   behavior. A flat map-style dataset alone does not define those step boundaries.
-- `metadata` accepts either an existing `sample -> SampleMetadata` callable,
-  or a mapping field name containing precomputed `SampleMetadata`. A named
-  metadata field is omitted from the dictionaries passed to the collator.
-  The source is not consumed during dataset or loader construction.
+- Prefer a `sample -> SampleMetadata` callable. The interface also accepts a
+  mapping field name, but the current online payload codec cannot exchange an
+  embedded `SampleMetadata` object: its removal before collation is too late
+  for transport. Keep plain numeric features in the raw payload and construct
+  metadata in the callback. The source is not consumed during construction.
 - `cpu_fields` names top-level fields of the collated mapping. Their complete
   subtrees stay on CPU; other tensor leaves move recursively. Metadata and
   collation remain application semantics, not model names embedded in Hyper.
 - `log_fields` selects numeric `SampleMetadata.features` to sum per bin.
   Generic sample/sequence/cost and send/receive logs need no extra callback.
-  Configure the application's Python logging to include INFO messages.
+  Hyper owns the `DPBalance` logger; no application logger setup is needed.
+  `config.dp_balance_log=0` suppresses the report and per-bin aggregation,
+  without changing balancing, exchange, buffering or H2D. The default is `1`.
+  `HP_LOG_CONFIG=DPBalance:WARNING` can also filter INFO output centrally.
 - Iteration returns ready device microbatches. The loader waits on the copy
   event and records storage on the consumer stream internally. No explicit
   device-consumption hook or application-side H2D is needed.

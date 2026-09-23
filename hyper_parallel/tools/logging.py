@@ -40,9 +40,10 @@ Three concerns are deliberately decoupled so each can change independently:
   unrecognised name still works but warns once, to catch typos that would
   otherwise silently produce no logs.
 
-Logging is *off by default* (each component logger starts at ``WARNING``): the
-stdout handler is always installed, but ``debug``/``info`` calls stay silent
-until a component is enabled by env var or code. Output goes to ``stdout``.
+Most component loggers start at ``WARNING``. ``DPBalance`` starts at ``INFO``
+to retain loader diagnostics; each loader can disable these with
+``DistributedDatasetConfig.dp_balance_log=0``. ``HP_LOG_CONFIG`` overrides
+component levels. Output goes to ``stdout``.
 
 Usage::
 
@@ -75,8 +76,9 @@ HP_LOG_CONFIG_ENV = "HP_LOG_CONFIG"
 # Logger namespace; each component lives at ``hyper_parallel.<component>``.
 _NAMESPACE = "hyper_parallel"
 
-# Components stay silent until explicitly enabled.
+# Diagnostic components can retain a more verbose default independently.
 _DEFAULT_LEVEL = logging.WARNING
+_COMPONENT_DEFAULT_LEVELS = {"DPBalance": logging.INFO}
 
 # Component label used when ``get_logger`` is called without one.
 _DEFAULT_COMPONENT = "HP"
@@ -87,7 +89,7 @@ _DEFAULT_COMPONENT = "HP"
 # silently never match. Whoever adds a new component (DTensor, CP, EP, ...)
 # appends its name here (one line) to make it case-insensitive and silence the
 # typo warning.
-_KNOWN_COMPONENTS = (_DEFAULT_COMPONENT, "FSDP", "DCP")
+_KNOWN_COMPONENTS = (_DEFAULT_COMPONENT, "FSDP", "DCP", "DPBalance")
 _CANONICAL = {name.upper(): name for name in _KNOWN_COMPONENTS}
 _warned_unknown = set()
 
@@ -226,7 +228,7 @@ def get_logger(component: str = _DEFAULT_COMPONENT) -> logging.Logger:
     # are not duplicated by an app-level root handler.
     component_logger.handlers = [_make_handler(component)]
     component_logger.propagate = False
-    component_logger.setLevel(_env_levels().get(component, _DEFAULT_LEVEL))
+    component_logger.setLevel(_env_levels().get(component, _COMPONENT_DEFAULT_LEVELS.get(component, _DEFAULT_LEVEL)))
     _registry[component] = component_logger
     return component_logger
 

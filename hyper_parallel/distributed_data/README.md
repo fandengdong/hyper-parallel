@@ -4,6 +4,10 @@ This PyTorch data path separates Dataset Readers, planning, and Data
 Constructors, inspired by MegaScale-Data. Step membership belongs to the
 upstream producer, not to a metadata read-ahead window.
 
+For a practical Chinese guide to building the dataset/loader, controlling logs,
+and replacing the cost model or assignment algorithm, see
+[使用说明：接入、日志、cost 和均衡算法](distributed_dataloader_doc.md).
+
 ```text
 native BatchSampler selects this step's Dataset-index occurrences
   -> metadata: look up only selected indices
@@ -492,11 +496,11 @@ The default packer and collator preserve the structure as a tuple of bins,
 each containing the raw samples. Custom callbacks must be consistent across
 ranks.
 
-Online payload A2A defaults to CPU/Gloo. A rank-local `device`
-uses the WORLD accelerator backend by default (HCCL for NPU or NCCL for CUDA);
-Python payloads still incur serialization and Host/device copies. The enabled
-node-local path always exchanges raw samples with Gloo and uses the training
-device only for final H2D. Shared metadata mode bypasses payload transport entirely.
+`DistributedDatasetConfig.communication_backend` defaults to HCCL and requires
+an NPU device. Set it explicitly to `"gloo"` for host control/payload exchange;
+pass a rank-local accelerator `device` to retain final H2D. Python payloads
+still incur serialization, and HCCL also incurs Host/device copies for data
+transport. Shared metadata mode bypasses payload transport entirely.
 
 ## Current boundaries
 
@@ -504,8 +508,8 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 - Iterable/streaming online data uses an external complete-step source on every pure-DP rank.
 - Node-local balancing retains at most one prefetched step, including
   final H2D. The first step waits for preparation; the original path is synchronous.
-- Gloo control plane and pickle payloads; online A2A
-  may use Gloo, NCCL, or HCCL.
+- Control/payload transport uses the configured HCCL or Gloo backend;
+  accelerator model-peer broadcasts can use HCCL/NCCL separately.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
 - Native sampler checkpoints are per rank and include transformed read-ahead payloads. Sample
   keys and plans replay exactly when the Dataset stream is deterministic for a
