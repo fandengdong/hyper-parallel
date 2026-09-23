@@ -115,6 +115,28 @@ token 预算选样本，`SamplePacker` 顺序拼接整个样本（不再把窗�
    **拉起前务必确认节点真空闲**：本集群别人的任务常常不是 `torchrun` 形式，
    仅看进程名会误判，随后我们的作业会以"诡异的低分配 OOM"失败。
    仓库自带工具：`bash /home/fdd/workspace/bin/find_empty_nodes.sh <ip_list_file>`。
+6. **HF `datasets` 缓存必须先预热**（2026-09-23 实测，冷缓存下 256 rank 必挂）。
+   omni 数据层经 `datasets.load_dataset` 读源，缓存默认落在 `~/.cache/huggingface/datasets`。
+   冷缓存时 256 个 rank 会同时构建同一个缓存条目，而 HF 的 builder 锁在本集群共享文件系统上
+   **无法串行化加载后的 `.filter(sample_filter)` 这一步**，于是索引缓存被并发写坏，全部 rank 报：
+
+   ```
+   FileNotFoundError: .../datasets/json/default-<hash>/.../cache-<hash>.arrow
+   OSError: error stat()ing file
+   ```
+
+   必须先**单进程**把两级缓存建好，再用 `HF_DATASETS_CACHE` 指向它启动：`json-train.arrow`
+   （源渲染）与 `.filter()` 的 `cache-<hash>.arrow`（行索引）。注意第二级必须用**同一个函数对象**
+   （`OmniDataTransform.is_valid_sample`，指纹会哈希它），所以要在 `hyper_parallel` 可导入的环境里建
+   （本机裸 Python 导入会因 torch_npu 初始化卡住，用 pytest 跑一个一次性模块最稳）。
+   这是 omni 加载器的性质，不是本包特有：trainer_dev 自己的 omni 配置冷缓存同样会撞。
+7. **真实路由那一档必须配 expert capacity**。`configs/256card_2sn/gbs4096_realrouter.yaml`
+   （`fix_router: false`）交付的形态是 `swap_inputs: false` + 无 `capacity_factor`，
+   正是文档里 `r37` 记录的 OOM 形态：真实路由下最忙的 rank 承担峰值，GBS4096 会
+   `NPU out of memory`。实测即使补上 `--activation_checkpoint.swap_inputs=true`，GBS256 仍
+   OOM（已分配 54.10 GB / 仅剩 4 GB）；**加上 `HP_EP_CAPACITY_FACTOR=4.5` 后正常跑完**
+   （8 步 0 报错，峰值 52.90 GB，min 步时 40.45 s）。均衡档（`fix_router: true`）不需要 capacity，
+   它靠"每 rank token 数完全相同"压内存。
 
 ---
 
