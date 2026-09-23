@@ -54,8 +54,10 @@
 
 ### 1.4 真实数据线（COCO2017 8K packing，另一条口径）
 
-`configs/realdata_2sn/coco2017_2sn_8k_packed_cap45.yaml`：每窗拼满 8192（10 样本 / 10 图，填充率 93.4%），
-稳态 **50–58 s/step**、峰值 **50.37 GB**、**real tok/s 8,210**、supervised/padded 22.6%；
+`configs/realdata_2sn/coco2017_2sn_8k_packed_cap45.yaml`：`OmniPackingLoader` 按 8K
+token 预算选样本，`SamplePacker` 顺序拼接整个样本（不再把窗口补到 8192，而是拼到预算内，
+并下发 int32 `cu_seq_lens` 做块对角注意力）。该配方实测：稳态 **50–58 s/step**、
+峰值 **50.37 GB**、**real tok/s 8,210**、supervised/padded 22.6%；
 等步数 loss 下降是 padded 臂的 **1.89×**。
 
 > 这条线的步时**不能**和 §1.1/§1.2 的合成数据吞吐数字直接比较（序列长度分布完全不同）。
@@ -102,7 +104,7 @@
 1. **代码**：本 PR 所在的 commit（配置的 `_target_` 指向仓库内的模块 ——
    `examples.training_demo.cropped_kimi_vlm.build_cropped_kimi_vlm`、
    `hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn`、
-   `hyper_parallel.data.vlm.*`、`hyper_parallel.components.optim.builders.AdamW`）。
+   `hyper_parallel.data.omni.*`、`hyper_parallel.components.optim.builders.AdamW`）。
 2. **模型目录**：见 §4。**只读 `config.json` 与 processor/tokenizer 文件**；
    这些吞吐配置**都不加载 1.9T 权重**（没有任何一个设 `load_pretrained: true`）。
 3. **数据**：见 §4。合成吞吐数据的 JSON 需**样本数 ≥ `global_batch_size`**，
@@ -118,12 +120,13 @@
 
 ## 4. 需要改的路径
 
-配置里只有 **2 个绝对路径**（真实数据线是 3 个），全部指向作者的集群存储，**换机器必须改**：
+配置里的绝对路径全部指向作者的集群存储，**换机器必须改**：
 
 | YAML key | 当前值 | 说明 |
 |---|---|---|
 | `model.config_path` | `/home/fdd/workspace/models/moonshotai/Kimi-K2.6` | Kimi-K2.6 模型目录。`AutoConfig.from_pretrained` 从这里读 `config.json`（`model_type` 必须是 `kimi_k25`） |
-| `model.pretrained_model_name_or_path` | 同上 | VLM trainer 用 `AutoProcessor.from_pretrained(..., trust_remote_code=False)` 从这里建 native processor |
+| `model.pretrained_model_name_or_path` | 同上 | 模型加载路径 |
+| `dataset.model_assets.pretrained_model_name_or_path` | 同上 | VLM trainer 用 `dataset.model_assets`（`hyper_parallel.data.omni.omni_transform.build_auto_processor`）并透传 `model.trust_remote_code=false`，从这里建 native processor |
 | `dataset.data_path`（9 个配置） | `/home/fdd/workspace/datasets/mm_datasets/mock_vlm_dataset/mock_data_pic_num_10_textlen_10240.json` | 合成吞吐数据（457 MB 目录，10240 条 × 10 图） |
 | `dataset.data_path`（COCO 线） | `/home/fdd/workspace/datasets/COCO2017/mllm_format_llava_instruct_data.json` | 真实数据（196 MB） |
 

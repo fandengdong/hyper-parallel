@@ -55,6 +55,27 @@ if TYPE_CHECKING:
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
+    from hyper_parallel.models.adapter_spec import RecomputePolicy
+    from hyper_parallel.models.materialization import (
+        MaterializationContext,
+        MaterializationReason,
+        MaterializedStateHook,
+        RebuildableBufferSpec,
+        rebuild_materialized_state,
+        register_materialized_state_hook,
+        register_rebuildable_buffer,
+    )
+    from hyper_parallel.models.validation_spec import (
+        CheckpointValidationSpec,
+        DataValidationSpec,
+        ModelValidationSpec,
+        ModuleParityCase,
+        ObservationSpec,
+        ParameterProbeSpec,
+        SharedStateValidationSpec,
+        StateInvariantSpec,
+        TopologyConstraint,
+    )
 
 
 _LAZY_FACADE_EXPORTS = {
@@ -63,22 +84,61 @@ _LAZY_FACADE_EXPORTS = {
     "HyperAutoModelForSequenceClassification": "hyper_parallel.models._transformers",
 }
 
+_LAZY_MATERIALIZATION_EXPORTS = {
+    "MaterializationContext",
+    "MaterializationReason",
+    "MaterializedStateHook",
+    "RebuildableBufferSpec",
+    "rebuild_materialized_state",
+    "register_materialized_state_hook",
+    "register_rebuildable_buffer",
+}
+
+_LAZY_VALIDATION_EXPORTS = {
+    "CheckpointValidationSpec",
+    "DataValidationSpec",
+    "ModelValidationSpec",
+    "ModuleParityCase",
+    "ObservationSpec",
+    "ParameterProbeSpec",
+    "SharedStateValidationSpec",
+    "StateInvariantSpec",
+    "TopologyConstraint",
+}
+
 __all__ = [
     "CompileConfig",
+    "CheckpointValidationSpec",
+    "DataValidationSpec",
     "FSDP2Config",
     "FSDP2MixedPrecisionConfig",
     "HyperAutoModelForCausalLM",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
+    "MaterializationContext",
+    "MaterializationReason",
+    "MaterializedStateHook",
     "ModelAdapterSpec",
     "ModelBuildOptions",
+    "ModelValidationSpec",
+    "ModuleParityCase",
+    "ObservationSpec",
+    "ParameterProbeSpec",
+    "RebuildableBufferSpec",
+    "RecomputePolicy",
+    "SharedStateValidationSpec",
+    "StateInvariantSpec",
+    "TopologyConstraint",
     "VisionFlopsEstimate",
     "batch_seq_len",
     "estimate_flops_per_token",
     "estimate_vision_flops",
     "get_model_adapter",
     "normalize_build_options",
+    "rebuild_materialized_state",
+    "register_materialized_state_hook",
     "register_model_adapter",
+    "register_rebuildable_buffer",
     "resolve_flops_per_token",
     "resolve_vision_flops",
 ]
@@ -91,8 +151,20 @@ def __getattr__(name):  # pylint: disable=invalid-name
         value = getattr(module, name)
         globals()[name] = value
         return value
+    if name in _LAZY_MATERIALIZATION_EXPORTS:
+        module = importlib.import_module(".materialization", __name__)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    if name in _LAZY_VALIDATION_EXPORTS:
+        module = importlib.import_module(".validation_spec", __name__)
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     if name == "ModelAdapterSpec":
         return importlib.import_module(".adapter_spec", __name__).ModelAdapterSpec
+    if name == "RecomputePolicy":
+        return importlib.import_module(".adapter_spec", __name__).RecomputePolicy
     if name in ("get_model_adapter", "register_model_adapter"):
         return getattr(importlib.import_module(".registry", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -100,4 +172,9 @@ def __getattr__(name):  # pylint: disable=invalid-name
 
 def __dir__():  # pylint: disable=invalid-name
     """Include lazy facade exports in ``dir()``."""
-    return sorted(set(globals()) | set(_LAZY_FACADE_EXPORTS))
+    return sorted(
+        set(globals())
+        | set(_LAZY_FACADE_EXPORTS)
+        | _LAZY_MATERIALIZATION_EXPORTS
+        | _LAZY_VALIDATION_EXPORTS
+    )

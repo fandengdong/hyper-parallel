@@ -783,16 +783,17 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
-  _target_: hyper_parallel.data.vlm.build_vlm_dataset
-  # Random/mock dataset for throughput testing: keep every record. The filter has to
-  # transform the whole dataset during construction (per rank), which is prohibitive
-  # for 10240 records x 10 images; off, construction is O(1).
-  filter_trainable: false
-  data_config:
-    source_type: online
-  data_path: /home/fdd/workspace/datasets/mm_datasets/mock_vlm_dataset/mock_data_pic_num_10_textlen_10240.json
+  # Model-owned processor: built through the Omni ``model_assets`` target so the VLM
+  # trainer forwards ``model.trust_remote_code`` to ``AutoProcessor``.
+  model_assets:
+    _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
+    pretrained_model_name_or_path: /home/fdd/workspace/models/moonshotai/Kimi-K2.6
+    trust_remote_code: false          # native kimi_k25 processor (image_grid_thw protocol)
+    local_files_only: true
   data_transform:
-    _target_: hyper_parallel.data.vlm.kimi_transform.build_kimi_vlm_data_transform
+    # Eager (padding) Kimi transform: encodes one sample and pads it to max_seq_len,
+    # which is the shape the fixed-sample throughput arms below measure.
+    _target_: hyper_parallel.data.omni.kimi_transform.build_kimi_omni_transform
     max_seq_len: 8192
     # ARM H: align the image budget with MindSpeed-MM. Their kimi_k3 config sets
     # image_max_pixels: 262144 (=512*512) and resizes by sqrt(max_px/(w*h)) before
@@ -801,12 +802,25 @@ dataset:
     # grid [1,74,74] -> 1369 tokens/image, so 10 images = 13690 > 12288 and the
     # assistant turn is truncated away entirely (loss = 0).
     image_max_pixels: 262144
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: /home/fdd/workspace/datasets/mm_datasets/mock_vlm_dataset/mock_data_pic_num_10_textlen_10240.json
+  data_config:
+    # Random/mock dataset for throughput testing: keep every record. The filter has to
+    # transform the whole dataset during construction (per rank), which is prohibitive
+    # for 10240 records x 10 images; off, construction is O(1).
+    filter_trainable: false
 
 dataloader:
+  # Fixed-sample, pad-to-max_seq_len path (NOT packed): the eager Omni Kimi transform pads
+  # every sample to max_seq_len, OmniCollator stacks the equal-length rows, and the shipped
+  # padded-token throughput numbers come from this shape. The token-budget packing path is
+  # only the COCO real-data arm.
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
-  dataloader_type: single
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

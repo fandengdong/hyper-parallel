@@ -38,7 +38,8 @@ from torch.utils.data import Dataset
 
 from tests.common.mark_utils import arg_mark
 
-from hyper_parallel.data.vlm.dataset import _RepeatedDataset, build_vlm_dataset
+from hyper_parallel.data.omni import OmniDataTransform
+from hyper_parallel.data.omni.build_dataset import _RepeatedDataset, build_online_omni_mapping_dataset
 
 _CPU_MARKS = {"plat_marks": ["cpu_linux", "cpu_macos"], "level_mark": "level0",
               "card_mark": "allcards", "essential_mark": "essential"}
@@ -218,14 +219,28 @@ class TestRepeatedDatasetShuffle(unittest.TestCase):
             _RepeatedDataset(_CountingSource(4), 0, shuffle=True)
 
 
+class _IdentityOmniTransform(OmniDataTransform):
+    """Return each Omni source record unchanged (test-only transform)."""
+
+    def __init__(self) -> None:
+        """Bind a placeholder processor and a tiny sequence limit."""
+        super().__init__(max_seq_len=8, processor=object())
+
+    def encode_sample(self, sample: dict) -> dict:
+        """Return the raw record unchanged."""
+        return sample
+
+
 class TestBuildVlmDatasetRepeat(unittest.TestCase):
     """``data_config['repeat']`` reaches the wrapper through the builder."""
 
     @staticmethod
     def _write_list(path: str, count: int) -> None:
-        """Write a LLaVA-style JSON list of ``count`` records, each with a distinct id."""
+        """Write ``count`` JSONL records, each with messages and a distinct id."""
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump([{"messages": [], "id": index} for index in range(count)], handle)
+            for index in range(count):
+                record = {"messages": [{"role": "user", "content": "hi"}], "id": index}
+                handle.write(json.dumps(record) + "\n")
 
     @staticmethod
     def _ids(dataset: object, count: int) -> list:
@@ -233,12 +248,11 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
         return [dataset[index]["id"] for index in range(count)]
 
     def _build(self, data_path: str, data_config: dict) -> object:
-        """Build a lazy dataset (no transform, no trainable filter)."""
-        return build_vlm_dataset(
+        """Build a lazy Omni mapping dataset with an identity transform."""
+        return build_online_omni_mapping_dataset(
             data_config=data_config,
             data_path=data_path,
-            transform=None,
-            filter_trainable=False,
+            transform=_IdentityOmniTransform(),
         )
 
     @arg_mark(**_CPU_MARKS)
@@ -251,7 +265,7 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
             is the same record as index ``i``.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            data_path = os.path.join(tmp, "data.json")
+            data_path = os.path.join(tmp, "data.jsonl")
             self._write_list(data_path, 3)
             plain = self._build(data_path, {"source_type": "online"})
             repeated = self._build(data_path, {"source_type": "online", "repeat": 3})
@@ -268,7 +282,7 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
             no extra indirection.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            data_path = os.path.join(tmp, "data.json")
+            data_path = os.path.join(tmp, "data.jsonl")
             self._write_list(data_path, 2)
             for config in ({"source_type": "online"}, {"source_type": "online", "repeat": 1}):
                 with self.subTest(config=config):
@@ -286,7 +300,7 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
             single pass -- and every record id is still served exactly once.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            data_path = os.path.join(tmp, "data.json")
+            data_path = os.path.join(tmp, "data.jsonl")
             self._write_list(data_path, 8)
             built = self._build(data_path, {"source_type": "online", "shuffle": True})
             self.assertIsInstance(built, _RepeatedDataset)
@@ -300,17 +314,19 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
         """Feature: shuffle wiring default.
 
         Description: Build with ``shuffle`` false and with it absent.
-        Expectation: Neither is wrapped, so the ordering stays the file's.
+        Expectation: Neither is wrapped, so both serve the same source order --
+            the Omni Mapping source owns its own deterministic per-epoch order.
         """
         with tempfile.TemporaryDirectory() as tmp:
-            data_path = os.path.join(tmp, "data.json")
+            data_path = os.path.join(tmp, "data.jsonl")
             self._write_list(data_path, 4)
-            for config in ({"source_type": "online"},
-                           {"source_type": "online", "shuffle": False}):
+            built_default = self._build(data_path, {"source_type": "online"})
+            built_false = self._build(data_path, {"source_type": "online", "shuffle": False})
+            for config, built in (("default", built_default), ("false", built_false)):
                 with self.subTest(config=config):
-                    built = self._build(data_path, config)
                     self.assertNotIsInstance(built, _RepeatedDataset)
-                    self.assertEqual(self._ids(built, 4), list(range(4)))
+                    self.assertEqual(sorted(self._ids(built, 4)), list(range(4)))
+            self.assertEqual(self._ids(built_default, 4), self._ids(built_false, 4))
 
 
 if __name__ == "__main__":

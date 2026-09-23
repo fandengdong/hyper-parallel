@@ -781,38 +781,43 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
-  _target_: hyper_parallel.data.vlm.build_vlm_dataset
-  data_config:
-    source_type: online
-  data_path: /home/fdd/workspace/datasets/COCO2017/mllm_format_llava_instruct_data.json
-  # FOUND ON FIRST ATTEMPT: filter_trainable defaults to true, which runs the
-  # full transform over EVERY record during construction (single-threaded, per
-  # rank). At 570k real records that is a multi-hour silent startup, not a hang.
-  filter_trainable: false
+  model_assets:
+    _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
+    pretrained_model_name_or_path: /home/fdd/workspace/models/moonshotai/Kimi-K2.6
+    trust_remote_code: false          # native kimi_k25 processor (image_grid_thw protocol)
+    local_files_only: true
   data_transform:
-    _target_: hyper_parallel.data.vlm.kimi_transform.build_kimi_vlm_data_transform
+    # Packed arm: the deferred hooks render each conversation once, report its exact
+    # ``packing_length`` for candidate selection, and truncate only (no per-sample pad),
+    # so SamplePacker concatenates whole samples up to the token budget.
+    _target_: hyper_parallel.data.omni.kimi_transform.build_kimi_omni_transform
+    deferred: true
     max_seq_len: 8192
     # No image_max_pixels: native resolution is the point of the 8192 window.
     # A 2250x1500 SAM image costs ~4187 merged vision tokens, so one image plus
     # its caption (~200 tok) needs ~4400 -- it fits, where the 2048 window had to
     # drop the image outright.
-    pad_granularity: 128
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: /home/fdd/workspace/datasets/COCO2017/mllm_format_llava_instruct_data.json
+  data_config:
+    # FOUND ON FIRST ATTEMPT: filter_trainable defaults to true, which runs the
+    # full transform over EVERY record during construction (single-threaded, per
+    # rank). At 570k real records that is a multi-hour silent startup, not a hang.
+    filter_trainable: false
 
 dataloader:
-  # One training step = ONE packed 8K window per rank: the dynamic loader selects
-  # samples by token budget (batch_size x max_seq_len = 1 x 8192) and the packing
-  # collator concatenates them, padding only the remainder.
-  _target_: hyper_parallel.data.batching.DynamicBatchDataLoader
-  batch_size: 1
-  max_seq_len: 8192
-  min_buffered_samples: 8
+  # One training step = ONE packed 8K window per rank: OmniPackingLoader selects samples by
+  # token budget (8192) and SamplePacker concatenates them in order, padding nothing and
+  # emitting int32 cu_seq_lens for block-diagonal attention. The old per-sample
+  # ``pad_granularity: 128`` is gone: packing concatenates whole samples, so it is not needed.
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
   collate_fn:
-    _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
-    # packing: 拼满 8K 窗口（块对角掩码随批次一起下发），只对余量做 padding
-    packing: true
-    pad_granularity: 128
-    max_seq_len: 8192
-  dataloader_type: single
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
+  token_budget: 8192
+  min_buffered_samples: 8
   data_rearrange_map: null
   data_sharding: false
   drop_last: true

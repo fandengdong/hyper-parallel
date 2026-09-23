@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for VeOmni-style VLM packing (fill the window, pad the remainder).
+"""Unit tests for the merged Omni/VLM packing path.
 
-Real instruction samples are short (~175 tokens for COCO LLaVA-instruct) while the window is
-8192, so padding each sample costs 97.7% of the compute.  Packing is only *sound* if the
-sub-sequence boundaries travel with the batch, so these tests pin both halves: the window
-filling arithmetic, and the ``cu_seq_lens`` contract that keeps attention block diagonal.
+Real instruction samples are short (~175 tokens for COCO LLaVA-instruct) while
+the window is 8192, so padding each sample costs most of the compute. The merged
+design packs with :class:`SamplePacker` / :class:`FirstFitPackingSelector`:
+candidate samples are concatenated in order up to the token budget, and the
+packed batch carries ``cu_seq_lens`` so the model can build a block-diagonal
+attention mask. These tests pin the field handling (text and modality) and the
+``cu_seq_lens`` contract that keeps attention from leaking across samples.
 """
 # pylint: disable=wrong-import-position
 
@@ -28,16 +31,14 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402
 
-from hyper_parallel.data.vlm.packing import (  # noqa: E402
-    VlmPackingCollator,
-    block_diagonal_mask,
-    pack_vlm_samples,
-    sample_length,
-)
+from hyper_parallel.data.batching.build_collate_fn import build_omni_collate_fn
+from hyper_parallel.data.batching.dynamic_batch import PackingCandidateBuffer
+from hyper_parallel.data.batching.packing import FirstFitPackingSelector, SamplePacker
+from hyper_parallel.data.batching.runtime_input import AttentionRuntime, RuntimeInputContext
 
 
 def _sample(length, image_rows=0, offset=0):
-    """Build one fake transformed sample of ``length`` tokens."""
+    """Build one fake encoded sample of ``length`` tokens."""
     sample = {
         "input_ids": torch.arange(offset, offset + length),
         "labels": torch.arange(offset, offset + length),
@@ -50,179 +51,148 @@ def _sample(length, image_rows=0, offset=0):
     return sample
 
 
-class TestWindowFilling(unittest.TestCase):
-    """Greedy filling must never split a sample and must fill to the cap."""
+class TestPackedFields(unittest.TestCase):
+    """Text concatenates on the token axis, modality concatenates on dim 0."""
 
-    def test_short_samples_are_packed_until_the_window_is_full(self):
-        """14 samples of 175 tokens fill one 2048-token window and leave a tail window."""
-        samples = [_sample(175, offset=i * 175) for i in range(14)]
-        windows = pack_vlm_samples(samples, max_seq_len=2048)
-        # 11 x 175 = 1925 fits, the 12th would need 2100 > 2048.
-        self.assertEqual(len(windows), 2)
-        first = windows[0]["input_ids"]
-        self.assertEqual(first.numel(), 2048)
-        # 11 x 175 = 1925 real tokens, then 123 padded zeros.  (Counting non-zeros would
-        # undercount by one, because the very first token id IS zero -- padding shares the
-        # value, so compare the token stream instead.)
-        self.assertTrue(torch.equal(first[0, :1925], torch.arange(1925)))
-        self.assertTrue(bool((first[0, 1925:] == 0).all()))
+    def test_text_fields_concatenate_in_source_order(self):
+        """Every token field follows the packed sample order."""
+        packed = SamplePacker().pack_selected_samples([_sample(4, offset=0), _sample(3, offset=4)])
 
-    def test_only_the_remainder_is_padded(self):
-        """The last window pads only what is missing, and its labels are ignored."""
-        samples = [_sample(3000, offset=0), _sample(3000, offset=3000)]
-        windows = pack_vlm_samples(samples, max_seq_len=8192)
-        self.assertEqual(len(windows), 1)
-        window = windows[0]
-        self.assertEqual(window["input_ids"].numel(), 8192)
-        self.assertEqual(int((window["labels"] == -100).sum()), 8192 - 6000)
+        self.assertEqual(packed["input_ids"].tolist(), [0, 1, 2, 3, 4, 5, 6])
+        self.assertEqual(packed["labels"].tolist(), [0, 1, 2, 3, 4, 5, 6])
+        self.assertEqual(packed["attention_mask"].tolist(), [1] * 7)
+        self.assertEqual(packed["mm_token_type_ids"].tolist(), [0] * 7)
 
-    def test_a_full_window_is_emitted_without_extra_padding(self):
-        """Exactly-full windows leave no tail and need no synthetic boundary."""
-        windows = pack_vlm_samples([_sample(4096), _sample(4096)], max_seq_len=8192)
-        self.assertEqual(len(windows), 1)
-        self.assertEqual(windows[0]["cu_seq_lens"].tolist(), [0, 4096, 8192])
+    def test_modality_fields_concatenate_on_dim_zero(self):
+        """Vision rows must follow the image placeholders in the packed ids."""
+        first = _sample(4, image_rows=2, offset=0)
+        second = _sample(3, image_rows=1, offset=4)
+        packed = SamplePacker().pack_selected_samples([first, second])
 
-    def test_oversized_sample_is_rejected_not_split(self):
-        """A sample longer than the window is a transform bug, so it must raise."""
-        with self.assertRaises(ValueError):
-            pack_vlm_samples([_sample(9000)], max_seq_len=8192)
-
-
-class TestBoundaries(unittest.TestCase):
-    """``cu_seq_lens`` is what keeps attention from leaking across packed samples."""
+        self.assertEqual(tuple(packed["pixel_values"].shape), (3, 3))
+        self.assertEqual(packed["pixel_values"][0, 0].item(), 0.0)
+        self.assertEqual(packed["pixel_values"][-1, 0].item(), 4.0)
+        self.assertEqual(tuple(packed["image_grid_thw"].shape), (2, 3))
 
     def test_boundaries_describe_every_sub_sequence(self):
         """Each packed sample contributes one boundary, in order."""
-        windows = pack_vlm_samples([_sample(100), _sample(200), _sample(300)], max_seq_len=8192)
-        self.assertEqual(windows[0]["cu_seq_lens"].tolist(), [0, 100, 300, 600, 8192])
+        packed = SamplePacker().pack_selected_samples(
+            [_sample(100), _sample(200), _sample(300)]
+        )
+        boundaries = packed["cu_seq_lens"]
 
-    def test_padding_tail_is_its_own_boundary(self):
-        """The padded remainder is covered by a synthetic final boundary."""
-        windows = pack_vlm_samples([_sample(5000)], max_seq_len=8192)
-        cu = windows[0]["cu_seq_lens"].tolist()
-        self.assertEqual(cu[0], 0)
-        self.assertEqual(cu[-1], 8192)
-        self.assertIn(5000, cu)
+        self.assertEqual(boundaries.dtype, torch.int32)
+        self.assertEqual(boundaries.tolist(), [0, 100, 300, 600])
+        self.assertTrue(bool((boundaries[1:] >= boundaries[:-1]).all()))
 
-    def test_boundaries_are_int32_and_monotone(self):
-        """Attention kernels index with int32 and require non-decreasing ends."""
-        windows = pack_vlm_samples([_sample(700), _sample(700)], max_seq_len=2048)
-        cu = windows[0]["cu_seq_lens"]
-        self.assertEqual(cu.dtype, torch.int32)
-        self.assertTrue(bool((cu[1:] >= cu[:-1]).all()))
-
-
-class TestFieldHandling(unittest.TestCase):
-    """Text resets, modality order, and the length contract."""
-
-    def test_positions_restart_inside_each_packed_sample(self):
-        """A packed sample must not inherit the previous sample's positions."""
-        first = _sample(4, offset=0)
-        first["position_ids"] = torch.tensor([0, 1, 2, 3])
+    def test_packing_metadata_is_not_packed(self):
+        """``packing_length`` and an incoming ``cu_seq_lens`` are scheduling-only."""
+        first = _sample(4)
+        first["packing_length"] = 4
         second = _sample(3, offset=4)
-        second["position_ids"] = torch.tensor([10, 11, 12])
-        window = pack_vlm_samples([first, second], max_seq_len=8)[0]
-        self.assertEqual(window["position_ids"][0, :7].tolist(), [0, 1, 2, 3, 0, 1, 2])
+        second["packing_length"] = 3
+        packed = SamplePacker().pack_selected_samples([first, second])
 
-    def test_images_are_concatenated_in_packing_order(self):
-        """Vision rows must follow the order of the image placeholders in the packed ids."""
-        first = _sample(4, image_rows=2, offset=0)
-        second = _sample(3, image_rows=1, offset=4)
-        window = pack_vlm_samples([first, second], max_seq_len=8)[0]
-        self.assertEqual(window["pixel_values"].shape[0], 3)
-        self.assertEqual(window["pixel_values"][0, 0].item(), 0.0)
-        self.assertEqual(window["pixel_values"][-1, 0].item(), 4.0)
-        self.assertEqual(window["image_grid_thw"].shape[0], 2)
+        self.assertNotIn("packing_length", packed)
+        self.assertEqual(packed["cu_seq_lens"].tolist(), [0, 4, 7])
 
-    def test_multidimensional_position_fields_keep_their_axes(self):
-        """mRoPE positions are ``[3, S]``: packing must not flatten them into ``[3*S]``.
+    def test_single_sample_pack_is_a_passthrough_concat(self):
+        """One selected sample still yields one packed sample with a boundary."""
+        packed = SamplePacker().pack_selected_samples([_sample(5)])
 
-        The first launch died on all 256 ranks with "too many indices for tensor of dimension
-        1" because the packing flattened these; a position field must be concatenated along
-        the token axis only, and reset per sub-sequence on that same axis.
-        """
-        first = _sample(4, offset=0)
-        first["position_ids"] = torch.stack([torch.tensor([0, 1, 2, 3])] * 3)
-        second = _sample(3, offset=4)
-        second["position_ids"] = torch.stack([torch.tensor([9, 10, 11])] * 3)
-        window = pack_vlm_samples([first, second], max_seq_len=8)[0]
-        self.assertEqual(window["position_ids"].shape, (1, 3, 8))
-        self.assertEqual(window["position_ids"][0, 0, :7].tolist(), [0, 1, 2, 3, 0, 1, 2])
-        self.assertEqual(window["position_ids"][0, 2, :7].tolist(), [0, 1, 2, 3, 0, 1, 2])
+        self.assertEqual(packed["input_ids"].shape[0], 5)
+        self.assertEqual(packed["cu_seq_lens"].tolist(), [0, 5])
 
-    def test_text_position_ids_of_varying_rank_still_pack(self):
-        """A 1-D field and a 2-D field may coexist in one batch."""
-        first = _sample(3, offset=0)
-        first["text_position_ids"] = torch.tensor([0, 1, 2])
-        second = _sample(3, offset=3)
-        second["text_position_ids"] = torch.tensor([0, 1, 2])
-        window = pack_vlm_samples([first, second], max_seq_len=8)[0]
-        self.assertEqual(window["text_position_ids"].shape, (1, 8))
 
-    def test_length_helper_reports_the_token_count(self):
-        """The filler needs the token length, and a sample without ids is a bug."""
-        self.assertEqual(sample_length(_sample(37)), 37)
+class TestSelectorBudget(unittest.TestCase):
+    """The selector fills the token budget in order and never splits a sample."""
+
+    def test_first_fit_fills_the_budget_without_splitting(self):
+        """11 x 175 = 1925 fits a 2048 budget; the 12th sample is left behind."""
+        selector = FirstFitPackingSelector()
+        samples = [_sample(175, offset=index * 175) for index in range(14)]
+
+        selected = selector.select_samples_to_pack(samples, 2048)
+
+        self.assertEqual(list(selected), list(range(11)))
+        self.assertEqual(selector.get_sample_cost(samples[0]), 175)
+
+    def test_a_single_oversized_sample_forms_its_own_group(self):
+        """The first candidate is always accepted, even above the budget."""
+        selector = FirstFitPackingSelector()
+
+        self.assertEqual(list(selector.select_samples_to_pack([_sample(9000)], 2048)), [0])
+
+    def test_packing_length_overrides_the_encoded_length(self):
+        """A prepared sample can report a cheaper scheduling cost."""
+        sample = _sample(100)
+        sample["packing_length"] = 7
+
+        self.assertEqual(FirstFitPackingSelector().get_sample_cost(sample), 7)
+
+    def test_empty_budget_group_is_rejected(self):
+        """Nothing to select is an upstream bug, not an empty packed window."""
         with self.assertRaises(ValueError):
-            sample_length({})
-
-
-class TestPackingCollator(unittest.TestCase):
-    """The collator is the trainer-facing half: one step, one window, hard errors otherwise."""
-
-    def test_one_step_becomes_one_window(self):
-        """A selection inside the budget packs to exactly one padded window."""
-        collator = VlmPackingCollator(max_seq_len=2048)
-        window = collator([_sample(175, offset=i * 175) for i in range(10)])
-        self.assertEqual(window["input_ids"].numel(), 2048)
-        self.assertEqual(window["cu_seq_lens"][0].item(), 0)
-        self.assertEqual(window["cu_seq_lens"][-1].item(), 2048)
-
-    def test_oversized_selection_raises_instead_of_dropping(self):
-        """Two windows mean the sampler budget disagrees with the window size."""
-        collator = VlmPackingCollator(max_seq_len=512)
+            FirstFitPackingSelector().select_samples_to_pack([], 2048)
         with self.assertRaises(ValueError):
-            collator([_sample(400), _sample(400)])
+            PackingCandidateBuffer(
+                token_budget=16,
+                min_buffered_samples=1,
+                packing_selector=FirstFitPackingSelector(),
+            ).get_micro_batch()
 
-    def test_empty_selection_raises(self):
-        """An empty step is a bug upstream, not something to pack."""
-        with self.assertRaises(ValueError):
-            VlmPackingCollator(max_seq_len=512)([])
+    def test_candidate_buffer_selects_and_retains_the_remainder(self):
+        """Selected candidates leave the buffer; the rest survive for the next step."""
+        buffer = PackingCandidateBuffer(
+            token_budget=10,
+            min_buffered_samples=1,
+            packing_selector=FirstFitPackingSelector(),
+        )
+        for sample in (_sample(6, offset=0), _sample(6, offset=6)):
+            buffer.put_item(sample)
 
-    def test_builder_accepts_the_packing_flag(self):
-        """``build_vlm_collator(packing=True)`` must return the packing collator, not raise."""
-        from hyper_parallel.data.vlm.collator import build_vlm_collator  # pylint: disable=C0415
+        selected = buffer.get_micro_batch()
 
-        collator = build_vlm_collator(packing=True, max_seq_len=8192)
-        self.assertIsInstance(collator, VlmPackingCollator)
-        self.assertEqual(collator.max_seq_len, 8192)
+        self.assertEqual([sample["input_ids"][0].item() for sample in selected], [0])
+        self.assertEqual(len(buffer.buffer), 1)
+        self.assertEqual(buffer.buffer_token_count, 6)
 
-    def test_invalid_window_is_rejected(self):
-        """A non-positive window cannot be packed into."""
-        with self.assertRaises(ValueError):
-            VlmPackingCollator(max_seq_len=0)
+    def test_packing_one_window_collates_with_the_omni_collator(self):
+        """A packed step is one sample, and OmniCollator accepts it unchanged."""
+        packed = SamplePacker().pack_selected_samples([_sample(4), _sample(3, offset=4)])
+        batch = build_omni_collate_fn()([packed])
+
+        self.assertEqual(tuple(batch["input_ids"].shape), (1, 7))
+        self.assertEqual(batch["cu_seq_lens"].reshape(-1).tolist(), [0, 4, 7])
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _attention_mask(boundaries, seq_length, reset_mask=True):
+    """Build the runtime attention mask for one packed single-row batch."""
+    runtime = AttentionRuntime(
+        mode="dense",
+        create_mask=True,
+        reset_mask=reset_mask,
+        sliding_window=None,
+    )
+    context = RuntimeInputContext(
+        local_input_shape=(1, seq_length),
+        parallel_ranks={"tp": 0, "cp": 0},
+        parallel_sizes={"tp": 1, "cp": 1},
+        options={},
+    )
+    batch = {"input_ids": torch.zeros(1, seq_length, dtype=torch.long), "cu_seq_lens": boundaries}
+    runtime_inputs = runtime.build_runtime_inputs(batch=batch, context=context)
+    return runtime_inputs["attention_mask"]
 
 
 class TestBlockDiagonalAttention(unittest.TestCase):
-    """The 0-card gate: packed attention must equal per-sample attention.
-
-    Concatenating tokens without enforcing the boundaries would let a token attend to a
-    different sample's tokens, which trains a different model silently.  These tests build the
-    mask from ``cu_seq_lens`` and check the *numerical* consequence, not just the mask's shape.
-    """
+    """``cu_seq_lens`` is what keeps attention from leaking across packed samples."""
 
     @staticmethod
-    def _sdpa_packed(q, k, v, cu):
-        """Run SDPA once over the packed window with the block-diagonal mask."""
-        total = int(cu[-1])
-        mask = block_diagonal_mask(cu)
-        # Causal *within* each sub-sequence: AND the block mask with a lower-triangular mask.
-        causal = torch.tril(torch.ones(total, total, dtype=torch.bool))
+    def _sdpa_packed(q, k, v, mask):
+        """Run SDPA once over the packed window with the runtime block mask."""
         return torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
-            q, k, v, attn_mask=(mask & causal).unsqueeze(0).unsqueeze(0)
+            q, k, v, attn_mask=mask
         )
 
     @staticmethod
@@ -230,7 +200,7 @@ class TestBlockDiagonalAttention(unittest.TestCase):
         """Run SDPA separately per sub-sequence and concatenate, as the ground truth."""
         outs = []
         start = 0
-        for end in [int(x) for x in cu[1:]]:
+        for end in [int(boundary) for boundary in cu[1:]]:
             qs, ks, vs = q[..., start:end, :], k[..., start:end, :], v[..., start:end, :]
             length = end - start
             causal = torch.tril(torch.ones(length, length, dtype=torch.bool))
@@ -243,14 +213,14 @@ class TestBlockDiagonalAttention(unittest.TestCase):
         return torch.cat(outs, dim=-2)
 
     def test_mask_is_true_only_inside_a_sub_sequence(self):
-        """The mask is exactly the block-diagonal indicator."""
+        """The runtime mask is exactly the block-diagonal causal indicator."""
         cu = torch.tensor([0, 2, 5], dtype=torch.int32)
-        mask = block_diagonal_mask(cu)
+        mask = _attention_mask(cu, 5)[0, 0]
         expected = torch.tensor(
-            [[1, 1, 0, 0, 0],
+            [[1, 0, 0, 0, 0],
              [1, 1, 0, 0, 0],
-             [0, 0, 1, 1, 1],
-             [0, 0, 1, 1, 1],
+             [0, 0, 1, 0, 0],
+             [0, 0, 1, 1, 0],
              [0, 0, 1, 1, 1]], dtype=torch.bool)
         self.assertTrue(torch.equal(mask, expected))
 
@@ -263,8 +233,11 @@ class TestBlockDiagonalAttention(unittest.TestCase):
         q = torch.randn(1, heads, total, dim)
         k = torch.randn(1, heads, total, dim)
         v = torch.randn(1, heads, total, dim)
-        packed = self._sdpa_packed(q, k, v, cu)
+        mask = _attention_mask(cu, total)
+
+        packed = self._sdpa_packed(q, k, v, mask)
         reference = self._sdpa_per_sample(q, k, v, cu)
+
         self.assertTrue(
             torch.allclose(packed, reference, rtol=1e-6, atol=1e-6),
             f"max abs diff {(packed - reference).abs().max().item():.3e}",
@@ -278,26 +251,27 @@ class TestBlockDiagonalAttention(unittest.TestCase):
         q = torch.randn(1, 1, total, 4)
         k = torch.randn(1, 1, total, 4)
         v = torch.randn(1, 1, total, 4)
-        packed = self._sdpa_packed(q, k, v, cu)
+
         reference = self._sdpa_per_sample(q, k, v, cu)
         leaking = torch.nn.functional.scaled_dot_product_attention(  # pylint: disable=not-callable
             q, k, v, attn_mask=torch.tril(torch.ones(total, total, dtype=torch.bool)).view(1, 1, total, total)
         )
-        self.assertFalse(torch.allclose(leaking, reference, rtol=1e-6, atol=1e-6))
-        self.assertTrue(torch.allclose(packed, reference, rtol=1e-6, atol=1e-6))
 
-    def test_collator_ships_the_mask(self):
-        """A packed step carries both the boundaries and their enforcement."""
-        window = VlmPackingCollator(max_seq_len=512)([_sample(200), _sample(200)])
-        self.assertIn("block_diagonal_mask", window)
-        mask = window["block_diagonal_mask"]
-        self.assertEqual(mask.shape, (512, 512))
-        self.assertTrue(bool(mask[0, 0]))
-        self.assertFalse(bool(mask[0, 300]))
+        self.assertFalse(torch.allclose(leaking, reference, rtol=1e-6, atol=1e-6))
+        self.assertTrue(
+            torch.allclose(self._sdpa_packed(q, k, v, _attention_mask(cu, total)), reference,
+                           rtol=1e-6, atol=1e-6)
+        )
 
     def test_bad_boundaries_are_rejected(self):
         """Malformed boundaries must fail loudly rather than produce a wrong mask."""
         with self.assertRaises(ValueError):
-            block_diagonal_mask(torch.tensor([1, 3], dtype=torch.int32))
+            _attention_mask(torch.tensor([1, 3], dtype=torch.int32), 3)
         with self.assertRaises(ValueError):
-            block_diagonal_mask(torch.tensor([0, 3, 3], dtype=torch.int32))
+            _attention_mask(torch.tensor([0, 3, 3], dtype=torch.int32), 3)
+        with self.assertRaises(ValueError):
+            _attention_mask(torch.tensor([0, 2], dtype=torch.int32), 5)
+
+
+if __name__ == "__main__":
+    unittest.main()

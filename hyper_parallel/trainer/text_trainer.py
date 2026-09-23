@@ -20,7 +20,6 @@ from typing import Any, Dict
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
@@ -59,9 +58,11 @@ class TextTrainer:
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
@@ -131,7 +132,7 @@ class TextTrainer:
         )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-LLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
@@ -218,11 +219,10 @@ class TextTrainer:
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
         """Execute one text training step."""
-        config = self.base.config
         num_micro_steps = self.base.num_micro_batches
-        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
 
         self.on_step_begin()
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss = 0.0
@@ -234,6 +234,7 @@ class TextTrainer:
                 micro_step,
                 num_micro_steps,
             )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
                 num_micro_steps,
@@ -243,17 +244,13 @@ class TextTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = 0.0
-        if config.training.max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(
-                self.base.model,
-                config.training.max_grad_norm,
-            )
+        grad_norm = self.base.prepare_optimizer_step()
 
         # The unit-pipelined variant is opt-in and falls back to the plain loop
         # below when it is disabled or unsupported by the optimizer and model.
         # It reuses this call site's dispatch context so the lazy optimizer
         # state is created through the same path as in a full step().
+        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
         if not fsdp_runtime.run_unit_pipelined_step(
                 optimizers,
                 self.base.model,
@@ -263,6 +260,7 @@ class TextTrainer:
                 with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                     optimizer.step()
                 optimizer.zero_grad()
+        self.base.model_integration.after_optimizer()
 
         schedulers = (
             self.base.lr_scheduler
@@ -280,6 +278,9 @@ class TextTrainer:
         # optimizer updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        self.base._end_model_integration_step(
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,

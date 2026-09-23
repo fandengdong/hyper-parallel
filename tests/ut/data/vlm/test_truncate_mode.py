@@ -78,7 +78,7 @@ class TestInferSeqlen(unittest.TestCase):
 
     @staticmethod
     def _infer_seqlen():
-        from hyper_parallel.data.vlm.kimi_transform import _infer_seqlen
+        from hyper_parallel.data.omni.kimi_transform import _infer_seqlen
 
         return _infer_seqlen
 
@@ -110,7 +110,7 @@ class TestTruncateMode(unittest.TestCase):
 
     @staticmethod
     def _transform(truncate_mode: str = "proportional", **kwargs):
-        from hyper_parallel.data.vlm.kimi_transform import KimiVLMChatTransform
+        from hyper_parallel.data.omni.kimi_transform import KimiVLMChatTransform
 
         return KimiVLMChatTransform(processor=object(), max_seq_len=600,
                                     truncate_mode=truncate_mode, **kwargs)
@@ -119,7 +119,7 @@ class TestTruncateMode(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_proportional_keeps_the_head_of_the_response(self):
         """Half the sample is supervised: the cut lands inside the response."""
-        from hyper_parallel.data.vlm.kimi_transform import _infer_seqlen
+        from hyper_parallel.data.omni.kimi_transform import _infer_seqlen
 
         transform = self._transform("proportional")
         sample = _sample(1000, supervised_from=500)
@@ -213,7 +213,7 @@ class TestTruncateMode(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_builder_forwards_the_option(self):
         """The builder passes ``truncate_mode`` through and defaults to proportional."""
-        from hyper_parallel.data.vlm.kimi_transform import build_kimi_vlm_data_transform
+        from hyper_parallel.data.omni.kimi_transform import build_kimi_vlm_data_transform
 
         self.assertEqual(
             build_kimi_vlm_data_transform(

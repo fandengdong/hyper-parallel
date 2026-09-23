@@ -55,8 +55,8 @@ def prepare_kimi_vlm_data(
 ) -> None:
     """Write one content-list JSON plus one synthetic image per sample.
 
-    Records follow the multimodal conversation contract consumed by
-    ``hyper_parallel.data.vlm``: ``{"messages": [user, assistant], "images":
+    Records follow the Omni multimodal conversation contract consumed by
+    ``hyper_parallel.data.omni``: ``{"messages": [user, assistant], "images":
     [...]}`` where media appear as explicit ``{"type": "image", "url": ...}``
     items so their position inside the turn is preserved. Media paths are
     relative and resolved against the JSON directory by the dataset.

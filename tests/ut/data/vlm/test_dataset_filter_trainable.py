@@ -33,7 +33,7 @@ from torch.utils.data import Dataset
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.data.constants import IGNORE_INDEX
-from hyper_parallel.data.vlm.dataset import _TransformDataset
+from hyper_parallel.data.omni.build_dataset import _TransformDataset
 
 
 class _CountingSource(Dataset):

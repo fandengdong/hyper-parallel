@@ -73,7 +73,7 @@ def _image(size, color=(16, 32, 64)):
 
 def _transform(image_max_pixels):
     """Build the transform over the stub processor for one pixel budget."""
-    from hyper_parallel.data.vlm.kimi_transform import KimiVLMChatTransform
+    from hyper_parallel.data.omni.kimi_transform import KimiVLMChatTransform
 
     return KimiVLMChatTransform(processor=_StubProcessor(),
                                 image_max_pixels=image_max_pixels)
@@ -219,7 +219,7 @@ class TestImageMaxPixelsOption(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_builder_forwards_the_option_and_patch_rounding_is_gone(self):
         """The builder wires ``image_max_pixels`` and no patch grid is needed."""
-        from hyper_parallel.data.vlm.kimi_transform import (
+        from hyper_parallel.data.omni.kimi_transform import (
             KimiVLMChatTransform,
             build_kimi_vlm_data_transform,
         )

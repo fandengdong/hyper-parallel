@@ -780,7 +780,7 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
     performance = {}
     input_files = _resolve_input_files(args.dataset_name_or_path)
     for workers in worker_candidates:
-        logger.info("Processing data with %d workers.", workers)
+        logger.info("Processing data with %s workers", workers)
         workers_per_partition = workers // args.partitions
 
         if args.split_sentences:

@@ -78,19 +78,27 @@ compile:
   dynamo_cache_size_limit: 256
 
 dataset:
-  _target_: hyper_parallel.data.vlm.build_vlm_dataset
-  data_config:
-    source_type: online
-  data_path: ./output/training_demo/kimi_vlm_data/data.json
+  model_assets:
+    _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
+    pretrained_model_name_or_path: /path/to/Kimi-K2.6
+    trust_remote_code: false          # native kimi_k25 processor (image_grid_thw protocol)
+    local_files_only: true
   data_transform:
-    _target_: hyper_parallel.data.vlm.kimi_transform.build_kimi_vlm_data_transform
+    _target_: hyper_parallel.data.omni.kimi_transform.build_kimi_omni_transform
     max_seq_len: 1024
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: ./output/training_demo/kimi_vlm_data/data.json
+  data_config:
+    # Demo default: drop records whose assistant turn a truncation removed entirely.
+    filter_trainable: true
 
 dataloader:
   _target_: hyper_parallel.data.batching.FixedBatchDataLoader
   collate_fn:
-    _target_: hyper_parallel.data.vlm.collator.build_vlm_collator
-  dataloader_type: single
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
   data_rearrange_map: null
   data_sharding: false
   drop_last: true
