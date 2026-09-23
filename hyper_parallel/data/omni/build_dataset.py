@@ -280,6 +280,21 @@ class _TransformDataset(Dataset):
         record = self.source[self.indices[index]]
         return self.transform(record) if self.transform is not None else record
 
+    def __getattr__(self, name: str) -> Any:
+        """Forward source-owned interface attributes to the wrapped dataset.
+
+        The Omni packing loader drives the deferred encoding lifecycle through the
+        dataset object (``encode_selected_sample`` / ``encode_batch`` and an
+        optional ``packing_selector``). Filtering wraps the source, so without this
+        delegation packing combined with ``filter_trainable`` fails with
+        ``OmniPackingLoader requires encode_selected_sample() and encode_batch()``.
+        ``__getattr__`` only runs when normal lookup fails, so it cannot shadow the
+        wrapper's own members.
+        """
+        if name == "source":
+            raise AttributeError(name)
+        return getattr(self.source, name)
+
 
 class _RepeatedDataset(Dataset):
     """Repeat a map-style dataset over a multiplied index space.
@@ -329,6 +344,22 @@ class _RepeatedDataset(Dataset):
         if self.perm is not None:
             position = self.perm[position]
         return self.dataset[position]
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward source-owned interface attributes to the wrapped dataset.
+
+        Harness note: repetition and ``shuffle`` are implemented here, but the Omni
+        packing loader still has to reach the deferred encoding hooks
+        (``encode_selected_sample`` / ``encode_batch``) and ``packing_selector`` on
+        the wrapped ``_OmniMappingDataset``. Hiding them here made packing combined
+        with ``shuffle``/``repeat`` fail with
+        ``TypeError: OmniPackingLoader requires encode_selected_sample() and
+        encode_batch()`` on every rank. ``__getattr__`` is only consulted when
+        normal lookup fails, so the wrapper's own members still win.
+        """
+        if name == "dataset":
+            raise AttributeError(name)
+        return getattr(self.dataset, name)
 
 
 class _OmniMappingDataset(MappingTransformDataset):

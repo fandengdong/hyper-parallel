@@ -31,6 +31,7 @@ import json
 import os
 import tempfile
 import unittest
+from typing import Any
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -327,6 +328,71 @@ class TestBuildVlmDatasetRepeat(unittest.TestCase):
                     self.assertNotIsInstance(built, _RepeatedDataset)
                     self.assertEqual(sorted(self._ids(built, 4)), list(range(4)))
             self.assertEqual(self._ids(built_default, 4), self._ids(built_false, 4))
+
+
+class _PackingAwareSource(_CountingSource):
+    """Map-style source that also exposes the Omni packing loader's interface."""
+
+    def __init__(self, count: int) -> None:
+        """Expose ``count`` records plus the deferred-encoding hooks."""
+        super().__init__(count)
+        self.packing_selector = "selector-sentinel"
+
+    def encode_selected_sample(self, sample: Any) -> Any:
+        """Encode one selected sample (identity stand-in)."""
+        return sample
+
+    def encode_batch(self, batch: Any) -> Any:
+        """Encode one packed batch (identity stand-in)."""
+        return batch
+
+
+class TestWrapperKeepsPackingInterface(unittest.TestCase):
+    """Wrapping a source must not hide the hooks the Omni packing loader reads.
+
+    Regression: packing combined with ``shuffle``/``repeat`` failed on every rank of a
+    2-SN run with ``TypeError: OmniPackingLoader requires encode_selected_sample() and
+    encode_batch()``, because ``_RepeatedDataset``/``_TransformDataset`` exposed only
+    ``__len__``/``__getitem__`` while the loader reads those hooks off the dataset
+    object it is handed.
+    """
+
+    @arg_mark(**_CPU_MARKS)
+    def test_repeat_and_shuffle_forward_the_packing_hooks(self):
+        """Feature: repeat+shuffle keeps the packing interface.
+
+        Description: Wrap a hook-bearing source with ``repeat`` and ``shuffle``.
+        Expectation: Both hooks and the selector stay reachable, and the wrapper's own
+            ``__len__`` still wins over the delegated one.
+        """
+        wrapped = _RepeatedDataset(_PackingAwareSource(4), 2, shuffle=True, seed=1)
+        self.assertTrue(callable(getattr(wrapped, "encode_selected_sample", None)))
+        self.assertTrue(callable(getattr(wrapped, "encode_batch", None)))
+        self.assertEqual(wrapped.packing_selector, "selector-sentinel")
+        self.assertEqual(len(wrapped), 8)
+
+    @arg_mark(**_CPU_MARKS)
+    def test_repeat_alone_forwards_the_packing_hooks(self):
+        """Feature: repeat without shuffle.
+
+        Description: Wrap with ``repeat`` only.
+        Expectation: The deferred-encoding hooks are still reachable.
+        """
+        wrapped = _RepeatedDataset(_PackingAwareSource(3), 2)
+        self.assertTrue(callable(getattr(wrapped, "encode_selected_sample", None)))
+        self.assertTrue(callable(getattr(wrapped, "encode_batch", None)))
+
+    @arg_mark(**_CPU_MARKS)
+    def test_wrapper_does_not_invent_missing_hooks(self):
+        """Feature: a source without the hooks stays hook-free.
+
+        Description: Wrap a plain source that has no packing interface.
+        Expectation: The wrapper does not fabricate one, so the packing loader still
+            rejects it instead of failing later.
+        """
+        wrapped = _RepeatedDataset(_CountingSource(3), 2)
+        self.assertFalse(hasattr(wrapped, "encode_selected_sample"))
+        self.assertFalse(hasattr(wrapped, "encode_batch"))
 
 
 if __name__ == "__main__":
