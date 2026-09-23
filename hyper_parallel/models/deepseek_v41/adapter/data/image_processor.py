@@ -20,17 +20,20 @@ Every one of those positions carries `image_token_id` in `input_ids`; only the t
 apart. The IMAGE slots are filled with aligner rows in reading order.
 """
 
+from __future__ import annotations
+
 import base64
 import io
 import math
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.request import urlopen
 
 import numpy as np
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 from PIL import Image, ImageOps
 
-from hyper_parallel.models.deepseek_v41.adapter.encoding import IMAGE_PLACEHOLDER
+from hyper_parallel.models.deepseek_v41.adapter.data.encoding import IMAGE_PLACEHOLDER
 
 TEXT = -1
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
@@ -46,12 +49,36 @@ class ImageInput:
 
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
+    """Return the LLM token count for an image grid.
+
+    Args:
+        n_llm_h: Image grid height after aligner downsampling.
+        n_llm_w: Image grid width after aligner downsampling.
+
+    Returns:
+        Number of image-span tokens consumed by the LLM.
+    """
     image_token_count = n_llm_h * (n_llm_w + 1) + 2
     return image_token_count
 
 
-def llm_grid(best_height: int, best_width: int, patch_size: int, downsample_ratio: int):
-    """Token grid the aligner produces from a patch grid of this pixel size."""
+def llm_grid(
+        best_height: int,
+        best_width: int,
+        patch_size: int,
+        downsample_ratio: int,
+) -> Tuple[int, int]:
+    """Calculate the token grid produced by the aligner.
+
+    Args:
+        best_height: Resized image height in pixels.
+        best_width: Resized image width in pixels.
+        patch_size: ViT patch size in pixels.
+        downsample_ratio: Aligner downsampling ratio.
+
+    Returns:
+        Token-grid height and width.
+    """
     grid_height = math.ceil((best_height // patch_size) / downsample_ratio)
     grid_width = math.ceil(
         (best_width // patch_size) / downsample_ratio
@@ -60,8 +87,25 @@ def llm_grid(best_height: int, best_width: int, patch_size: int, downsample_rati
     return grid_shape
 
 
-def solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token):
-    """Largest aspect-preserving pixel size whose token grid still fits in max_n_token."""
+def solve_resize_ratio(
+        height: Union[int, float],
+        width: Union[int, float],
+        patch_size: int,
+        downsample_ratio: int,
+        max_n_token: int,
+) -> Tuple[int, int]:
+    """Find the largest aspect-preserving size within the token limit.
+
+    Args:
+        height: Original image height.
+        width: Original image width.
+        patch_size: ViT patch size in pixels.
+        downsample_ratio: Aligner downsampling ratio.
+        max_n_token: Maximum number of image-span tokens.
+
+    Returns:
+        Resized height and width in pixels.
+    """
     r = height / width
     max_w_float = math.sqrt((max_n_token - 2) / r + 0.25) - 0.5
     max_h_float = max_w_float * r
@@ -79,8 +123,29 @@ def solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token)
     return resized_shape
 
 
-def safe_resize(height, width, best_height, best_width, patch_size, downsample_ratio, max_n_token):
-    """Shrink the pixel size until the image costs at most max_n_token LLM tokens."""
+def safe_resize(
+        height: Union[int, float],
+        width: Union[int, float],
+        best_height: int,
+        best_width: int,
+        patch_size: int,
+        downsample_ratio: int,
+        max_n_token: int,
+) -> Tuple[int, int, int, int]:
+    """Shrink an image until it fits within the LLM token limit.
+
+    Args:
+        height: Original image height.
+        width: Original image width.
+        best_height: Candidate resized height.
+        best_width: Candidate resized width.
+        patch_size: ViT patch size in pixels.
+        downsample_ratio: Aligner downsampling ratio.
+        max_n_token: Maximum number of image-span tokens.
+
+    Returns:
+        LLM grid height, grid width, resized height, and resized width.
+    """
     n_llm_h, n_llm_w = llm_grid(best_height, best_width, patch_size, downsample_ratio)
     if num_image_tokens(n_llm_h, n_llm_w) > max_n_token:
         best_height, best_width = solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token)
@@ -91,8 +156,15 @@ def safe_resize(height, width, best_height, best_width, patch_size, downsample_r
     return resize_plan
 
 
-def load_image_bytes(record) -> bytes:
-    """Load image bytes from raw/base64 data, an Anthropic source, URL, or path."""
+def load_image_bytes(record: Dict[str, Any]) -> bytes:
+    """Load image bytes from supported record formats.
+
+    Args:
+        record: Image record containing bytes, base64 data, a URL, or a path.
+
+    Returns:
+        Encoded image bytes.
+    """
     data = record.get("data")
     if isinstance(data, bytes):
         return data
@@ -128,8 +200,17 @@ def load_image_bytes(record) -> bytes:
     raise ValueError(f"Cannot load image from record: {list(record.keys())}")
 
 
-def plan_image_grid(width: int, height: int, args):
-    """Resize plan for an image of the given original size; a pure function of its arguments."""
+def plan_image_grid(width: int, height: int, args: Any) -> Tuple[int, int, int, int]:
+    """Build a resize plan for an image.
+
+    Args:
+        width: Original image width.
+        height: Original image height.
+        args: DeepSeek vision preprocessing configuration.
+
+    Returns:
+        LLM grid height, grid width, resized height, and resized width.
+    """
     p = args.vision_patch_size
     if args.vision_max_wh_ratio is not None and width > height * args.vision_max_wh_ratio:
         width = height * args.vision_max_wh_ratio
@@ -151,8 +232,16 @@ def plan_image_grid(width: int, height: int, args):
     return resize_plan
 
 
-def load_image(record, args):
-    """Load and transform one image record into ViT patches."""
+def load_image(record: Dict[str, Any], args: Any) -> Tuple[torch.Tensor, int, int, int, int]:
+    """Load and transform one image record into ViT patches.
+
+    Args:
+        record: Image record accepted by ``load_image_bytes``.
+        args: DeepSeek vision preprocessing configuration.
+
+    Returns:
+        Patch tensor and ViT/LLM grid dimensions.
+    """
     p = args.vision_patch_size
     with Image.open(io.BytesIO(load_image_bytes(record))) as source:
         image = source.convert("RGB")
@@ -178,11 +267,25 @@ def image_token_types(n_llm_h: int, n_llm_w: int) -> torch.Tensor:
     return token_types
 
 
-def prepare_vl_inputs(prompt, images, tokenizer, args):
-    """Tokenize `prompt`, expanding each image placeholder token into its image span.
-    Returns (tokens, token_types, image_inputs). Image-span positions carry `args.image_token_id` in
-    `tokens` and are distinguished only by `token_types` (TEXT elsewhere). `image_inputs` is None when
-    the prompt has no images."""
+def prepare_vl_inputs(
+        prompt: str,
+        images: Sequence[Dict[str, Any]],
+        tokenizer: Any,
+        args: Any,
+) -> Tuple[List[int], List[int], Optional[List[ImageInput]]]:
+    """Tokenize a prompt and expand each image placeholder into an image span.
+
+    Args:
+        prompt: Encoded conversation prompt.
+        images: Image records ordered by their prompt placeholders.
+        tokenizer: Tokenizer used by the language model.
+        args: DeepSeek vision preprocessing configuration.
+
+    Returns:
+        Token IDs, token-type IDs, and optional prepared image inputs. Image-span
+        positions carry ``args.image_token_id`` and token types distinguish their
+        semantic roles.
+    """
     # The placeholder is spelled differently across tokenizer revisions, so the id comes from the
     # config; only cross-check it when this tokenizer does know the training-time spelling.
     image_token_id = args.image_token_id

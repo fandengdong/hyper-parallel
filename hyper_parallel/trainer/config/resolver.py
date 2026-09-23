@@ -518,6 +518,8 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
         raise ConfigResolutionError(path, f"could not construct {config_type.__name__}: {exc}") from exc
 
 
+
+
 def _resolve_nested_target_nodes(value: object, *, path: str) -> object:
     """Resolve reserved ``_target_`` nodes inside a target argument tree."""
     if isinstance(value, Mapping):
@@ -626,7 +628,7 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
 
 
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
-    """Resolve a ``DataLoaderConfig`` with its collator and batch runtime."""
+    """Resolve a DataLoader target with nested collator and batch runtime."""
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "DataLoader configuration must be a YAML mapping")
 

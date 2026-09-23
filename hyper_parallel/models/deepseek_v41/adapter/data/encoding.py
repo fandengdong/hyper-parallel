@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-DeepSeek-V4.1 Text and Vision Encoding
+DeepSeek-V4.1 text and vision encoding.
 A fully self-contained implementation for encoding/decoding DeepSeek-V4.1 chat
 messages with tool calling, thinking mode, quick instruction tasks, and image
 content blocks. No dependency on encoding_dsv4.
@@ -28,10 +28,10 @@ V4.1 changes relative to V4:
    of appending the assistant generation header.
 """
 
-from typing import Any, Dict, List, Union, Optional, Tuple
 import copy
 import json
 import re
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ============================================================
 # Special Tokens
@@ -93,8 +93,15 @@ def to_json(value: Any) -> str:
     return serialized_value
 
 
-def tools_from_openai_format(tools):
-    """Extract function definitions with namespace-qualified names."""
+def tools_from_openai_format(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract function definitions with namespace-qualified names.
+
+    Args:
+        tools: OpenAI-format tool declarations.
+
+    Returns:
+        Function schemas in DeepSeek's internal format.
+    """
     functions = []
     for tool in tools:
         function = dict(tool["function"])
@@ -133,8 +140,15 @@ def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
     return qualified_name
 
 
-def tool_calls_from_openai_format(tool_calls):
-    """Convert OpenAI-format tool calls to internal format."""
+def tool_calls_from_openai_format(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI-format tool calls to internal format.
+
+    Args:
+        tool_calls: OpenAI-format tool calls.
+
+    Returns:
+        Tool calls in DeepSeek's internal format.
+    """
     calls = []
     for tool_call in tool_calls:
         function = tool_call["function"]
@@ -148,8 +162,15 @@ def tool_calls_from_openai_format(tool_calls):
     return calls
 
 
-def tool_calls_to_openai_format(tool_calls):
-    """Convert internal tool calls to OpenAI format."""
+def tool_calls_to_openai_format(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert internal tool calls to OpenAI format.
+
+    Args:
+        tool_calls: Tool calls in DeepSeek's internal format.
+
+    Returns:
+        OpenAI-format tool calls.
+    """
     calls = []
     for tool_call in tool_calls:
         call = {
@@ -182,7 +203,7 @@ def decode_dsml_to_arguments(tool_name: str, tool_args: Dict[str, Tuple[str, str
 
     tool_args_json = "{" + ", ".join([_decode_value(k, v, string=is_str) for k, (v, is_str) in tool_args.items()]) + "}"
     namespace, name = _split_tool_name(tool_name)
-    tool_call = dict(name=name, arguments=tool_args_json)
+    tool_call = {"name": name, "arguments": tool_args_json}
     if namespace is not None:
         tool_call["namespace"] = namespace
     return tool_call
@@ -193,10 +214,16 @@ def decode_dsml_to_arguments(tool_name: str, tool_args: Dict[str, Tuple[str, str
 # ============================================================
 
 def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge tool messages into the preceding user message using content_blocks format.
+    """Merge tool messages into the preceding user message.
+
     DeepSeek-V4.1 does not have a standalone "tool" role; instead, tool results
     are encoded as <tool_result> blocks within user messages.
+
+    Args:
+        messages: Conversation messages in OpenAI format.
+
+    Returns:
+        A copied message list with tool results represented as content blocks.
     """
     merged: List[Dict[str, Any]] = []
 
@@ -223,7 +250,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
                 content_blocks = [{"type": "text", "text": msg.get("content", "")}]
-            if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1] and merged[-1].get("task") is None:
+            if (
+                    merged
+                    and merged[-1].get("role") == "user"
+                    and "content_blocks" in merged[-1]
+                    and merged[-1].get("task") is None
+            ):
                 merged[-1]["content_blocks"].extend(content_blocks)
             else:
                 # Preserve structured content and all message-level metadata.
@@ -466,17 +498,26 @@ def render_reasoning_effort(
     thinking_mode: str,
     effort: Union[str, int, None],
 ) -> str:
-    """Render the V4.1 numeric reasoning effort prefix (thinking mode, index 0 only)."""
+    """Render the V4.1 numeric reasoning effort prefix.
+
+    Args:
+        index: Message index in the conversation.
+        thinking_mode: Either ``chat`` or ``thinking``.
+        effort: Numeric budget or a supported named effort.
+
+    Returns:
+        The prefix for the initial thinking message, or an empty string.
+    """
     if effort is None:
         effort = DEFAULT_REASONING_EFFORT
-    valid_integer_effort = type(effort) is int and 1 <= effort <= 100
+    valid_integer_effort = isinstance(effort, int) and not isinstance(effort, bool) and 1 <= effort <= 100
     valid_named_effort = effort in REASONING_EFFORT_MAPPINGS
     if not valid_integer_effort and not valid_named_effort:
         raise ValueError(
             "Invalid reasoning effort for deepseek_v41: "
             f"{effort}, should be int within [1,100] or {list(REASONING_EFFORT_MAPPINGS)}"
         )
-    if type(effort) is str:
+    if isinstance(effort, str):
         effort = REASONING_EFFORT_MAPPINGS[effort]
     if index == 0 and thinking_mode == "thinking":
         reasoning_prefix = REASONING_EFFORT_TEMPLATE.format(budget=effort)
@@ -585,9 +626,21 @@ def render_message(
     drop_thinking: bool = True,
     reasoning_effort: Union[str, int, None] = None,
 ) -> str:
+    """Render a single message into its V4.1 encoded string form.
+
+    Args:
+        index: Index of the message to render.
+        messages: Entire conversation message list.
+        thinking_mode: Either ``chat`` or ``thinking``.
+        drop_thinking: Whether to omit stored reasoning content.
+        reasoning_effort: Numeric budget or a supported named effort.
+
+    Returns:
+        Encoded text for the selected message.
     """
-    Render a single message at the given index into its V4.1 encoded string form.
-    """
+    # This is a direct dispatcher for the externally defined role/content-block
+    # schema; splitting it would obscure the required ordering of emitted tokens.
+    #lizard forgives(cyclomatic_complexity, nloc)
     if not 0 <= index < len(messages):
         raise ValueError(f"message index is out of range: {index}")
     if thinking_mode not in ("chat", "thinking"):
@@ -658,7 +711,9 @@ def render_message(
         prompt += LATEST_REMINDER_SP_TOKEN + latest_reminder_msg_template.format(content=content)
 
     elif role == "tool":
-        raise NotImplementedError("deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()")
+        raise NotImplementedError(
+            "deepseek_v41 merges tool messages into user; please preprocess with merge_tool_messages()"
+        )
 
     elif role == "assistant":
         thinking_part = ""
@@ -845,8 +900,15 @@ def encode_messages(
 
 
 def load_cases(input_file: str) -> List[Dict[str, Any]]:
-    """Load one or more OpenAI-format conversation cases from JSON."""
-    with open(input_file) as file:
+    """Load one or more OpenAI-format conversation cases from JSON.
+
+    Args:
+        input_file: Path to the JSON input file.
+
+    Returns:
+        Normalized conversation cases.
+    """
+    with open(input_file, encoding="utf-8") as file:
         data = json.load(file)
     if isinstance(data, dict):
         data = [data]
@@ -890,8 +952,12 @@ def encode_case(
 # ============================================================
 
 def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Dict[str, str]]]:
-    """
-    Parse V4.1 DSML tool calls from text starting at the given index.
+    """Parse V4.1 DSML tool calls from text starting at the given index.
+
+    Args:
+        index: Character offset at which parsing starts.
+        text: Model output containing DSML tool calls.
+
     Returns:
         Tuple of (new_index, last_stop_token, list_of_tool_call_dicts).
     """
@@ -914,7 +980,9 @@ def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Di
         if stop_token is None:
             raise ValueError("Missing special token in tool calls")
 
-        index, tool_name_content, stop_token = _read_until_stop(index, text, [tool_parameter_start_token, tool_call_end_token])
+        index, tool_name_content, stop_token = _read_until_stop(
+            index, text, [tool_parameter_start_token, tool_call_end_token]
+        )
 
         p_tool_name = re.findall(r'^\s*name="(.*?)">\n$', tool_name_content, flags=re.DOTALL)
         if len(p_tool_name) != 1:
@@ -934,7 +1002,9 @@ def parse_tool_calls(index: int, text: str) -> Tuple[int, Optional[str], List[Di
                 raise ValueError(f"Duplicate parameter name: '{param_name}'")
             tool_args[param_name] = (param_value, string)
 
-            index, content, stop_token = _read_until_stop(index, text, [tool_parameter_start_token, tool_call_end_token])
+            index, content, stop_token = _read_until_stop(
+                index, text, [tool_parameter_start_token, tool_call_end_token]
+            )
             if content != ">\n":
                 raise ValueError(f"Parameter format error: expected '>\\n' but got '{content}'")
 

@@ -22,13 +22,13 @@ import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.omni.omni_transform import OmniDataTransform
-from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     IMAGE,
     IMAGE_NEW_LINE,
     TEXT,
     ImageInput,
 )
-from hyper_parallel.models.deepseek_v41.adapter.processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.processor import (
     DeepseekV41Processor,
 )
 

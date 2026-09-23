@@ -14,6 +14,8 @@
 # ============================================================================
 """Build the native DeepSeek-V4.1 multimodal processor."""
 
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,8 +23,8 @@ from typing import Any
 
 from transformers import AutoTokenizer
 
-from hyper_parallel.models.deepseek_v41.adapter.encoding import encode_messages
-from hyper_parallel.models.deepseek_v41.adapter.image_processor import (
+from hyper_parallel.models.deepseek_v41.adapter.data.encoding import encode_messages
+from hyper_parallel.models.deepseek_v41.adapter.data.image_processor import (
     prepare_vl_inputs as prepare_native_vl_inputs,
 )
 

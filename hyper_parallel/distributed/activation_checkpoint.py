@@ -1182,6 +1182,20 @@ def _apply_activation_checkpointing(
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
+    selection_source = getattr(selection, "source", "default")
+    if selection_source == "model_adapter_safe_regions":
+        return _apply_model_adapter_safe_checkpointing(
+            model,
+            containers,
+            ac_layers,
+            selection,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+        )
+
+    # Selective recomputation normally wraps whole layers. KV-shared models
+    # instead use submodule checkpointing so attention does not write the cache
+    # again during backward recomputation.
     if activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(
             containers,

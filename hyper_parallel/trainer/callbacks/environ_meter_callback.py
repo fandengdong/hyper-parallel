@@ -14,6 +14,8 @@
 # ============================================================================
 """Training and environment metric collection callback."""
 
+from __future__ import annotations
+
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union
@@ -72,7 +74,11 @@ class EnvironMeterCallback(Callback):
         self._vision_flops: Any = None  # resolved lazily; None = text-only model
         self._vision_flops_resolved = False
         self._seq_len: Optional[int] = None  # captured from the first batch
-        self._peak_tflops = trainer.config.training.peak_tflops
+        # Read defensively: the callback only uses this inside ``if self._peak_tflops:``,
+        # and trainer stubs in tests need not carry a full config tree.
+        self._peak_tflops = getattr(
+            getattr(getattr(trainer, "config", None), "training", None), "peak_tflops", None
+        )
 
     def _resolve_flops_per_token(self) -> Optional[float]:
         """Resolve FLOPs/token lazily from the model and its config geometry."""
@@ -143,11 +149,15 @@ class EnvironMeterCallback(Callback):
         return int(numel())
 
     @classmethod
-    def _batch_tokens(cls, batch: Mapping[str, Any]) -> int:
-        """Count text tokens in one micro-batch without mutating it."""
+    def _batch_tokens(cls, batch: Mapping[str, Any]) -> Any:
+        """Count text tokens without synchronizing a device scalar to the host."""
+        token_count = batch.get("token_count")
+        if token_count is not None:
+            return token_count
+
         labels = batch.get("labels")
         if labels is not None and callable(getattr(labels, "sum", None)):
-            return int((labels != IGNORE_INDEX).sum().item())
+            return (labels != IGNORE_INDEX).sum()
 
         attention_mask = batch.get("attention_mask")
         attention_mask_shape = getattr(attention_mask, "shape", ())
@@ -156,7 +166,7 @@ class EnvironMeterCallback(Callback):
             and attention_mask is not None
             and callable(getattr(attention_mask, "sum", None))
         ):
-            return int(attention_mask.sum().item())
+            return attention_mask.sum()
 
         input_ids = batch.get("input_ids")
         input_numel = cls._tensor_numel(input_ids)
@@ -293,6 +303,55 @@ class EnvironMeterCallback(Callback):
         reduced = all_reduce(value, op=op, group=self._metric_group() if group is None else group)
         return float(reduced)
 
+    def _accumulate_batches(self, value: Any) -> None:
+        """Accumulate batch metrics without retaining input tensor references."""
+        for batch in self._micro_batches(value):
+            token_count = self._batch_tokens(batch)
+            if callable(getattr(token_count, "detach", None)):
+                token_count = token_count.detach()
+            if self._local_step_tokens is None:
+                if callable(getattr(token_count, "clone", None)):
+                    token_count = token_count.clone()
+                self._local_step_tokens = token_count
+            else:
+                self._local_step_tokens = self._local_step_tokens + token_count
+            # ``_batch_padded_tokens`` falls back to the token count, which may be a device
+            # scalar in the metadata-only path; only a resolved slot count is accumulated.
+            # When nothing is accumulated the publish path falls back to the token count.
+            padded_tokens = self._batch_padded_tokens(batch)
+            if isinstance(padded_tokens, int) and not isinstance(padded_tokens, bool):
+                self._local_step_padded_tokens += padded_tokens
+            self._local_step_samples += self._batch_samples(batch)
+            if self._resolve_vision_flops() is not None:
+                counts = self._vision_patch_counts(batch)
+                if counts:
+                    self._local_step_vision_patches += counts[0]
+                    self._local_step_vision_patches_sq += counts[1]
+
+    def _global_samples(self) -> int:
+        """Reduce samples while counting each CP-replicated sample exactly once.
+
+        Two equivalent routes exist: reduce over the DP-only group (``mesh.dp_mesh``),
+        which already excludes the CP peers, or reduce over DP+CP and divide out the
+        ``cp_size`` replicas. The first is preferred when the mesh exposes it; the
+        division route is the fallback and validates divisibility.
+        """
+        cp_size = int(getattr(self.trainer.mesh, "cp_size", 1))
+        if getattr(self.trainer.mesh, "dp_mesh", None) is not None:
+            if cp_size < 1:
+                raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+            return int(self._reduce(self._local_step_samples, op="sum", group=self._sample_group()))
+        if cp_size < 1:
+            raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+        reduced_samples = self._reduce(self._local_step_samples, op="sum")
+        global_samples = reduced_samples / cp_size
+        if not global_samples.is_integer():
+            raise ValueError(
+                "Reduced sample count must be divisible by cp_size, "
+                f"but got reduced_samples={reduced_samples} and cp_size={cp_size}"
+            )
+        return int(global_samples)
+
     def _current_lr(self) -> float:
         """Return the maximum learning rate across scheduler or optimizer groups."""
         schedulers = self.trainer.lr_scheduler
@@ -374,14 +433,31 @@ class EnvironMeterCallback(Callback):
         batches = self._micro_batches(micro_batches)
         if self._seq_len is None:
             self._seq_len = batch_seq_len(batches)
-        self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
-        self._local_step_padded_tokens = sum(self._batch_padded_tokens(batch) for batch in batches)
-        self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
-        if self._resolve_vision_flops() is not None:
-            counts = [self._vision_patch_counts(batch) for batch in batches]
-            self._local_step_vision_patches = sum(count[0] for count in counts if count)
-            self._local_step_vision_patches_sq = sum(count[1] for count in counts if count)
+        # ``_local_step_tokens`` stays a device scalar (or ``None``) so accumulation
+        # never forces a host sync; the other counters are plain integers.
+        self._local_step_tokens = None
+        self._local_step_padded_tokens = 0
+        self._local_step_samples = 0
+        self._local_step_vision_patches = 0
+        self._local_step_vision_patches_sq = 0
         self._step_start_time = time.perf_counter()
+        self._accumulate_batches(micro_batches)
+
+    def on_micro_step_begin(
+        self,
+        state: TrainerState,
+        micro_batch: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Accumulate metrics for one prepared micro-batch.
+
+        Args:
+            state: Current training progress.
+            micro_batch: Prepared inputs and lightweight metric metadata.
+            **kwargs: Unused callback context.
+        """
+        del state, kwargs
+        self._accumulate_batches(micro_batch)
 
     def on_step_end(
         self,
@@ -402,9 +478,10 @@ class EnvironMeterCallback(Callback):
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
-        global_tokens = int(self._reduce(self._local_step_tokens, op="sum"))
+        local_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
+        global_tokens = int(self._reduce(local_tokens, op="sum"))
         global_padded_tokens = int(self._reduce(self._local_step_padded_tokens, op="sum"))
-        global_samples = int(self._reduce(self._local_step_samples, op="sum", group=self._sample_group()))
+        global_samples = self._global_samples()
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
 
@@ -418,9 +495,11 @@ class EnvironMeterCallback(Callback):
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
 
         tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
-        padded_tokens_per_second = (
-            global_padded_tokens / global_step_time if global_step_time > 0 else 0.0
-        )
+        # The hardware executes dense ops over the padded batch, so that is the TFLOPS/MFU
+        # basis. A caller that only supplies device token scalars (no batch tensors) has no
+        # padding accounting; fall back to the real token count rather than reporting 0.
+        padded_basis = global_padded_tokens or global_tokens
+        padded_tokens_per_second = padded_basis / global_step_time if global_step_time > 0 else 0.0
         env_metrics = {
             **train_metrics,
             "performance/step_time": global_step_time,
@@ -476,3 +555,6 @@ class EnvironMeterCallback(Callback):
                     env_metrics["performance/hfu"] = env_metrics["performance/mfu"] * factor
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics
+        # Release the device token scalar now that the step is published: keeping it pins
+        # device memory across steps for no benefit.
+        self._local_step_tokens = None

@@ -19,7 +19,7 @@ from typing import Any
 
 from torch import nn, no_grad  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel.models.qwen3.adapter.attention import (
+from hyper_parallel.models.qwen3.adapter.runtime.attention import (
     run_qwen3_flash_attention,
 )
 from hyper_parallel.models.replacement import module_replacement

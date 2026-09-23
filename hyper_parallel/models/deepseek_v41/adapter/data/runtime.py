@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DeepSeek-V4.1 forward runtime inputs."""
+"""Build DeepSeek-V4.1 model inputs from generic runtime batches."""
 
 from __future__ import annotations
 
@@ -32,6 +32,32 @@ from hyper_parallel.data.batching.runtime_input import (
 
 class DeepseekV41Runtime(RuntimeInputAdapter):
     """Build V4.1 packed attention and CP-local image insertion inputs."""
+
+    def __init__(
+            self,
+            *,
+            include_position_ids: bool = True,
+            include_image_sequence_start: bool = True,
+    ) -> None:
+        """Configure fields already supplied by the selected batch runtime.
+
+        Args:
+            include_position_ids: Build CP-global position IDs. Omni batches
+                require this; ``TextParallelBatch`` already owns them.
+            include_image_sequence_start: Build the CP-local image insertion
+                offset. Text-only batches do not need this field.
+        """
+        self.include_position_ids = include_position_ids
+        self.include_image_sequence_start = include_image_sequence_start
+
+    def runtime_input_fields(self) -> tuple[str, ...]:
+        """Declare the stable set of model inputs produced by this instance."""
+        fields = ["packed_seq_params"]
+        if self.include_position_ids:
+            fields.append("position_ids")
+        if self.include_image_sequence_start:
+            fields.append("image_sequence_start")
+        return tuple(fields)
 
     def build_runtime_inputs(
             self,
@@ -60,12 +86,18 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
                 global_sequence_length=cp_size * local_sequence_length,
             )
         }
-        input_ids = batch["input_ids"]
         cp_start = runtime_inputs["packed_seq_params"].local_query_start
-        position_ids = torch.arange(
-            cp_start, cp_start + local_sequence_length, device=input_ids.device, dtype=torch.long
-        ).unsqueeze(0)
-        runtime_inputs.update(position_ids=position_ids, image_sequence_start=cp_start)
+        if self.include_position_ids:
+            input_ids = batch["input_ids"]
+            position_ids = torch.arange(
+                cp_start,
+                cp_start + local_sequence_length,
+                device=input_ids.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            runtime_inputs["position_ids"] = position_ids
+        if self.include_image_sequence_start:
+            runtime_inputs["image_sequence_start"] = cp_start
         return runtime_inputs
 
 
