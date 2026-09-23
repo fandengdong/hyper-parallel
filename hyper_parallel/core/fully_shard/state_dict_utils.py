@@ -1691,6 +1691,13 @@ def _infer_state_keys(optimizer: torch.optim.Optimizer) -> List[str]:
     opt_cls = type(optimizer)
     opt_name = opt_cls.__name__.lower()
 
+    # An explicit declaration beats name guessing: single-state optimizers (e.g. PSM,
+    # which keeps only ``exp_avg``) would otherwise fall through to the warning branch
+    # and yield an empty template that no longer matches the real optimizer state.
+    declared = getattr(opt_cls, "optim_state_keys", None)
+    if declared:
+        return list(declared)
+
     if "adam" in opt_name:
         keys = ["step", "exp_avg", "exp_avg_sq"]
         if optimizer.defaults.get("amsgrad", False):

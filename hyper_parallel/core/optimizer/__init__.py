@@ -33,6 +33,7 @@ logger.setLevel(logging.INFO)
 _LAZY_EXPORTS = {
     "AdamW": ".adamw",
     "Muon": ".muon",
+    "PSM": ".psm",
     "ChainedOptimizer": ".optimizer",
     "detect_dtensor_backend": ".dtensor_compat",
 }
@@ -61,6 +62,7 @@ def _load_torch_optimizer_runtime():
     from hyper_parallel.core.optimizer.adamw import AdamW
     from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
     from hyper_parallel.core.optimizer.muon import Muon
+    from hyper_parallel.core.optimizer.psm import PSM
     from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 
     return AdamW, Muon, ChainedOptimizer, detect_dtensor_backend
