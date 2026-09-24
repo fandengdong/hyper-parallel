@@ -1,0 +1,867 @@
+# COCO2017 LLaVA-instruct, 2 SN, TRUE packing to an 8K window, real router, capacity 6.0.
+#
+# Differs from coco2017_2sn_8k_cap6.yaml in exactly three things:
+#   * DynamicBatchDataLoader(batch_size=1, max_seq_len=8192) -- samples are selected by
+#     TOKEN BUDGET, so one step is one packed window instead of 256 padded samples;
+#   * build_vlm_collator(packing=True) -- short samples are concatenated to fill the
+#     window (pad only the remainder) and the batch carries cu_seq_lens plus the
+#     block-diagonal mask that keeps attention inside each packed sample;
+#   * train_iters 300 -> 1050 (overnight, ends ~09:00).
+#
+# Why: the padded run measured 48k valid tokens against 2,097,150 padded slots (2.3%),
+# MFU 11-15%.  Packing keeps the same 8192-token window per rank -- same step cost -- but
+# fills it with ~46 real samples, so each overnight step sees ~2.1M valid tokens.
+model:
+  _target_: examples.training_demo.cropped_kimi_vlm.build_cropped_kimi_vlm
+  pretrained_model_name_or_path: /home/fdd/workspace/models/moonshotai/Kimi-K2.6
+  config_path: /home/fdd/workspace/models/moonshotai/Kimi-K2.6
+  num_hidden_layers: 61
+  n_routed_experts: 384
+  trust_remote_code: false          # processor 走 native（image_grid_thw 协议）
+  local_files_only: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  validate_placement: false
+
+training:
+  # 09-22 上午启动 → 明早 09:00（09-23）约 24h；packed 步时预计 45-50s ⇒ 1800 步
+  train_iters: 1800
+  train_samples: null
+  eval_iters: 0
+
+  global_batch_size: 256
+  micro_batch_size: 1
+
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: false
+
+  # Per-card peak dense BF16 TFLOPS for MFU normalization (400 = the team's
+  # HP_MFU_PEAK_TFLOPS convention); MFU is skipped while unset.
+  peak_tflops: 400.0
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 128
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 256
+  edp_shard_size: 2
+  enable_offload: true
+  replicate_params: []
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+
+plan_overrides:
+  # seq2048 variant: the seq4096 run OOM'd at step 0 (54.59GB allocated on NPU,
+  # i.e. our own working set, vs 44.25GB for the text-tower-only full run).
+  # NB: the 166 vision-tower leaf specs below are required whenever EP >= 1
+  # (their role-based boundaries collapse under whole-tower replication, so the
+  # planner needs explicit per-leaf parameter specs to pass the coverage check).
+  # FSDP-only runs (ep_size: 1, e.g. the train_kimi_vlm demo) do not need them.
+  # 文本塔全部 norm 换成融合 NPU RMSNorm（61 层 x 4 处 + 最终 norm）。
+  # 机制要求：每个 pattern 至少命中一个模块，且命中模块类型必须完全匹配，
+  # 因此 FQN 写全；RMSNorm 组件复用源模块的 weight/eps（state_dict 与切分均不变）。
+  - match:
+      - "model.language_model.*.input_layernorm"
+      - "model.language_model.*.post_attention_layernorm"
+      - "model.language_model.*.self_attn.q_a_layernorm"
+      - "model.language_model.*.self_attn.kv_a_layernorm"
+      - model.language_model.norm
+    module_type: transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3RMSNorm
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.components.modules.RMSNorm
+
+  # 文本塔 MoE 走 EP（deepseekv3 archetype；排除 first_k_dense_replace=1 的稠密 layer0）
+  - match: "model.language_model.layers.[123456789]*.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn
+      # Real MoE routing: no fixed plan, so loss/grad_norm are meaningful.
+      fix_router: false
+      # 容量上限 6.0：实测（r45）真实路由在该几何下 factor 6 是"仍装得下"的边界
+      # （peak 58.39 GB，drop 22%）；7 以上即 OOM。有效容量≈factor/2（group-limited topk
+      # 使每个 token 只能落到一半专家）。
+      capacity_factor: 4.5
+      use_grouped_gemm: true
+      overlap_shared_expert: true
+
+  - match: model.vision_tower.layers.0.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.0.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.0.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.0.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.0.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.0.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.1.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.2.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.3.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.4.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.5.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.6.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.7.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.8.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.9.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.10.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.11.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.12.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.13.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.14.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.15.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.16.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.17.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.18.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.19.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.20.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.21.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.22.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.23.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.24.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.25.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.attn.q_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.attn.k_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.attn.v_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.attn.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.mlp.fc1
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.layers.26.mlp.fc2
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.patch_embed.proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.vision_tower.patch_embed.pos_emb
+    params:
+      position_embeddings: {tp: replicate}
+  - match: model.mm_projector.in_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: model.mm_projector.out_proj
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: full
+  swap_inputs: true
+
+activation_swap: none
+
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+
+dataset:
+  model_assets:
+    _target_: hyper_parallel.data.omni.omni_transform.build_auto_processor
+    pretrained_model_name_or_path: /home/fdd/workspace/models/moonshotai/Kimi-K2.6
+    trust_remote_code: false          # native kimi_k25 processor (image_grid_thw protocol)
+    local_files_only: true
+  data_transform:
+    # Packed arm: the deferred hooks render each conversation once, report its exact
+    # ``packing_length`` for candidate selection, and truncate only (no per-sample pad),
+    # so SamplePacker concatenates whole samples up to the token budget.
+    _target_: hyper_parallel.data.omni.kimi_transform.build_kimi_omni_transform
+    deferred: true
+    max_seq_len: 8192
+    # No image_max_pixels: native resolution is the point of the 8192 window.
+    # A 2250x1500 SAM image costs ~4187 merged vision tokens, so one image plus
+    # its caption (~200 tok) needs ~4400 -- it fits, where the 2048 window had to
+    # drop the image outright.
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: /home/fdd/workspace/datasets/COCO2017/mllm_format_llava_instruct_data.json
+  data_config:
+    # FOUND ON FIRST ATTEMPT: filter_trainable defaults to true, which runs the
+    # full transform over EVERY record during construction (single-threaded, per
+    # rank). At 570k real records that is a multi-hour silent startup, not a hang.
+    filter_trainable: false
+
+dataloader:
+  # One training step = ONE packed 8K window per rank: OmniPackingLoader selects samples by
+  # token budget (8192) and SamplePacker concatenates them in order, padding nothing and
+  # emitting int32 cu_seq_lens for block-diagonal attention. The old per-sample
+  # ``pad_granularity: 128`` is gone: packing concatenates whole samples, so it is not needed.
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
+  token_budget: 8192
+  min_buffered_samples: 8
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: false
+  num_workers: 16
+  pin_memory: true
+  prefetch_factor: 4
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 1.0e-5
+    adamw_weight_decay: 0.01
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 50
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ""
+  restore_from: null
+
+debug:
+  check_nan_inf: true
+  check_dataset: null
+
+profiling:
+  enabled: false
+  start_step: 3
+  end_step: 5
+  trace_dir: ./outputs/profiling
+  record_shapes: false
+  profile_memory: false
+  with_stack: false
+  with_modules: false
+  rank: 0
+
+loss_fn:
+  _target_: hyper_parallel.components.losses.chunked_cross_entropy.ChunkedCausalLMLoss
+  chunk_size: 2048

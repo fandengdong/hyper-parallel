@@ -17,11 +17,13 @@
 from collections import defaultdict
 from typing import Any, Dict
 
+from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.omni import OmniDataTransform
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
@@ -69,7 +71,15 @@ class VLMTrainer:
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
 
-        processor = config.dataset.model_assets.build()
+        # The model-owned processor is built through the Omni ``model_assets``
+        # target; forward the model's ``trust_remote_code`` flag so a natively
+        # registered architecture such as ``kimi_k25`` stays on the local
+        # implementation unless the config opts into remote code.
+        processor = config.dataset.model_assets.build(
+            trust_remote_code=bool(
+                getattr(config.model, "trust_remote_code", True)
+            ),
+        )
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is None:
             raise ValueError("dataset.model_assets must build a processor with a tokenizer")
@@ -210,7 +220,32 @@ class VLMTrainer:
                 total_loss_dict[loss_name] += loss_value.item()
 
         grad_norm = self.base.prepare_optimizer_step()
-        self.base.step_optimizers_and_schedulers()
+
+        optimizers = (
+            self.base.optimizer
+            if isinstance(self.base.optimizer, list)
+            else [self.base.optimizer]
+        )
+        # The unit-pipelined variant is opt-in and falls back to the plain loop
+        # below when it is disabled or unsupported by the optimizer and model.
+        if not fsdp_runtime.run_unit_pipelined_step(optimizers, self.base.model):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch():
+                    optimizer.step()
+                optimizer.zero_grad()
+        self.base.model_integration.after_optimizer()
+
+        schedulers = (
+            self.base.lr_scheduler
+            if isinstance(self.base.lr_scheduler, list)
+            else (
+                [self.base.lr_scheduler]
+                if self.base.lr_scheduler is not None
+                else []
+            )
+        )
+        for scheduler in schedulers:
+            scheduler.step()
 
         # Checkpoint and logging callbacks observe completed optimizer updates.
         self.base.state.global_step += 1

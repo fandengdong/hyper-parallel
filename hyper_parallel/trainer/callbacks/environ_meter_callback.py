@@ -14,10 +14,18 @@
 # ============================================================================
 """Training and environment metric collection callback."""
 
+from __future__ import annotations
+
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Optional, Union
 
+from hyper_parallel.models.flops import (
+    batch_seq_len,
+    resolve_flops_per_token,
+    resolve_recompute_factor,
+    resolve_vision_flops,
+)
 from hyper_parallel.trainer.runtime.distributed import get_world_size_safe
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -43,11 +51,72 @@ class EnvironMeterCallback(Callback):
         super().__init__(trainer)
         self._step_start_time = 0.0
         self._local_step_tokens = 0
+        # All sequence slots in the step, padding included: the hardware runs
+        # dense ops over the padded batch, so this is the TFLOPS/MFU basis.
+        self._local_step_padded_tokens = 0
         self._local_step_samples = 0
+        # Vision patches are the tower's analogue of padded tokens: the tower runs
+        # over every patch of every image, so its FLOPs scale with this count and
+        # not with ``input_ids``.  ``_local_step_vision_patches_sq`` accumulates
+        # ``sum(p_i ** 2)`` because attention is computed inside one image only.
+        self._local_step_vision_patches = 0
+        self._local_step_vision_patches_sq = 0
         self._consumed_tokens = 0
         self._consumed_samples = 0
         self.trainer.step_train_metrics = {}
         self.trainer.step_env_metrics = {}
+        # TFLOPS/MFU inputs: FLOPs per token are derived from the model and
+        # its config geometry (``hyper_parallel.models.flops``) — a model's
+        # own ``hp_flops_per_token`` wins when present — using the sequence
+        # length observed from the first training batch. Resolution is lazy
+        # so callback-vs-model init order does not matter.
+        self._flops_per_token: Optional[float] = None  # resolved lazily
+        self._vision_flops: Any = None  # resolved lazily; None = text-only model
+        self._vision_flops_resolved = False
+        self._seq_len: Optional[int] = None  # captured from the first batch
+        # Read defensively: the callback only uses this inside ``if self._peak_tflops:``,
+        # and trainer stubs in tests need not carry a full config tree.
+        self._peak_tflops = getattr(
+            getattr(getattr(trainer, "config", None), "training", None), "peak_tflops", None
+        )
+
+    def _resolve_flops_per_token(self) -> Optional[float]:
+        """Resolve FLOPs/token lazily from the model and its config geometry."""
+        if self._flops_per_token is not None:
+            return self._flops_per_token
+        value = resolve_flops_per_token(
+            getattr(self.trainer, "model", None),
+            model_config=getattr(self.trainer, "model_config", None),
+            seq_len=self._resolve_seq_len(),
+        )
+        if value:
+            self._flops_per_token = value
+        return self._flops_per_token
+
+    def _resolve_vision_flops(self) -> Any:
+        """Resolve the vision-tower cost model lazily, once.
+
+        Returns:
+            A ``VisionFlopsEstimate`` for a multimodal model, else ``None``; the
+            result is cached including the ``None`` case so a text-only model does
+            not re-probe its config every step.
+        """
+        if self._vision_flops_resolved:
+            return self._vision_flops
+        self._vision_flops = resolve_vision_flops(
+            getattr(self.trainer, "model", None),
+            model_config=getattr(self.trainer, "model_config", None),
+        )
+        self._vision_flops_resolved = True
+        return self._vision_flops
+
+    def _resolve_seq_len(self) -> Optional[int]:
+        """Return the observed batch sequence length or a config fallback."""
+        if self._seq_len is not None:
+            return self._seq_len
+        model_config = getattr(self.trainer, "model_config", None)
+        max_positions = getattr(model_config, "max_position_embeddings", None)
+        return int(max_positions) if max_positions else None
 
     @staticmethod
     def _scalar(value: Any, name: str) -> float:
@@ -72,7 +141,7 @@ class EnvironMeterCallback(Callback):
             raise ValueError(f"Metric {name!r} must be scalar, but got {value!r}") from exc
 
     @staticmethod
-    def _tensor_numel(value: Any) -> int | None:
+    def _tensor_numel(value: Any) -> Optional[int]:
         """Return ``value.numel()`` when it exposes a tensor-like interface."""
         numel = getattr(value, "numel", None)
         if not callable(numel):
@@ -80,11 +149,15 @@ class EnvironMeterCallback(Callback):
         return int(numel())
 
     @classmethod
-    def _batch_tokens(cls, batch: Mapping[str, Any]) -> int:
-        """Count text tokens in one micro-batch without mutating it."""
+    def _batch_tokens(cls, batch: Mapping[str, Any]) -> Any:
+        """Count text tokens without synchronizing a device scalar to the host."""
+        token_count = batch.get("token_count")
+        if token_count is not None:
+            return token_count
+
         labels = batch.get("labels")
         if labels is not None and callable(getattr(labels, "sum", None)):
-            return int((labels != IGNORE_INDEX).sum().item())
+            return (labels != IGNORE_INDEX).sum()
 
         attention_mask = batch.get("attention_mask")
         attention_mask_shape = getattr(attention_mask, "shape", ())
@@ -93,13 +166,73 @@ class EnvironMeterCallback(Callback):
             and attention_mask is not None
             and callable(getattr(attention_mask, "sum", None))
         ):
-            return int(attention_mask.sum().item())
+            return attention_mask.sum()
 
         input_ids = batch.get("input_ids")
         input_numel = cls._tensor_numel(input_ids)
         if input_numel is not None:
             return input_numel
         return 0
+
+    @classmethod
+    def _batch_padded_tokens(cls, batch: Mapping[str, Any]) -> int:
+        """Count every sequence slot in one micro-batch, padding included.
+
+        The hardware executes the dense ops over the full padded batch, so
+        this is the denominator for TFLOPS/MFU; the non-padding count from
+        ``_batch_tokens`` stays the useful-token (data) metric.
+        """
+        input_ids = batch.get("input_ids")
+        numel = cls._tensor_numel(input_ids)
+        if numel is not None:
+            return numel
+        return cls._batch_tokens(batch)
+
+    @classmethod
+    def _vision_patch_counts(cls, batch: Mapping[str, Any]) -> Optional[tuple[int, int]]:
+        """Return ``(total_patches, sum(p_i ** 2))`` for one micro-batch.
+
+        ``image_grid_thw`` / ``video_grid_thw`` carry one ``(t, h, w)`` row per
+        media item, so a row's product is that item's patch count -- and hence the
+        tower's sequence length for it.  The square sum is what the attention term
+        needs, because the tower attends within each item only.
+
+        Args:
+            batch: One micro-batch mapping.
+
+        Returns:
+            Patch totals, or ``None`` when the batch carries no vision media.
+        """
+        total = 0
+        square_sum = 0
+        found = False
+        for key in ("image_grid_thw", "video_grid_thw"):
+            grid = batch.get(key)
+            if grid is None:
+                continue
+            shape = getattr(grid, "shape", None)
+            reshape = getattr(grid, "reshape", None)
+            if shape is None or not callable(reshape) or len(shape) != 2 or int(shape[-1]) != 3:
+                continue
+            counts = reshape(-1, 3)
+            prod = getattr(counts, "prod", None)
+            tolist = getattr(counts, "tolist", None)
+            if not callable(prod) or not callable(tolist):
+                continue
+            for count in prod(1).tolist():
+                count = int(count)
+                total += count
+                square_sum += count * count
+            found = True
+        if found:
+            return total, square_sum
+        # Fallback: the patch rows themselves.  Without a grid, every row is assumed
+        # to belong to one image, which overstates only the attention term.
+        shape = getattr(batch.get("pixel_values"), "shape", None)
+        if shape is not None and len(shape) > 0:
+            total = int(shape[0])
+            return total, total * total
+        return None
 
     @staticmethod
     def _batch_samples(batch: Mapping[str, Any]) -> int:
@@ -115,7 +248,7 @@ class EnvironMeterCallback(Callback):
         return int(shape[0])
 
     @staticmethod
-    def _batch_mapping(value: Any) -> Mapping[str, Any] | None:
+    def _batch_mapping(value: Any) -> Optional[Mapping[str, Any]]:
         """Return metric inputs for a mapping or prepared runtime batch."""
         if isinstance(value, Mapping):
             return value
@@ -149,12 +282,75 @@ class EnvironMeterCallback(Callback):
             return None
         return dp_cp_mesh.get_group()
 
-    def _reduce(self, value: float | int, op: str) -> float:
+    def _sample_group(self) -> Any:
+        """Return the group whose members hold *distinct* samples.
+
+        The CP peers of one DP group receive replicas of the same sample, so
+        summing per-rank sample counts over ``dp_cp`` would report
+        ``cp_size`` times the real batch. Text tokens are not affected: the CP
+        batch path slices the loss targets per rank, so the per-rank token
+        counts already partition the sequence.
+        """
+        dp_mesh = getattr(self.trainer.mesh, "dp_mesh", None)
+        if dp_mesh is None:
+            return self._metric_group()
+        return dp_mesh.get_group()
+
+    def _reduce(self, value: Union[float, int], op: str, group: Any = None) -> float:
         """Reduce one scalar metric, with a single-process no-op fallback."""
         if get_world_size_safe() <= 1:
             return float(value)
-        reduced = all_reduce(value, op=op, group=self._metric_group())
+        reduced = all_reduce(value, op=op, group=self._metric_group() if group is None else group)
         return float(reduced)
+
+    def _accumulate_batches(self, value: Any) -> None:
+        """Accumulate batch metrics without retaining input tensor references."""
+        for batch in self._micro_batches(value):
+            token_count = self._batch_tokens(batch)
+            if callable(getattr(token_count, "detach", None)):
+                token_count = token_count.detach()
+            if self._local_step_tokens is None:
+                if callable(getattr(token_count, "clone", None)):
+                    token_count = token_count.clone()
+                self._local_step_tokens = token_count
+            else:
+                self._local_step_tokens = self._local_step_tokens + token_count
+            # ``_batch_padded_tokens`` falls back to the token count, which may be a device
+            # scalar in the metadata-only path; only a resolved slot count is accumulated.
+            # When nothing is accumulated the publish path falls back to the token count.
+            padded_tokens = self._batch_padded_tokens(batch)
+            if isinstance(padded_tokens, int) and not isinstance(padded_tokens, bool):
+                self._local_step_padded_tokens += padded_tokens
+            self._local_step_samples += self._batch_samples(batch)
+            if self._resolve_vision_flops() is not None:
+                counts = self._vision_patch_counts(batch)
+                if counts:
+                    self._local_step_vision_patches += counts[0]
+                    self._local_step_vision_patches_sq += counts[1]
+
+    def _global_samples(self) -> int:
+        """Reduce samples while counting each CP-replicated sample exactly once.
+
+        Two equivalent routes exist: reduce over the DP-only group (``mesh.dp_mesh``),
+        which already excludes the CP peers, or reduce over DP+CP and divide out the
+        ``cp_size`` replicas. The first is preferred when the mesh exposes it; the
+        division route is the fallback and validates divisibility.
+        """
+        cp_size = int(getattr(self.trainer.mesh, "cp_size", 1))
+        if getattr(self.trainer.mesh, "dp_mesh", None) is not None:
+            if cp_size < 1:
+                raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+            return int(self._reduce(self._local_step_samples, op="sum", group=self._sample_group()))
+        if cp_size < 1:
+            raise ValueError(f"mesh.cp_size must be positive, but got {cp_size}")
+        reduced_samples = self._reduce(self._local_step_samples, op="sum")
+        global_samples = reduced_samples / cp_size
+        if not global_samples.is_integer():
+            raise ValueError(
+                "Reduced sample count must be divisible by cp_size, "
+                f"but got reduced_samples={reduced_samples} and cp_size={cp_size}"
+            )
+        return int(global_samples)
 
     def _current_lr(self) -> float:
         """Return the maximum learning rate across scheduler or optimizer groups."""
@@ -223,30 +419,69 @@ class EnvironMeterCallback(Callback):
     def on_step_begin(
         self,
         state: TrainerState,
-        micro_batches: list[dict[str, Any]] | None = None,
+        micro_batches: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> None:
-        """Start timing and count local input tokens and samples."""
+        """Start timing and count local input tokens and samples.
+
+        Args:
+            state: Current trainer state (unused; step comes from counters).
+            micro_batches: Micro-batches of the step, used for token,
+                sample and sequence-length accounting.
+        """
         del state, kwargs
         batches = self._micro_batches(micro_batches)
-        self._local_step_tokens = sum(self._batch_tokens(batch) for batch in batches)
-        self._local_step_samples = sum(self._batch_samples(batch) for batch in batches)
+        if self._seq_len is None:
+            self._seq_len = batch_seq_len(batches)
+        # ``_local_step_tokens`` stays a device scalar (or ``None``) so accumulation
+        # never forces a host sync; the other counters are plain integers.
+        self._local_step_tokens = None
+        self._local_step_padded_tokens = 0
+        self._local_step_samples = 0
+        self._local_step_vision_patches = 0
+        self._local_step_vision_patches_sq = 0
         self._step_start_time = time.perf_counter()
+        self._accumulate_batches(micro_batches)
+
+    def on_micro_step_begin(
+        self,
+        state: TrainerState,
+        micro_batch: dict[str, Any],
+        **kwargs: Any,
+    ) -> None:
+        """Accumulate metrics for one prepared micro-batch.
+
+        Args:
+            state: Current training progress.
+            micro_batch: Prepared inputs and lightweight metric metadata.
+            **kwargs: Unused callback context.
+        """
+        del state, kwargs
+        self._accumulate_batches(micro_batch)
 
     def on_step_end(
         self,
         state: TrainerState,
         loss: float,
-        loss_dict: dict[str, float] | None,
+        loss_dict: Optional[dict[str, float]],
         grad_norm: float,
         **kwargs: Any,
     ) -> None:
-        """Reduce and publish metrics for one completed optimizer step."""
+        """Reduce and publish metrics for one completed optimizer step.
+
+        Args:
+            state: Current trainer state (step counters live on counters).
+            loss: Reduced total loss for the step.
+            loss_dict: Per-component loss values for the step.
+            grad_norm: Global gradient norm for the step.
+        """
         del state, kwargs
         step_time = max(time.perf_counter() - self._step_start_time, 0.0)
         global_step_time = self._reduce(step_time, op="max")
-        global_tokens = int(self._reduce(self._local_step_tokens, op="sum"))
-        global_samples = int(self._reduce(self._local_step_samples, op="sum"))
+        local_tokens = 0 if self._local_step_tokens is None else self._local_step_tokens
+        global_tokens = int(self._reduce(local_tokens, op="sum"))
+        global_padded_tokens = int(self._reduce(self._local_step_padded_tokens, op="sum"))
+        global_samples = self._global_samples()
         self._consumed_tokens += global_tokens
         self._consumed_samples += global_samples
 
@@ -260,15 +495,66 @@ class EnvironMeterCallback(Callback):
             train_metrics[metric_name] = self._reduce(self._scalar(value, name), op="mean")
 
         tokens_per_second = global_tokens / global_step_time if global_step_time > 0 else 0.0
+        # The hardware executes dense ops over the padded batch, so that is the TFLOPS/MFU
+        # basis. A caller that only supplies device token scalars (no batch tensors) has no
+        # padding accounting; fall back to the real token count rather than reporting 0.
+        padded_basis = global_padded_tokens or global_tokens
+        padded_tokens_per_second = padded_basis / global_step_time if global_step_time > 0 else 0.0
         env_metrics = {
             **train_metrics,
             "performance/step_time": global_step_time,
             "performance/tokens_per_second": tokens_per_second,
+            "performance/tokens_per_second_padded": padded_tokens_per_second,
             "data/step_tokens": float(global_tokens),
+            "data/step_tokens_padded": float(global_padded_tokens),
             "data/consumed_tokens": float(self._consumed_tokens),
             "data/step_samples": float(global_samples),
             "data/consumed_samples": float(self._consumed_samples),
             **self._memory_metrics(),
         }
+        flops_per_token = self._resolve_flops_per_token()
+        vision = self._resolve_vision_flops()
+        global_vision_patches = 0
+        vision_tflops = 0.0
+        if vision is not None:
+            global_vision_patches = int(self._reduce(self._local_step_vision_patches, op="sum"))
+            patch_square_sum = int(self._reduce(self._local_step_vision_patches_sq, op="sum"))
+            env_metrics["data/step_vision_patches"] = float(global_vision_patches)
+            if global_step_time > 0 and global_vision_patches:
+                vision_tflops = (
+                    vision.flops(global_vision_patches, patch_square_sum)
+                    / global_step_time
+                    / 1e12
+                )
+        if flops_per_token or vision_tflops:
+            # Observed TFLOPS = (padded tokens/sec x flops/token) + vision tower,
+            # both in the 6N convention.  The hardware executes dense ops over the
+            # padded batch, so dividing by only the non-padding tokens would
+            # understate throughput by the padding ratio (severely so for VLM
+            # data); activation-checkpoint recompute is still not useful FLOPs.
+            # The vision tower's cost scales with image patches rather than with
+            # input_ids, so it is evaluated from the patches this step actually
+            # carried -- omitting it would make an image-heavy configuration look
+            # slower than an identical text-only one at the same real work.
+            llm_tflops = padded_tokens_per_second * flops_per_token / 1e12 if flops_per_token else 0.0
+            env_metrics["performance/tflops"] = llm_tflops + vision_tflops
+            if vision_tflops:
+                env_metrics["performance/tflops_vision"] = vision_tflops
+            if self._peak_tflops:
+                env_metrics["performance/mfu"] = env_metrics["performance/tflops"] / (
+                    self._peak_tflops * max(get_world_size_safe(), 1)
+                )
+                # HFU is the hardware view: the recompute forward is executed FLOPs even
+                # though MFU excludes it.  Unknowable for a selective schedule without an
+                # explicit factor, in which case it stays absent rather than guessed.
+                factor = resolve_recompute_factor(
+                    self.trainer.config,
+                    getattr(self.trainer.config.training, "hfu_recompute_factor", None),
+                )
+                if factor:
+                    env_metrics["performance/hfu"] = env_metrics["performance/mfu"] * factor
         self.trainer.step_train_metrics = train_metrics
         self.trainer.step_env_metrics = env_metrics
+        # Release the device token scalar now that the step is published: keeping it pins
+        # device memory across steps for no benefit.
+        self._local_step_tokens = None

@@ -49,6 +49,8 @@ _EXPORT_TO_MODULE = {
     "SwiGLUMLP": "swiglu_mlp",
 }
 
+__all__ = list(_EXPORT_TO_MODULE)
+
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     """Resolve a public class by importing only its owning submodule."""
@@ -59,5 +61,3 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     value = getattr(module, name)
     globals()[name] = value
     return value
-
-__all__ = list(_EXPORT_TO_MODULE)

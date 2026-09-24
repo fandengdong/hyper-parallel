@@ -18,22 +18,31 @@ assertions carrying a case-identification message; atomic assertions
 # pylint: disable=unused-argument,protected-access
 
 import functools
+import importlib
+import math
 from unittest import mock
-
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from hyper_parallel.distributed.expert_parallel import recipes as ep_compute
 from hyper_parallel.distributed.expert_parallel.recipes import routed_only_ep_compute_fn
 from hyper_parallel.distributed.expert_parallel.routing import (
     MOE_ROUTER_ADAPTERS,
+    _balanced_router,
     _sigmoid_group_router,
     _softmax_topk_router,
     _topk_router_module,
 )
+from hyper_parallel.distributed.expert_parallel import experts as ep_experts
 from hyper_parallel.distributed.expert_parallel.experts import (
+    _argsort_keys,
+    _expert_token_counts,
     _local_swiglu_expert_forward,
+    _pack_fused_dispatch,
+    _prepare_ep_dispatch,
+    _unpack_fused_dispatch,
     resolve_swiglu_weights,
 )
 from hyper_parallel.distributed.recipe_spec import (
@@ -1119,7 +1128,7 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
             self.local_expert_count = 1
             self.gate_up_proj = nn.Parameter(torch.randn(1, 8, 4))
             self.down_proj = nn.Parameter(torch.randn(1, 4, 4))
-            self._ep_act_fn = torch.tanh
+            self.ep_act_fn = torch.tanh
 
     experts = Experts()
     hidden_states = torch.randn(3, 4)
@@ -1185,6 +1194,300 @@ def test_router_and_expert_utils(tiny_hf_native_moe, tiny_hf_batched_moe):
     assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_adapter"
     torch.testing.assert_close(w, ref_w.to(w.dtype),
                                msg="case: sigmoid_group_router_adapter")
+
+    moe.n_group = 2
+    moe.topk_group = 1
+    idx, w = _sigmoid_group_router(moe, hidden)
+    group_scores = choice.view(-1, 2, 2).topk(2, dim=-1)[0].sum(dim=-1)
+    group_idx = group_scores.topk(1, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+    score_mask = group_mask.unsqueeze(-1).expand(-1, 2, 2).reshape(-1, 4)
+    grouped_choice = choice.masked_fill(~score_mask.bool(), float("-inf"))
+    ref_idx = grouped_choice.topk(2, dim=-1, sorted=False)[1]
+    ref_w = scores.gather(1, ref_idx)
+    ref_w = ref_w / (ref_w.sum(-1, keepdim=True) + 1e-20) * 2.5
+    assert torch.equal(idx, ref_idx), "case: sigmoid_group_router_group_filter"
+    torch.testing.assert_close(
+        w, ref_w.to(w.dtype), msg="case: sigmoid_group_router_group_filter"
+    )
+
+
+def test_fix_router_balanced_load(monkeypatch):
+    """``fix_router`` variant: round-robin assignment keeps the real top-k
+    weights but hands every destination rank exactly T*K/EP tokens."""
+    # ── case: balanced_router_even_load ──
+    # 12 tokens x top_k 2 = 24 slots over 8 experts -> 3 slots per expert,
+    # against a gate whose own preference would be anything but uniform.
+    class Gate(nn.Module):
+        def __init__(self, e, h):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(e, h) * 0.02)
+            self.register_buffer("e_score_correction_bias", torch.randn(e) * 0.01)
+
+        def forward(self, x):
+            return F.linear(  # pylint: disable=not-callable
+                x.view(-1, x.shape[-1]).float(), self.weight.float()
+            )
+
+    class MoE(nn.Module):  # pylint: disable=abstract-method
+        def __init__(self):
+            super().__init__()
+            self.gate = Gate(8, 16)
+            self.num_experts = 8
+            self.top_k = 2
+
+    torch.manual_seed(7)
+    moe = MoE()
+    hidden = torch.randn(12, 16)
+    idx, w = _balanced_router(moe, hidden)
+    assert idx.shape == (12, 2), "case: balanced_router_even_load"
+    counts = torch.bincount(idx.reshape(-1), minlength=8)
+    assert counts.tolist() == [3] * 8, "case: balanced_router_even_load"
+    assert torch.equal(idx, (torch.arange(24) % 8).view(12, 2)), \
+        "case: balanced_router_even_load"
+
+    # ── case: balanced_router_even_destination_load ──
+    # EP shape: 4 destinations x 2 local experts. 10 tokens x top_k 2 = 20
+    # slots -> exactly 5 per destination. A per-expert round robin (i % 8)
+    # replays the same residues on every rank instead, so the leftover piles
+    # onto the first destinations: 6, 6, 4, 4 -- and it is the busiest
+    # destination that sets the step time.
+    ep_moe = MoE()
+    ep_moe.experts = nn.Module()
+    ep_moe.experts.local_expert_count = 2
+    ep_hidden = torch.randn(10, 16)
+    idx, _ = _balanced_router(ep_moe, ep_hidden)
+    per_destination = torch.bincount(idx.reshape(-1) // 2, minlength=4)
+    assert per_destination.tolist() == [5, 5, 5, 5], \
+        "case: balanced_router_even_destination_load"
+    naive = torch.bincount(
+        (torch.arange(20) % 8) // 2, minlength=4)
+    assert naive.tolist() == [6, 6, 4, 4], \
+        "case: balanced_router_even_destination_load"
+
+    # Only the assignment is replaced: the true top-k weights are kept, so
+    # the gate keeps its gradient and the router GEMM stays in the profile.
+    _, ref_w = _sigmoid_group_router(moe, hidden)
+    torch.testing.assert_close(w, ref_w, msg="case: balanced_router_even_load")
+    assert MOE_ROUTER_ADAPTERS["deepseekv3_fixed"] is _balanced_router, \
+        "case: balanced_router_even_load"
+
+    # ── case: fix_router_selects_adapter ──
+    # The switch is the ONLY difference in the factory: off keeps the real
+    # sigmoid-group router, on swaps in the balanced one.
+    module = _TinyMoeMod()
+    module.shared_experts = nn.Identity()
+    captured = _capture_ep_primitives(monkeypatch)
+    compute_fn = ep_compute.deepseekv3_ep_compute_fn(
+        module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+        ep_mesh=_FakeEpMesh())
+    compute_fn(module, torch.randn(2, 4))
+    assert captured["router_fn"] is MOE_ROUTER_ADAPTERS["deepseekv3"], \
+        "case: fix_router_selects_adapter"
+
+    captured = _capture_ep_primitives(monkeypatch)
+    compute_fn = ep_compute.deepseekv3_ep_compute_fn(
+        module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+        ep_mesh=_FakeEpMesh(), fix_router=True)
+    compute_fn(module, torch.randn(2, 4))
+    assert captured["router_fn"] is _balanced_router, \
+        "case: fix_router_selects_adapter"
+
+
+def test_argsort_keys_aicore_path(monkeypatch):
+    """``_argsort_keys`` keeps the order via a float32 key, and only when the
+    key range is exactly representable (that is what moves the kernel from
+    AI_CPU to AICore on the EP dispatch path)."""
+    # ── case: argsort_fp32_key_same_order ──
+    # Dispatch keys are dest_rank * E + expert_idx, bounded by ep_size * E; real
+    # ties are expected, so compare the sorted KEY SEQUENCE rather than the
+    # permutation (the order of equal keys is not part of the contract).
+    torch.manual_seed(11)
+    keys = torch.randint(0, 128 * 384, (256,), dtype=torch.int64)
+    reference = keys.argsort()
+
+    monkeypatch.setattr(ep_experts, "_SORT_FP32_ENABLED", True)
+    got = _argsort_keys(keys, bound=128 * 384)
+    assert got.dtype == reference.dtype, "case: argsort_fp32_key_same_order"
+    assert torch.equal(keys[got], keys[reference]), \
+        "case: argsort_fp32_key_same_order"
+
+    # ── case: argsort_fp32_key_falls_back_out_of_range ──
+    # The largest integer float32 holds exactly is 2**24 - 1, so a bound above
+    # 2**24 must keep the exact int64 path.
+    big = torch.tensor([2 ** 24 + 1, 3, 2 ** 24, 2 ** 24 + 2], dtype=torch.int64)
+    assert torch.equal(_argsort_keys(big, bound=2 ** 25), big.argsort()), \
+        "case: argsort_fp32_key_falls_back_out_of_range"
+    # At the limit itself (keys < 2**24) the float32 path stays exact.
+    edge = torch.tensor([2 ** 24 - 1, 5, 0, 2 ** 24 - 2], dtype=torch.int64)
+    assert torch.equal(_argsort_keys(edge, bound=2 ** 24), edge.argsort()), \
+        "case: argsort_fp32_key_falls_back_out_of_range"
+
+
+def test_expert_token_counts_without_bincount(monkeypatch):
+    """EP routed-token counts come from a device-side histogram instead of
+    ``torch.bincount``, whose NPU implementation reads the input's min and max
+    back to the host on every call (two blocking D2H drains per MoE layer in
+    the profiled K2.6 step). Values, length and dtype are unchanged and the
+    grouped-GEMM path never reads a scalar back to the host."""
+    bincount_calls = []
+    real_bincount = torch.bincount
+
+    def spy_bincount(*args, **kwargs):
+        bincount_calls.append(1)
+        return real_bincount(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "bincount", spy_bincount)
+
+    # ── case: expert_token_counts_match_bincount ──
+    # Same values and the same minlength contract (an expert that got no tokens
+    # keeps its zero slot); int64 output whatever the index dtype.
+    indices = torch.tensor([0, 2, 2, 1, 2, 0], dtype=torch.int64)
+    reference = real_bincount(indices, minlength=4)
+    counts = _expert_token_counts(indices, 4)
+    assert counts.dtype == torch.int64, \
+        f"case: expert_token_counts_match_bincount: dtype={counts.dtype}"
+    assert counts.shape == reference.shape, \
+        f"case: expert_token_counts_match_bincount: shape={tuple(counts.shape)}, " \
+        f"expected={tuple(reference.shape)}"
+    assert torch.equal(counts, reference), \
+        f"case: expert_token_counts_match_bincount: counts={counts.tolist()}, " \
+        f"expected={reference.tolist()}"
+    assert torch.equal(_expert_token_counts(indices.to(torch.int32), 4), reference), \
+        f"case: expert_token_counts_match_bincount: int32 index mismatch, " \
+        f"counts={counts.tolist()}"
+    assert torch.equal(_expert_token_counts(indices.new_zeros(0), 3),
+                       torch.zeros(3, dtype=torch.int64)), \
+        "case: expert_token_counts_match_bincount: empty input must keep minlength"
+    assert not bincount_calls, \
+        f"case: expert_token_counts_match_bincount: torch.bincount called " \
+        f"{len(bincount_calls)} time(s)"
+
+    # ── case: grouped_experts_no_host_readback ──
+    # Grouped GEMM consumes the counts as its group-list source on device: each
+    # expert block must hold exactly that expert's rows, and no scalar may be
+    # read back to the host anywhere in the path.
+    def reject_readback(*args, **kwargs):
+        raise AssertionError("host scalar readback on the grouped expert path")
+
+    class GroupedExperts(nn.Module):  # pylint: disable=abstract-method
+        def __init__(self, local_expert_count):
+            super().__init__()
+            self.local_expert_count = local_expert_count
+            self.ep_use_grouped_gemm = True
+            self.counts = None
+            self.seen_rows = None
+
+        def forward_expert_major(self, x, num_tokens_per_expert, scores=None):
+            self.counts = num_tokens_per_expert.clone()
+            self.seen_rows = x.clone()
+            return x
+
+    grouped = GroupedExperts(3)
+    # Row i of `dispatched` starts with i * 4, so a block's rows identify the
+    # source token they came from.
+    dispatched = torch.arange(7 * 4, dtype=torch.float32).reshape(7, 4)
+    expert_id = torch.tensor([2, 0, 2, 1, 2, 0, 1], dtype=torch.int64)
+    with pytest.MonkeyPatch.context() as guard:
+        guard.setattr(torch.Tensor, "item", reject_readback)
+        guard.setattr(torch.Tensor, "tolist", reject_readback)
+        output = _local_swiglu_expert_forward(grouped, dispatched, expert_id)
+    grouped_counts = real_bincount(expert_id, minlength=3)
+    assert torch.equal(grouped.counts, grouped_counts), \
+        f"case: grouped_experts_no_host_readback: counts={grouped.counts.tolist()}, " \
+        f"expected={grouped_counts.tolist()}"
+    assert torch.equal(grouped.counts.cumsum(0), torch.tensor([2, 4, 7])), \
+        f"case: grouped_experts_no_host_readback: group_list={grouped.counts.cumsum(0).tolist()}"
+    for expert_index, block_size in enumerate(grouped_counts.tolist()):
+        starts = grouped_counts.cumsum(0).tolist()
+        begin = starts[expert_index] - block_size
+        block_rows = grouped.seen_rows[begin:begin + block_size, 0].tolist()
+        source_rows = (expert_id == expert_index).nonzero().reshape(-1).tolist()
+        assert sorted(block_rows) == sorted(row * 4 for row in source_rows), \
+            f"case: grouped_experts_no_host_readback: expert {expert_index} block rows " \
+            f"{block_rows}, expected {sorted(row * 4 for row in source_rows)}"
+    assert torch.equal(output, dispatched), \
+        f"case: grouped_experts_no_host_readback: output={output.tolist()}, " \
+        f"expected={dispatched.tolist()}"
+
+    # ── case: eager_expert_forward_matches_bincount_reference ──
+    # The eager (non-grouped) path still needs host ints; it now reads them in
+    # one transfer, so compare against a slicing reference built from bincount.
+    class EagerExperts(nn.Module):  # pylint: disable=abstract-method
+        def __init__(self, local_expert_count):
+            super().__init__()
+            self.local_expert_count = local_expert_count
+            self.gate_up_proj = nn.Parameter(torch.randn(local_expert_count, 8, 4))
+            self.down_proj = nn.Parameter(torch.randn(local_expert_count, 4, 4))
+            self.ep_act_fn = torch.tanh
+
+    torch.manual_seed(13)
+    eager = EagerExperts(3)
+    eager_id = torch.tensor([1, 2, 1, 0, 2, 2, 1], dtype=torch.int64)
+    got = _local_swiglu_expert_forward(eager, dispatched, eager_id)
+    order = _argsort_keys(eager_id, bound=3)
+    sorted_states = dispatched[order]
+    pieces = []
+    begin = 0
+    for expert_index, block_size in enumerate(
+            real_bincount(eager_id, minlength=3).tolist()):
+        chunk = sorted_states[begin:begin + block_size]
+        gate_states, up_states = F.linear(  # pylint: disable=not-callable
+            chunk, eager.gate_up_proj[expert_index]).chunk(2, dim=-1)
+        pieces.append(F.linear(  # pylint: disable=not-callable
+            torch.tanh(gate_states) * up_states, eager.down_proj[expert_index]))
+        begin += block_size
+    expected = torch.empty_like(dispatched)
+    expected[order] = torch.cat(pieces)
+    torch.testing.assert_close(
+        got, expected,
+        msg=f"case: eager_expert_forward_matches_bincount_reference: "
+            f"got={got.tolist()}, expected={expected.tolist()}")
+
+    # ── case: dispatch_send_counts_no_bincount ──
+    # The ragged all-to-all still needs host counts, but they must come from the
+    # same device histogram (one transfer) rather than a bincount drain.
+    exchanged = {}
+
+    def fake_all_to_all_single(output_tensor, input_tensor, group=None):
+        exchanged["group"] = group
+        exchanged["send"] = input_tensor.clone()
+        output_tensor.copy_(input_tensor)
+
+    monkeypatch.setattr(ep_experts.dist, "all_to_all_single",
+                        fake_all_to_all_single)
+    hidden = torch.randn(3, 4)
+    topk_index = torch.tensor([[0, 3], [4, 5], [1, 2]], dtype=torch.int64)
+    topk_weight = torch.rand(3, 2)
+    dispatch = _prepare_ep_dispatch(
+        hidden, topk_index, topk_weight,
+        local_expert_count=2, global_expert_count=8, ep_size=4,
+        ep_group="group-ep",
+    )
+    destination = topk_index.reshape(-1) // 2
+    expected_counts = real_bincount(destination, minlength=4).tolist()
+    assert dispatch.send_counts == expected_counts, \
+        f"case: dispatch_send_counts_no_bincount: send_counts={dispatch.send_counts}, " \
+        f"expected={expected_counts}"
+    # the fake exchange is the identity, so recv_counts mirrors send_counts
+    assert dispatch.receive_counts == expected_counts, \
+        f"case: dispatch_send_counts_no_bincount: recv_counts={dispatch.receive_counts}, " \
+        f"expected={expected_counts}"
+    assert exchanged["send"].dtype == torch.int64, \
+        f"case: dispatch_send_counts_no_bincount: dtype={exchanged['send'].dtype}"
+    source_indices = dispatch.source_indices
+    dispatch_order = dispatch.dispatch_order
+    dispatched_states = dispatch.states
+    dispatched_indices = dispatch.expert_indices
+    assert torch.equal(dispatched_states, hidden[source_indices[dispatch_order]]), \
+        f"case: dispatch_send_counts_no_bincount: dispatched rows=" \
+        f"{dispatched_states.tolist()}, expected={hidden[source_indices[dispatch_order]].tolist()}"
+    assert dispatched_indices.shape == (6, 1), \
+        f"case: dispatch_send_counts_no_bincount: expert indices shape=" \
+        f"{tuple(dispatched_indices.shape)}"
+    assert not bincount_calls, \
+        f"case: dispatch_send_counts_no_bincount: torch.bincount called " \
+        f"{len(bincount_calls)} time(s)"
 
 
 # ==========================================================================
@@ -1325,3 +1628,577 @@ def test_planner_ep_extend_contracts(tiny_hf_native_moe, tiny_hf_batched_moe,
     # Non-divisible -> error
     with pytest.raises(ValueError, match="must divide"):
         _expert_mesh_layout(mesh, ("dp", "tp"), 3)
+
+
+# ==========================================================================
+# Family 11: opt-in fused states+indices dispatch (HP_EP_FUSED_DISPATCH)
+# The routed dispatch sends the hidden states and the expert indices of a token
+# in two exchanges that carry identical token counts; the fused mode packs both
+# payloads into one row and exchanges the row once. These cases pin what the
+# switch promises: the routed tokens are unchanged, one exchange replaces two,
+# an unset HP_EP_FUSED_DISPATCH means off, and the unpack stays view-only so
+# the lazy wait (the shared-expert overlap window) is untouched.
+# ==========================================================================
+
+class _FusedDispatchMoe(nn.Module):
+    """MoE double: the routed dispatch reads only ``experts.local_expert_count``."""
+
+    def __init__(self, local_expert_count):
+        super().__init__()
+        self.experts = nn.Module()
+        self.experts.local_expert_count = local_expert_count
+
+
+class _FakeEpGroup:
+    """Size+rank EP group double (the role _FakeEpMesh's group plays)."""
+
+    def __init__(self, rank, size):
+        self.rank = rank
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+class _FakeEpA2AWorld:
+    """One-process EP world double for the routed token exchange.
+
+    Ranks run one after another in this process, so no transfer can happen
+    inside a call: every rank records the chunks it split out, and
+    :meth:`settle` files chunk ``i`` of each receive buffer from rank ``i`` --
+    the ``all_to_all`` contract ``_EPAllToAllUneven`` implements. The routing
+    plan belongs to the test, so the per-rank counts stay unequal, including a
+    destination that receives nothing at all.
+
+    ``wrap_async`` hands back a real ``AsyncCollectiveTensor``, which exercises
+    the lazy-wait behaviour of the production exchange without a process group.
+    """
+
+    def __init__(self, ep_size, send_plan, wrap_async=False):
+        self.ep_size = ep_size
+        self.send_plan = send_plan
+        self.wrap_async = wrap_async
+        self.sent = [[] for _ in range(ep_size)]
+        self.handles = []
+
+    def count_exchange(self, output_tensor, input_tensor, group=None):
+        """Stand-in for the counts all_to_all_single in _prepare_ep_dispatch."""
+        rank = group.rank
+        sends = [int(count) for count in input_tensor.tolist()]
+        assert sends == self.send_plan[rank], \
+            (f"case: fused_dispatch_counts_match_plan: rank {rank} computed "
+             f"send_counts={sends}, plan={self.send_plan[rank]}")
+        output_tensor.copy_(torch.tensor(
+            [self.send_plan[src][rank] for src in range(self.ep_size)],
+            dtype=output_tensor.dtype, device=output_tensor.device))
+
+    def token_exchange(self, rank, tensor, send_counts, recv_counts):
+        """Stand-in for ep_all_to_all_async: record the send, return the buffer."""
+        buffer = tensor.new_empty((sum(recv_counts),) + tuple(tensor.shape[1:]))
+        self.sent[rank].append((tensor.split(send_counts), list(recv_counts), buffer))
+        handle = AsyncCollectiveTensor(buffer) if self.wrap_async else buffer
+        self.handles.append(handle)
+        return handle
+
+    def settle(self):
+        """File every recorded chunk into its destination's receive buffer."""
+        for call in range(len(self.sent[0])):
+            chunks = {}
+            for rank in range(self.ep_size):
+                for dest, chunk in enumerate(self.sent[rank][call][0]):
+                    chunks[(rank, dest)] = chunk
+            for rank in range(self.ep_size):
+                _, recv_counts, buffer = self.sent[rank][call]
+                pieces = [chunks[(src, rank)] for src in range(self.ep_size)]
+                for src, piece in enumerate(pieces):
+                    assert piece.shape[0] == recv_counts[src], \
+                        (f"case: fused_dispatch_counts_match_plan: rank {rank} expects "
+                         f"{recv_counts[src]} rows from rank {src}, got {piece.shape[0]}")
+                buffer.copy_(torch.cat(pieces))
+
+
+def _fused_dispatch_plan():
+    """Routing plan: per-rank expert index of every (token, top-k slot).
+
+    Expert ``e`` is dispatched to destination ``e // local_expert_count``; the
+    plan keeps some destinations far busier than others and leaves destination
+    2 fed by nobody, so both "unequal split counts" and "a rank that receives
+    zero tokens" are part of the scenario.
+    """
+    local_expert_count = 2
+    slots = {
+        0: [0, 1, 0, 3, 1, 0, 2, 3],
+        1: [4, 5, 6, 4, 5, 6, 7, 4],
+        2: [6, 7, 7, 6, 6, 7, 7, 6],   # nothing routes to destination 2
+        3: [1, 0, 0, 1, 0, 1, 1, 0],
+    }
+    send_plan = {
+        rank: [sum(1 for expert in experts if expert // local_expert_count == dest)
+               for dest in range(len(slots))]
+        for rank, experts in slots.items()
+    }
+    return slots, send_plan, local_expert_count
+
+
+def _fused_dispatch_inputs():
+    """Scenario for the exchange cases: routing plan plus per-rank inputs.
+
+    The plan is the unequal one (destination 0 gets 5+8 routed rows while
+    destination 2 gets none), so a packing that misplaces a row or an offset
+    cannot hide.
+    """
+    slots, send_plan, local_expert_count = _fused_dispatch_plan()
+    experts_per_token, hidden_size = 2, 3
+    ep_size = len(slots)
+    token_count = len(slots[0]) // experts_per_token
+    torch.manual_seed(23)
+    return {
+        "slots": slots,
+        "send_plan": send_plan,
+        "local_expert_count": local_expert_count,
+        "ep_size": ep_size,
+        "experts_per_token": experts_per_token,
+        "hidden_size": hidden_size,
+        "row_count": len(slots[0]),
+        "hidden": {rank: torch.randn(2, 2, hidden_size, dtype=torch.bfloat16)
+                   for rank in range(ep_size)},
+        "topk": {rank: torch.tensor(experts, dtype=torch.int64).view(
+            token_count, experts_per_token) for rank, experts in slots.items()},
+        "weights": {rank: torch.rand(token_count, experts_per_token)
+                    for rank in range(ep_size)},
+    }
+
+
+def _run_routed_dispatch(monkeypatch, case, fused, wrap_async=False):
+    """Drive every rank's routed dispatch once and settle the world.
+
+    ``fake_async`` stands in for ``ep_all_to_all_async`` at the module call
+    site, so the switch is the only difference between the two modes.
+    """
+    world = _FakeEpA2AWorld(case["ep_size"], case["send_plan"], wrap_async=wrap_async)
+    exchanges = []
+
+    def fake_async(tensor, send_counts, recv_counts, group, **kwargs):
+        del kwargs  # the fused dispatch opts out of pending handles; a tensor is what it needs
+        exchanges.append((group.rank, tuple(tensor.shape), tensor.dtype))
+        return world.token_exchange(group.rank, tensor, send_counts, recv_counts)
+
+    def router_for(rank):
+        def router(module, hidden_states):
+            return case["topk"][rank], case["weights"][rank]
+        return router
+
+    monkeypatch.setattr(ep_experts, "ep_all_to_all_async", fake_async)
+    monkeypatch.setattr(ep_experts.dist, "all_to_all_single", world.count_exchange)
+    monkeypatch.setattr(ep_experts, "_FUSED_DISPATCH_ENABLED", fused)
+    states, indices = {}, {}
+    for rank in range(case["ep_size"]):
+        state = ep_experts.ep_routed_dispatch(
+            _FusedDispatchMoe(case["local_expert_count"]),
+            case["hidden"][rank],
+            router_fn=router_for(rank),
+            ep_group=_FakeEpGroup(rank, case["ep_size"]),
+        )
+        states[rank] = state.received_states
+        indices[rank] = state.received_indices
+    world.settle()
+    return world, states, indices, exchanges
+
+
+def test_fused_dispatch_one_exchange_per_pass(monkeypatch):
+    """The fused mode replaces the two routed exchanges with one, and that one
+    row carries the states' bytes plus the indices' bytes."""
+    case = _fused_dispatch_inputs()
+    ep_size = case["ep_size"]
+    hidden_size = case["hidden_size"]
+    row_count = case["row_count"]
+
+    # ── case: fused_dispatch_counts_match_plan ──
+    # The scenario is the unequal one: destination 0 gets 5+8 rows while
+    # destination 2 gets none.
+    assert case["send_plan"] == {0: [5, 3, 0, 0], 1: [0, 0, 5, 3],
+                                2: [0, 0, 0, 8], 3: [8, 0, 0, 0]}, \
+        f"case: fused_dispatch_counts_match_plan: send_plan={case['send_plan']}"
+
+    world_off, _, _, calls_off = _run_routed_dispatch(monkeypatch, case, False)
+    world_on, _, _, calls_on = _run_routed_dispatch(monkeypatch, case, True)
+
+    # ── case: fused_dispatch_one_exchange_per_pass ──
+    # The switch is the only difference in the schedule: OFF issues the states
+    # and then the indices (two exchanges per rank), ON issues one packed row
+    # per rank.
+    assert [len(world_off.sent[rank]) for rank in range(ep_size)] == [2] * ep_size, \
+        (f"case: fused_dispatch_one_exchange_per_pass: OFF exchanges per rank="
+         f"{[len(world_off.sent[rank]) for rank in range(ep_size)]}, expected 2 each")
+    assert [len(world_on.sent[rank]) for rank in range(ep_size)] == [1] * ep_size, \
+        (f"case: fused_dispatch_one_exchange_per_pass: ON exchanges per rank="
+         f"{[len(world_on.sent[rank]) for rank in range(ep_size)]}, expected 1 each")
+    assert len(calls_off) == 2 * ep_size and len(calls_on) == ep_size, \
+        (f"case: fused_dispatch_one_exchange_per_pass: ep_all_to_all_async calls "
+         f"OFF={len(calls_off)}, ON={len(calls_on)}, expected "
+         f"{2 * ep_size}/{ep_size}")
+    assert [call[:2] for call in calls_off] == [
+        (rank, shape)
+        for rank in range(ep_size)
+        for shape in ((row_count, hidden_size), (row_count, 1))
+    ], f"case: fused_dispatch_one_exchange_per_pass: OFF calls={calls_off}"
+    on_widths = {call[1][1] for call in calls_on}
+    assert {call[0] for call in calls_on} == set(range(ep_size)) and len(on_widths) == 1, \
+        f"case: fused_dispatch_one_exchange_per_pass: ON calls={calls_on}"
+    states_bytes = hidden_size * torch.bfloat16.itemsize
+    index_dtype_bytes = torch.int64.itemsize
+    packed_row_bytes = on_widths.pop() * torch.bfloat16.itemsize
+    assert packed_row_bytes >= states_bytes + index_dtype_bytes, \
+        (f"case: fused_dispatch_one_exchange_per_pass: packed row is "
+         f"{packed_row_bytes} bytes, expected at least "
+         f"{states_bytes + index_dtype_bytes}")
+
+
+def test_fused_dispatch_equivalence_across_ranks(monkeypatch):
+    """HP_EP_FUSED_DISPATCH=1 delivers exactly the routed tokens the two
+    separate exchanges deliver: same shapes, same dtypes, same values."""
+    case = _fused_dispatch_inputs()
+    ep_size = case["ep_size"]
+    hidden_size = case["hidden_size"]
+    hidden = case["hidden"]
+    slots = case["slots"]
+    local_expert_count = case["local_expert_count"]
+    experts_per_token = case["experts_per_token"]
+    send_plan = case["send_plan"]
+
+    _, states_off, indices_off, _ = _run_routed_dispatch(monkeypatch, case, False)
+    _, states_on, indices_on, _ = _run_routed_dispatch(monkeypatch, case, True)
+
+    # ── case: fused_dispatch_matches_split_exchanges ──
+    # Element-wise identical routed states/indices per rank, which is what makes
+    # the switch safe to enable: same dtype, same shape, same values.
+    for rank in range(ep_size):
+        expected_rows = sum(send_plan[src][rank] for src in range(ep_size))
+        assert states_on[rank].shape == states_off[rank].shape == \
+            (expected_rows, hidden_size), \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} shapes "
+             f"fused={tuple(states_on[rank].shape)}, "
+             f"split={tuple(states_off[rank].shape)}, "
+             f"expected={(expected_rows, hidden_size)}")
+        assert states_on[rank].dtype is states_off[rank].dtype, \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} dtypes "
+             f"fused={states_on[rank].dtype}, split={states_off[rank].dtype}")
+        assert torch.equal(states_on[rank], states_off[rank]), \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} states "
+             f"fused={states_on[rank].tolist()}, split={states_off[rank].tolist()}")
+        assert indices_on[rank].shape == indices_off[rank].shape == (expected_rows,), \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} index shapes "
+             f"fused={tuple(indices_on[rank].shape)}, "
+             f"split={tuple(indices_off[rank].shape)}, expected={(expected_rows,)}")
+        assert indices_on[rank].dtype is torch.int64, \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} index dtype "
+             f"fused={indices_on[rank].dtype}, split={indices_off[rank].dtype}")
+        assert torch.equal(indices_on[rank], indices_off[rank]), \
+            (f"case: fused_dispatch_matches_split_exchanges: rank {rank} indices "
+             f"fused={indices_on[rank].tolist()}, "
+             f"split={indices_off[rank].tolist()}")
+
+    # ── case: fused_dispatch_delivers_the_routed_rows ──
+    # Independent anchor (it also validates the world double itself): what a
+    # rank receives is the multiset of rows routed to it, so a packing bug
+    # cannot pass by matching its own output.
+    for rank in range(ep_size):
+        routed_rows, routed_experts = [], []
+        for src in range(ep_size):
+            flat = hidden[src].reshape(-1, hidden_size)
+            for slot, expert in enumerate(slots[src]):
+                if expert // local_expert_count == rank:
+                    routed_rows.append(flat[slot // experts_per_token])
+                    routed_experts.append(expert)
+        assert states_on[rank].shape[0] == len(routed_rows), \
+            (f"case: fused_dispatch_delivers_the_routed_rows: rank {rank} received "
+             f"{states_on[rank].shape[0]} rows, routed={len(routed_rows)}")
+        if not routed_rows:
+            continue
+        expected_states = torch.stack(routed_rows)
+        expected_indices = torch.tensor(routed_experts, dtype=torch.int64)
+        assert torch.equal(states_on[rank].sort(dim=0).values,
+                           expected_states.sort(dim=0).values), \
+            (f"case: fused_dispatch_delivers_the_routed_rows: rank {rank} states "
+             f"received={states_on[rank].tolist()}, routed={expected_states.tolist()}")
+        assert torch.equal(indices_on[rank].sort().values, expected_indices.sort().values), \
+            (f"case: fused_dispatch_delivers_the_routed_rows: rank {rank} indices "
+             f"received={indices_on[rank].tolist()}, routed={expected_indices.tolist()}")
+
+
+def test_fused_dispatch_keeps_the_lazy_wait(monkeypatch):
+    """The fused unpack is view-only, so the exchange's wait still lands on the
+    first real consumer instead of on the dispatch call itself."""
+    case = _fused_dispatch_inputs()
+    ep_size = case["ep_size"]
+    _, states_off, indices_off, _ = _run_routed_dispatch(monkeypatch, case, False)
+
+    # ── case: fused_dispatch_keeps_the_lazy_wait ──
+    # A real AsyncCollectiveTensor stands in for the collective handle: pack and
+    # unpack must be pure views, so nothing enqueues the wait between the
+    # exchange and the independent work the caller runs before the experts read
+    # the result. A materializing op in the unpack (a reshape that copies, a
+    # contiguous()) would complete the handle right here and serialize the
+    # shared-expert overlap away -- the very thing the fused path must keep.
+    world_lazy, states_lazy, indices_lazy, _ = _run_routed_dispatch(
+        monkeypatch, case, True, wrap_async=True)
+    assert len(world_lazy.handles) == ep_size, \
+        (f"case: fused_dispatch_keeps_the_lazy_wait: handles={len(world_lazy.handles)}, "
+         f"expected={ep_size}")
+    for handle in world_lazy.handles:
+        assert handle.completed is False, \
+            "case: fused_dispatch_keeps_the_lazy_wait: the unpack waited on the exchange"
+    for rank in range(ep_size):
+        assert states_lazy[rank].completed is False, \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} states view "
+             f"completed={states_lazy[rank].completed}, expected=False")
+        assert indices_lazy[rank].completed is False, \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} index view "
+             f"completed={indices_lazy[rank].completed}, expected=False")
+        # The experts' first read is what materializes the pending exchange.
+        materialized_states = states_lazy[rank] + 0
+        materialized_indices = indices_lazy[rank] - 0
+        assert torch.equal(materialized_states, states_off[rank]), \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} states after the "
+             f"wait={materialized_states.tolist()}, split={states_off[rank].tolist()}")
+        assert torch.equal(materialized_indices, indices_off[rank]), \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} indices after the "
+             f"wait={materialized_indices.tolist()}, split={indices_off[rank].tolist()}")
+        assert states_lazy[rank].completed is True, \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} states view "
+             f"completed={states_lazy[rank].completed}, expected=True")
+        assert indices_lazy[rank].completed is True, \
+            (f"case: fused_dispatch_keeps_the_lazy_wait: rank {rank} index view "
+             f"completed={indices_lazy[rank].completed}, expected=True")
+
+
+class _IdentityEpA2AWorld:
+    """One-rank EP world double whose exchange is the identity.
+
+    With ``ep_size=1`` every expert is local, so the all-to-all moves nothing;
+    handing the tensor straight back keeps the run free of the in-place copy the
+    multi-rank double needs to fill its receive buffers, which is what makes the
+    autograd graph here the production one -- the exchange is an autograd
+    Function and the pack/unpack are ordinary ops on its input and output.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def count_exchange(self, output_tensor, input_tensor, group=None):
+        """One rank: the counts come back unchanged."""
+        output_tensor.copy_(input_tensor)
+
+    def token_exchange(self, tensor):
+        """Record the exchanged shape and return the tensor (nothing moves)."""
+        self.calls.append(tuple(tensor.shape))
+        return tensor
+
+
+class _IdentityA2AFunction(torch.autograd.Function):
+    """Differentiable stand-in for ``ep_all_to_all_async``.
+
+    What the gradient case needs is an exchange that behaves like the real one
+    for autograd: a Function whose backward is the reverse exchange. On the
+    one-rank world the forward and the backward are both the identity, so this
+    is the real contract with the transfer factored out -- the packed row must
+    stay on a differentiable *float* path, and a byte-view packing
+    (``view(uint8)``) severs the graph right here without changing a single
+    forward value.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, world):  # pylint: disable=arguments-differ
+        """Hand the tensor to the world's identity exchange."""
+        return world.token_exchange(tensor)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+        """Identity backward (the one-rank exchange moved nothing)."""
+        return grad_output, None
+
+
+def test_fused_dispatch_gradient_matches_split_exchanges(monkeypatch):
+    """The fused dispatch keeps the routed branch differentiable: the gradient
+    that reaches the local hidden states is the one the two separate exchanges
+    produce. A packing that reinterpreted the states as bytes would detach the
+    branch (every forward value unchanged, no gradient at all), which is
+    invisible to any value-only comparison."""
+    ep_size = 1
+    local_expert_count = 4   # every expert is local -> the whole routing is rank 0's
+    hidden_size = 3
+    slots = [[0, 1], [2, 3], [0, 3], [1, 2]]
+
+    def run(fused):
+        torch.manual_seed(37)
+        hidden = torch.randn(2, 2, hidden_size, dtype=torch.bfloat16, requires_grad=True)
+        weights = torch.rand(len(slots), len(slots[0]))
+        topk = torch.tensor(slots, dtype=torch.int64)
+        world = _IdentityEpA2AWorld()
+
+        def fake_async(tensor, send_counts, recv_counts, group, **kwargs):
+            del kwargs  # the fused dispatch opts out of pending handles
+            return _IdentityA2AFunction.apply(tensor, world)
+
+        monkeypatch.setattr(ep_experts, "ep_all_to_all_async", fake_async)
+        monkeypatch.setattr(ep_experts.dist, "all_to_all_single", world.count_exchange)
+        monkeypatch.setattr(ep_experts, "_FUSED_DISPATCH_ENABLED", fused)
+        state = ep_experts.ep_routed_dispatch(
+            _FusedDispatchMoe(local_expert_count),
+            hidden,
+            router_fn=lambda module, hidden_states: (topk, weights),
+            ep_group=_FakeEpGroup(0, ep_size),
+        )
+        # ── case: fused_dispatch_keeps_the_routed_branch_differentiable ──
+        # The routed states are a live graph node in both modes: the experts'
+        # input must never arrive detached (that would train the routed branch
+        # with a silently zero activation gradient).
+        assert state.received_states.requires_grad is True, \
+            (f"case: fused_dispatch_keeps_the_routed_branch_differentiable: fused={fused} "
+             f"received_states.requires_grad={state.received_states.requires_grad}, "
+             f"expected=True")
+        loss = (state.received_states.float()
+                * state.flattened_expert_weights.reshape(-1, 1)).sum()
+        loss.backward()
+        return hidden.grad.clone(), state.received_states.detach().clone()
+
+    grad_off, states_off = run(False)
+    grad_on, states_on = run(True)
+
+    # ── case: fused_dispatch_gradient_matches_split_exchanges ──
+    assert torch.equal(states_on, states_off), \
+        (f"case: fused_dispatch_gradient_matches_split_exchanges: states fused="
+         f"{states_on.tolist()}, split={states_off.tolist()}")
+    assert torch.equal(grad_on, grad_off), \
+        (f"case: fused_dispatch_gradient_matches_split_exchanges: gradient fused="
+         f"{grad_on.tolist()}, split={grad_off.tolist()}")
+    assert bool(grad_on.abs().sum() > 0), \
+        (f"case: fused_dispatch_gradient_matches_split_exchanges: gradient fused="
+         f"{grad_on.tolist()} is all zero, so this case proves nothing")
+
+
+def test_fused_dispatch_pack_round_trip():
+    """The fused row is byte-exact: pack/unpack restores dtype, shape and every
+    value -- including non-square, empty and above-bf16-range payloads."""
+    rows = 6
+
+    # ── case: fused_pack_round_trip_non_square ──
+    # H=3 is odd and H=5 is not a multiple of the index slot, so both need the
+    # head pad; H=7168 is the model's real EP dispatch width.
+    for state_dtype, index_dtype in ((torch.bfloat16, torch.int64),
+                                     (torch.float32, torch.int64),
+                                     (torch.bfloat16, torch.int32)):
+        for hidden_size in (3, 5, 7168):
+            torch.manual_seed(29)
+            states = torch.randn(rows, hidden_size, dtype=state_dtype)
+            indices = torch.randint(0, 8, (rows, 1), dtype=index_dtype)
+            packed = _pack_fused_dispatch(states, indices)
+            back_states, back_indices = _unpack_fused_dispatch(
+                packed, hidden_size=hidden_size, index_dtype=index_dtype)
+
+            # Layout derived here from the alignment rules, not from the source:
+            # the index region must start at a byte offset that is a multiple of
+            # the index element size, and the row must hold whole state elements.
+            state_bytes = hidden_size * states.element_size()
+            index_bytes = indices.element_size()
+            align = math.lcm(states.element_size(), index_bytes)
+            head_bytes = (-state_bytes) % align
+            assert packed.shape[1] * states.element_size() == state_bytes + head_bytes + align, \
+                (f"case: fused_pack_round_trip_non_square: {state_dtype} states / "
+                 f"{index_dtype} indices, H={hidden_size}: row="
+                 f"{packed.shape[1] * states.element_size()} bytes, expected="
+                 f"{state_bytes + head_bytes + align}")
+            assert torch.equal(
+                packed.view(torch.uint8)[:, state_bytes + head_bytes:
+                                         state_bytes + head_bytes + index_bytes],
+                indices.view(torch.uint8)), \
+                (f"case: fused_pack_round_trip_non_square: {state_dtype} states / "
+                 f"{index_dtype} indices, H={hidden_size}: index bytes were converted "
+                 f"instead of copied")
+            assert back_states.dtype is state_dtype and back_states.shape == states.shape, \
+                (f"case: fused_pack_round_trip_non_square: states restored as "
+                 f"{back_states.dtype}{tuple(back_states.shape)}, expected "
+                 f"{state_dtype}{tuple(states.shape)}")
+            assert torch.equal(back_states, states), \
+                (f"case: fused_pack_round_trip_non_square: {state_dtype} states round "
+                 f"tripped as {back_states.tolist()}, expected {states.tolist()}")
+            assert back_indices.dtype is index_dtype and back_indices.shape == (rows,), \
+                (f"case: fused_pack_round_trip_non_square: indices restored as "
+                 f"{back_indices.dtype}{tuple(back_indices.shape)}, expected "
+                 f"{index_dtype}{(rows,)}")
+            assert torch.equal(back_indices, indices.reshape(-1)), \
+                (f"case: fused_pack_round_trip_non_square: {index_dtype} indices round "
+                 f"tripped as {back_indices.tolist()}, expected "
+                 f"{indices.reshape(-1).tolist()}")
+
+    # ── case: fused_pack_keeps_indices_above_bf16_range ──
+    # 1024 experts: bf16 holds only integers up to 256 exactly, so an
+    # implementation that casts the index into the packed dtype silently
+    # corrupts the routing above that -- the index must travel as bytes.
+    torch.manual_seed(31)
+    expert_count = 1024
+    indices = torch.tensor([257, 511, 1000, 1023, 0, 512], dtype=torch.int64).view(rows, 1)
+    states = torch.randn(rows, 4, dtype=torch.bfloat16)
+    back_states, back_indices = _unpack_fused_dispatch(
+        _pack_fused_dispatch(states, indices), hidden_size=4, index_dtype=torch.int64)
+    assert expert_count > 256, \
+        f"case: fused_pack_keeps_indices_above_bf16_range: expert_count={expert_count}"
+    assert torch.equal(back_indices, indices.reshape(-1)), \
+        (f"case: fused_pack_keeps_indices_above_bf16_range: indices round tripped as "
+         f"{back_indices.tolist()}, expected {indices.reshape(-1).tolist()}")
+    assert not torch.equal(back_indices, indices.reshape(-1).to(torch.bfloat16).to(torch.int64)), \
+        (f"case: fused_pack_keeps_indices_above_bf16_range: the payload survives a bf16 "
+         f"cast ({indices.reshape(-1).to(torch.bfloat16).to(torch.int64).tolist()}), so "
+         f"this case cannot tell the byte copy from a numeric cast")
+    assert torch.equal(back_states, states), \
+        (f"case: fused_pack_keeps_indices_above_bf16_range: states round tripped as "
+         f"{back_states.tolist()}, expected {states.tolist()}")
+
+    # ── case: fused_pack_round_trip_empty ──
+    # A rank that routes nothing and a rank that receives nothing: both sides
+    # stay empty instead of driving an offset past the buffer.
+    for state_dtype in (torch.bfloat16, torch.float32):
+        states = torch.randn(0, 3, dtype=state_dtype)
+        indices = torch.zeros(0, 1, dtype=torch.int64)
+        packed = _pack_fused_dispatch(states, indices)
+        back_states, back_indices = _unpack_fused_dispatch(
+            packed, hidden_size=3, index_dtype=torch.int64)
+        assert packed.shape[0] == 0, \
+            (f"case: fused_pack_round_trip_empty: packed rows={packed.shape[0]}, expected=0")
+        assert back_states.shape == (0, 3) and back_states.dtype is state_dtype, \
+            (f"case: fused_pack_round_trip_empty: empty states restored as "
+             f"{back_states.dtype}{tuple(back_states.shape)}, expected "
+             f"{state_dtype}{(0, 3)}")
+        assert back_indices.shape == (0,) and back_indices.dtype is torch.int64, \
+            (f"case: fused_pack_round_trip_empty: empty indices restored as "
+             f"{back_indices.dtype}{tuple(back_indices.shape)}, expected "
+             f"{torch.int64}{(0,)}")
+        assert torch.equal(back_states, states) and torch.equal(back_indices,
+                                                               indices.reshape(-1)), \
+            (f"case: fused_pack_round_trip_empty: empty round trip changed the payload: "
+             f"states={back_states.tolist()}, indices={back_indices.tolist()}")
+
+
+def test_fused_dispatch_flag_default_off():
+    """The fused dispatch is opt-in: HP_EP_FUSED_DISPATCH is read once at import
+    and an unset variable keeps the two separate exchanges in place."""
+    with pytest.MonkeyPatch.context() as guard:
+        # ── case: fused_dispatch_default_off ──
+        guard.delenv("HP_EP_FUSED_DISPATCH", raising=False)
+        reloaded = importlib.reload(ep_experts)
+        assert reloaded._FUSED_DISPATCH_ENABLED is False, \
+            (f"case: fused_dispatch_default_off: unset HP_EP_FUSED_DISPATCH imported as "
+             f"{reloaded._FUSED_DISPATCH_ENABLED}, expected False")
+
+        # ── case: fused_dispatch_opt_in ──
+        guard.setenv("HP_EP_FUSED_DISPATCH", "1")
+        reloaded = importlib.reload(ep_experts)
+        assert reloaded._FUSED_DISPATCH_ENABLED is True, \
+            (f"case: fused_dispatch_opt_in: HP_EP_FUSED_DISPATCH=1 imported as "
+             f"{reloaded._FUSED_DISPATCH_ENABLED}, expected True")
+        guard.setenv("HP_EP_FUSED_DISPATCH", "0")
+        reloaded = importlib.reload(ep_experts)
+        assert reloaded._FUSED_DISPATCH_ENABLED is False, \
+            (f"case: fused_dispatch_opt_in: HP_EP_FUSED_DISPATCH=0 imported as "
+             f"{reloaded._FUSED_DISPATCH_ENABLED}, expected False")
+    importlib.reload(ep_experts)

@@ -27,7 +27,6 @@ import inspect
 import os
 import unittest
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 from tests.common.mark_utils import arg_mark
 
@@ -230,6 +229,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "MixedPrecisionConfig",
                 "ModelIntegrationConfig",
                 "OptimizerConfig",
+                "OptimizerSwapConfig",
                 "ProfilingConfig",
                 "Target",
                 "TrainerConfig",

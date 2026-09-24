@@ -14,6 +14,8 @@
 # limitations under the License.
 """CheckpointerCallback --- save/restore policy on top of a Checkpointer."""
 
+__all__ = ["CheckpointerCallback"]
+
 import os
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -138,7 +140,11 @@ class CheckpointerCallback(Callback):
             self, state: TrainerState, **kwargs: Any
     ) -> None:
         """Save on the configured step cadence."""
-        if self._save_steps > 0 and state.global_step % self._save_steps == 0:
+        # ``global_step`` 0 is a multiple of every cadence, so without the lower bound a
+        # fresh launch writes a full checkpoint before training a single step (a 1T model
+        # makes that ~2 TB of I/O in the startup path).  The first periodic save is due
+        # at ``save_steps``.
+        if self._save_steps > 0 and state.global_step > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
                 return
             self._save_checkpoint(state)
@@ -473,6 +479,3 @@ class CheckpointerCallback(Callback):
         steps_per_epoch = self._steps_per_epoch()
         trainer.start_epoch = trainer.state.global_step // steps_per_epoch
         trainer.start_step = trainer.state.global_step % steps_per_epoch
-
-
-__all__ = ["CheckpointerCallback"]

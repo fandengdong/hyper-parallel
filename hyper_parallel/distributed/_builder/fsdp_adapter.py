@@ -30,6 +30,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+from torch.nn import Module as ModuleClass
+from torch.nn import Parameter as ParameterClass
+
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
 from hyper_parallel.distributed._builder.source_shard import (
@@ -41,7 +45,6 @@ from hyper_parallel.distributed._builder.source_shard import (
 )
 from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models.registry import get_model_adapter
-from hyper_parallel.platform import get_platform
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import (
@@ -49,9 +52,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
-ModuleClass = platform.Module
-ParameterClass = platform.Parameter
 
 
 @dataclass(frozen=True)
@@ -168,7 +168,7 @@ class FSDP2Manager:
         return self._build_compatibility_fsdp_mesh()
 
     def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
-        """Resolve the configured dtype strings to platform dtypes.
+        """Resolve the configured dtype strings to torch dtypes.
 
         Dtype strings stay YAML-friendly; ``float32`` resolves to the
         framework's ``float32`` dtype object. Fully-sharded params without an
@@ -177,9 +177,9 @@ class FSDP2Manager:
         mix_precision = self.config.mix_precision
         dtype_by_name = {
             None: None,
-            "bfloat16": platform.tensor_dtype.bfloat16,
-            "float16": platform.tensor_dtype.float16,
-            "float32": platform.tensor_dtype.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
         }
         return fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],
@@ -193,7 +193,9 @@ class FSDP2Manager:
         """Return CPU offload when enabled, otherwise the default no-offload policy."""
         if not self.config.enable_offload:
             return fully_shard_utils.OffloadPolicy()
-        return fully_shard_utils.CPUOffloadPolicy()
+        return fully_shard_utils.CPUOffloadPolicy(
+            pin_memory=self.config.offload_pin_memory
+        )
 
     def _build_fully_shard_kwargs(
         self,
@@ -231,6 +233,7 @@ class FSDP2Manager:
         wrap_modules = []
         wrapped_module_ids = set()
         excluded_subtree_module_fqns = excluded_subtree_module_fqns or set()
+        module_id_to_fqn = {id(module): fqn for fqn, module in model.named_modules()}
 
         def is_inside_declared_subtree(module_fqn: str) -> bool:
             """Whether one module is inside an automatic-discovery exclusion."""
@@ -254,7 +257,7 @@ class FSDP2Manager:
                 blocks = list(child.children())
                 if not blocks:
                     continue
-                for block_index, block in enumerate(blocks):
+                for block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
@@ -263,9 +266,14 @@ class FSDP2Manager:
                         # The wrapper and its direct child represent one logical
                         # transformer block during module-tree traversal.
                         wrapped_module_ids.add(id(wrapped_module))
-                    wrap_modules.append(
-                        _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
-                    )
+                    # Use the block's real module FQN (children may be named
+                    # attributes such as "q_proj" rather than ModuleList
+                    # indices; an index-composed FQN breaks owner resolution
+                    # and the FSDP source-shard-info validation under TP).
+                    real_fqn = module_id_to_fqn.get(id(block))
+                    if real_fqn is None:
+                        continue
+                    wrap_modules.append(_WrapModuleInfo(real_fqn, block))
         return wrap_modules, wrapped_module_ids
 
     def _find_expert_wrap_modules(

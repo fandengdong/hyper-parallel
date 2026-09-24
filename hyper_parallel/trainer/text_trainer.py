@@ -19,11 +19,13 @@ from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime.device import synchronize
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.config import TrainerConfig
@@ -178,13 +180,27 @@ class TextTrainer:
         """Dispatch the step-begin lifecycle hook."""
         self.base.on_step_begin()
 
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
+
+        Args:
+            micro_batch: Prepared inputs and lightweight metric metadata.
+        """
+        self.base.on_micro_step_begin(micro_batch)
+
     def on_step_end(
             self,
             loss: Any = None,
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
@@ -211,12 +227,26 @@ class TextTrainer:
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
+        metric_inputs = {
+            **model_inputs,
+            **loss_inputs,
+            "token_count": self.base.current_token_counts["foundation_tokens"],
+        }
+        self.on_micro_step_begin(metric_inputs)
+        del metric_inputs
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one text training step."""
+        """Execute one text training step.
+
+        Args:
+            data_iterator: Iterator providing the step's micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
         num_micro_steps = self.base.num_micro_batches
 
         self.on_step_begin()
@@ -243,7 +273,34 @@ class TextTrainer:
                 total_loss_dict[loss_name] += loss_value.item()
 
         grad_norm = self.base.prepare_optimizer_step()
-        self.base.step_optimizers_and_schedulers()
+
+        # The unit-pipelined variant is opt-in and falls back to the plain loop
+        # below when it is disabled or unsupported by the optimizer and model.
+        # It reuses this call site's dispatch context so the lazy optimizer
+        # state is created through the same path as in a full step().
+        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
+        if not fsdp_runtime.run_unit_pipelined_step(
+                optimizers,
+                self.base.model,
+                dispatch_no_skip={torch.zeros_like},
+        ):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+                    optimizer.step()
+                optimizer.zero_grad()
+        self.base.model_integration.after_optimizer()
+
+        schedulers = (
+            self.base.lr_scheduler
+            if isinstance(self.base.lr_scheduler, list)
+            else (
+                [self.base.lr_scheduler]
+                if self.base.lr_scheduler is not None
+                else []
+            )
+        )
+        for scheduler in schedulers:
+            scheduler.step()
 
         # Checkpoint and logging callbacks observe the number of completed
         # optimizer updates.

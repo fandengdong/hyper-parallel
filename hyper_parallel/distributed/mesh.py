@@ -104,6 +104,36 @@ class MeshContext:
         return sub
 
     @property
+    def dp_mesh(self) -> Any:
+        """DP-only mesh, excluding CP.
+
+        Data is sharded by ``dp_rank`` while the CP peers of one DP group hold
+        replicas of the same sample, so quantities that count *distinct*
+        samples (e.g. ``data/step_samples``) must reduce over this domain
+        rather than over :attr:`dp_cp_mesh`.
+        """
+        if self.device_mesh is None:
+            return None
+        dim_names = self.device_mesh.mesh_dim_names or ()
+        if "dp" in dim_names:
+            return self.device_mesh["dp"]
+        selected_dims = tuple(
+            dim_name
+            for dim_name in ("dp_replicate", "dp_shard")
+            if dim_name in dim_names
+        )
+        if not selected_dims:
+            return None
+        sub = (
+            self.device_mesh[selected_dims[0]]
+            if len(selected_dims) == 1
+            else self.device_mesh[selected_dims]
+        )
+        if sub.ndim > 1:
+            sub = sub.flatten("dp")
+        return sub
+
+    @property
     def cp_mesh(self) -> Any:
         """CP submesh for CP utilities (e.g. shard_batch_for_cp).
 
@@ -185,36 +215,50 @@ class MeshContext:
         self.fsdp_non_moe_mesh = _init_topology_mesh(dense_mesh_kwargs)
         _validate_dense_tp_rank_layout(self.device_mesh, self.fsdp_non_moe_mesh)
 
+        self._build_expert_parallel_mesh(device_type, init_backend, dense_rank_list)
+
+    def _build_expert_parallel_mesh(
+        self,
+        device_type: str,
+        init_backend: bool,
+        dense_rank_list: tuple[int, ...] | None,
+    ) -> None:
+        """Build the expert-parallel FSDP mesh when expert parallelism is enabled."""
         self.fsdp_moe_mesh = None
-        if self.ep_size > 1:
-            expert_domain_size = math.prod(self.device_mesh.mesh_shape)
-            if expert_domain_size % self.ep_size != 0:
-                raise ValueError(
-                    f"expert domain size ({expert_domain_size}) must be divisible by "
-                    f"ep_size ({self.ep_size})"
-                )
-            edp_size = expert_domain_size // self.ep_size
-            if edp_size % self.edp_shard_size != 0:
-                raise ValueError(
-                    f"expert data-parallel size ({edp_size}) must be divisible by "
-                    f"edp_shard_size ({self.edp_shard_size})"
-                )
-            edp_replicate_size = edp_size // self.edp_shard_size
-            if edp_replicate_size > 1:
-                expert_mesh_shape = (edp_replicate_size, self.edp_shard_size, self.ep_size)
-                expert_mesh_names = ("edp_replicate", "edp_shard", "ep")
-            else:
-                expert_mesh_shape = (self.edp_shard_size, self.ep_size)
-                expert_mesh_names = ("edp_shard", "ep")
-            expert_mesh_kwargs = {
-                "device_type": device_type,
-                "mesh_shape": expert_mesh_shape,
-                "mesh_dim_names": expert_mesh_names,
-                "init_backend": init_backend,
-            }
-            if init_backend and dense_rank_list is not None:
-                expert_mesh_kwargs["rank_list"] = dense_rank_list
-            self.fsdp_moe_mesh = _init_topology_mesh(expert_mesh_kwargs)
+        if self.ep_size <= 1:
+            return
+        expert_domain_size = math.prod(self.device_mesh.mesh_shape)
+        if expert_domain_size % self.ep_size != 0:
+            raise ValueError(
+                f"expert domain size ({expert_domain_size}) must be divisible by "
+                f"ep_size ({self.ep_size})"
+            )
+        edp_size = expert_domain_size // self.ep_size
+        if edp_size % self.edp_shard_size != 0:
+            raise ValueError(
+                f"expert data-parallel size ({edp_size}) must be divisible by "
+                f"edp_shard_size ({self.edp_shard_size})"
+            )
+        edp_replicate_size = edp_size // self.edp_shard_size
+        expert_mesh_shape = (
+            (edp_replicate_size, self.edp_shard_size, self.ep_size)
+            if edp_replicate_size > 1
+            else (self.edp_shard_size, self.ep_size)
+        )
+        expert_mesh_names = (
+            ("edp_replicate", "edp_shard", "ep")
+            if edp_replicate_size > 1
+            else ("edp_shard", "ep")
+        )
+        expert_mesh_kwargs = {
+            "device_type": device_type,
+            "mesh_shape": expert_mesh_shape,
+            "mesh_dim_names": expert_mesh_names,
+            "init_backend": init_backend,
+        }
+        if init_backend and dense_rank_list is not None:
+            expert_mesh_kwargs["rank_list"] = dense_rank_list
+        self.fsdp_moe_mesh = _init_topology_mesh(expert_mesh_kwargs)
 
 
 def _validate_dense_tp_rank_layout(device_mesh: Any, fsdp_non_moe_mesh: Any) -> None:

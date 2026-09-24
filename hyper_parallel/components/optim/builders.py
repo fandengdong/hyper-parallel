@@ -19,12 +19,16 @@ Parameter-name and parameter-group logic lives in
 algorithm implementations stay in ``hyper_parallel.core.optimizer``.
 """
 
+__all__ = ["AdamW", "Muon", "PSM"]
+
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.optimizer import get_hyper_optimizer
+from hyper_parallel.core.optimizer.psm import PSM as CorePSM
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.components.optim.parameter_groups import (
     _DEFAULT_ADAMW_NAME_KEYWORDS,
     get_adamw_param_groups,
@@ -189,4 +193,53 @@ class Muon:
         return self.optimizer
 
 
-__all__ = ["AdamW", "Muon"]
+class PSM:
+    """Build a Power-Sign Momentum optimizer from YAML configuration.
+
+    PSM keeps a single momentum state per parameter (no second moment), so its optimizer
+    state is half of AdamW's -- the reason for comparing it on a 1T-parameter run.  The
+    parameter-group split (weight decay vs none) reuses the AdamW routing so both
+    optimizers see exactly the same groups and the comparison isolates the update rule.
+    """
+
+    def __init__(
+            self,
+            psm_config: dict,
+            model: nn.Module,
+            no_decay_params: Optional[List[str]] = None,
+    ) -> None:
+        """Initialize PSM optimizer configuration.
+
+        Args:
+            psm_config: PSM hyperparameters resolved from YAML (``psm_lr``,
+                ``psm_gamma``, ``psm_beta``, ``psm_weight_decay``).
+            model: Module whose trainable parameters are optimized.
+            no_decay_params: Optional names excluded from weight decay.
+        """
+        self.config = psm_config
+        self.model = model
+        weight_decay = psm_config.get("psm_weight_decay", 1e-2)
+        groups, _ = get_adamw_param_groups(
+            self.model,
+            weight_decay=weight_decay,
+            no_decay_params=no_decay_params,
+        )
+        if not groups:
+            raise ValueError("PSM requires at least one trainable parameter")
+        # The trainer's LR-scheduler container and the offload/checkpoint wrappers all
+        # speak the chained-optimizer protocol (``optimizers_dict`` keyed by family), so
+        # PSM is wrapped in a single-slot chain rather than returned bare -- a bare
+        # torch Optimizer fails in LRSchedulersContainer with
+        # "AttributeError: 'PSM' object has no attribute 'optimizers_dict'".
+        leaf = CorePSM(
+            groups,
+            lr=psm_config.get("psm_lr", 1e-3),
+            gamma=psm_config.get("psm_gamma", 0.9),
+            beta=psm_config.get("psm_beta", 0.1),
+            weight_decay=weight_decay,
+        )
+        self.optimizer = ChainedOptimizer(self.model, {"psm": leaf})
+
+    def get_optimizer(self) -> Any:
+        """Return the chained optimizer holding the PSM leaf."""
+        return self.optimizer

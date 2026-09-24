@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -47,9 +48,15 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import HSDPModule, SkipDTensorDispatch
+from hyper_parallel.core.optimizer import (
+    ChainedOptimizer,
+    SwapOptimizerConfig,
+    swap_optimizer,
+)
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
+    OptimizerSwapConfig,
     TrainerConfig,
     normalize_distributed_setup_overrides,
     save_configs,
@@ -73,6 +80,7 @@ from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_par
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
+    MixedPrecisionOptimizer,
 )
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
@@ -87,6 +95,7 @@ from hyper_parallel.trainer.runtime.device import (  # pylint: disable=syntax-er
 )
 
 from hyper_parallel.trainer.callbacks import (
+    Callback,
     EnvironMeterCallback,
     EvaluateCallback,
     GarbageCollectionCallback,
@@ -94,6 +103,7 @@ from hyper_parallel.trainer.callbacks import (
     ProfilingCallback,
     TqdmCallback,
     CheckpointerCallback,
+    ThroughputMFUCallback,
     TrainerState,
 )
 
@@ -101,6 +111,69 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hyper_parallel.data.text.chat_template import ChatTemplate
+
+
+def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
+    """Translate the trainer-facing swap section into the core swap config.
+
+    Args:
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The backend-neutral swap configuration consumed by ``swap_optimizer``.
+    """
+    return SwapOptimizerConfig(
+        swap_times=config.swap_times,
+        state_keys=config.state_keys,
+        min_numel=config.min_numel,
+        include_master_params=config.include_master_params,
+        # ``None`` means "leave it to the backend default", not "off": the core
+        # config declares ``packed_swap: bool = True``, so pass that default
+        # through rather than letting ``None`` read as a hard False.
+        packed_swap=True if config.packed_swap is None else config.packed_swap,
+    )
+
+
+def _attach_optimizer_swap(optimizer: Any, config: OptimizerSwapConfig) -> Any:
+    """Attach optimizer-state swap to every Adam/AdamW leaf of ``optimizer``.
+
+    Every YAML optimizer target returns a ``ChainedOptimizer`` of leaf
+    optimizers -- also for a single AdamW -- and the fp32 main-parameter wrapper
+    keeps the same leaf containers. The swap runtime wraps one concrete
+    Adam/AdamW and delegates everything else, so it is attached to the leaves
+    and the outer object keeps dispatching.
+
+    Args:
+        optimizer: Optimizer built by the configured target, optionally already
+            wrapped for fp32 main parameters.
+        config: Resolved ``optimizer.swap`` configuration section.
+
+    Returns:
+        The optimizer carrying swap-wrapped leaves. A leaf the swap runtime does
+        not support fails here, before the first training step.
+
+    Raises:
+        ValueError: When the unit-pipelined optimizer step is enabled, which
+            drives the leaves directly and would bypass the swap pipeline.
+    """
+    if fsdp_runtime.unit_pipeline_enabled():
+        raise ValueError(
+            "optimizer.swap cannot be enabled together with "
+            f"{fsdp_runtime.UNIT_PIPELINE_ENV}=1: the unit-pipelined step calls "
+            "step_subset on each leaf optimizer and would bypass optimizer-state swap"
+        )
+    swap_config = _to_swap_optimizer_config(config)
+    chained = optimizer.optimizer if isinstance(optimizer, MixedPrecisionOptimizer) else optimizer
+    if not isinstance(chained, ChainedOptimizer):
+        return swap_optimizer(optimizer, swap_config)
+
+    names = list(chained.optimizers_dict)
+    leaves = [swap_optimizer(chained.optimizers_dict[name], swap_config) for name in names]
+    # In place: the fp32 main-parameter wrapper aliases both containers.
+    chained.chained_optimizers[:] = leaves
+    for name, leaf in zip(names, leaves):
+        chained.optimizers_dict[name] = leaf
+    return optimizer
 
 
 class BaseTrainer(Stateful, ABC):
@@ -440,6 +513,11 @@ class BaseTrainer(Stateful, ABC):
             if config.optimizer.fp32_main_params
             else optimizer
         )
+        # Swap is attached after the fp32 main-parameter wrap: that wrapper owns
+        # the master parameters ``include_master_params`` swaps, and the lr
+        # scheduler built right after reads ``self.optimizer.param_groups``.
+        if config.optimizer.swap.enabled:
+            self.optimizer = _attach_optimizer_swap(self.optimizer, config.optimizer.swap)
 
     def _build_lr_scheduler(self):
         config: TrainerConfig = self.config
@@ -487,6 +565,22 @@ class BaseTrainer(Stateful, ABC):
                 "Checkpointing is inactive (save_ckpt=false, restore_from=None); "
                 "no checkpoint callback registered."
             )
+        # Optional standalone throughput/MFU probe (off by default).
+        if os.environ.get("HP_THROUGHPUT_MFU", "0") == "1":
+            self.add_callback(ThroughputMFUCallback(self))
+
+    def add_callback(self, callback: Callback) -> None:
+        """Register an extra ``Callback`` to receive every lifecycle event.
+
+        Use this to plug domain-specific monitors (custom metric sinks,
+        in-house experiment trackers) without editing the trainer. Built-in
+        callbacks always run first; user callbacks run in registration order.
+
+        Args:
+            callback: Callback instance to append to the dispatch list.
+        """
+        self._callbacks.append(callback)
+        logger.info("User callback registered: %s", type(callback).__name__)
 
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
@@ -513,13 +607,29 @@ class BaseTrainer(Stateful, ABC):
         for callback in self._callbacks:
             callback.on_step_begin(self.state, **kwargs)
 
+    def on_micro_step_begin(self, micro_batch: Dict[str, Any], **kwargs: Any) -> None:
+        """Run all registered callbacks before one forward-backward micro step.
+
+        Args:
+            micro_batch: Prepared inputs for the current micro step.
+            **kwargs: Additional callback context.
+        """
+        for callback in self._callbacks:
+            callback.on_micro_step_begin(self.state, micro_batch, **kwargs)
+
     def on_step_end(
         self,
         loss: Optional[float] = None,
         loss_dict: Optional[Dict[str, Any]] = None,
         grad_norm: Optional[float] = None,
     ) -> None:
-        """Run all registered callbacks at the end of a training step."""
+        """Run all registered callbacks at the end of a training step.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
 
@@ -530,6 +640,12 @@ class BaseTrainer(Stateful, ABC):
         (e.g. ``multimodal_metadata`` emitted by ``PackingCollator``) are
         recursed so inner tensor values land on the device too; Python ints
         / lists / etc. pass through unchanged.
+
+        Args:
+            micro_batch: Batch fields to move to the training device.
+
+        Returns:
+            Batch fields with tensors moved to the training device.
         """
 
         def _to_device(v: Any) -> Any:
@@ -549,7 +665,15 @@ class BaseTrainer(Stateful, ABC):
     def postforward(
             self, outputs: ModelOutput, labels: Optional[torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Postprocess model outputs after forward pass."""
+        """Postprocess model outputs after forward pass.
+
+        Args:
+            outputs: Model outputs consumed by the configured loss.
+            labels: Labels associated with the current micro-batch.
+
+        Returns:
+            Backward loss and named globally aggregated loss values.
+        """
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
@@ -633,7 +757,12 @@ class BaseTrainer(Stateful, ABC):
             return loss, loss_dict
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
-        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``."""
+        """Reshard model after backward pass; policy lives in ``runtime/fsdp.py``.
+
+        Args:
+            micro_step: Zero-based micro-step index.
+            num_micro_steps: Number of micro-steps in the optimizer step.
+        """
         fsdp_runtime.model_reshard(self.hsdp_model_parts, self.config.fsdp_config, micro_step, num_micro_steps)
 
     def _configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int):
@@ -647,7 +776,12 @@ class BaseTrainer(Stateful, ABC):
         )
 
     def configure_fsdp_gradient_sync(self, micro_step: int, num_micro_steps: int) -> None:
-        """Configure FSDP gradient synchronization for an external training loop."""
+        """Configure FSDP gradient synchronization for an external training loop.
+
+        Args:
+            micro_step: Zero-based micro-step index.
+            num_micro_steps: Number of micro-steps in the optimizer step.
+        """
         self._configure_fsdp_gradient_sync(micro_step, num_micro_steps)
 
     def begin_fsdp_runtime_diagnostics(self, micro_step: int) -> None:
@@ -693,12 +827,23 @@ class BaseTrainer(Stateful, ABC):
         return grad_norm
 
     def step_optimizers_and_schedulers(self) -> None:
-        """Step every optimizer and scheduler, then expose the final state."""
+        """Step every optimizer and scheduler, then expose the final state.
+
+        The unit-pipelined variant is opt-in and falls back to the plain loop
+        below when it is disabled or unsupported by the optimizer and model.
+        It reuses this call site's dispatch context so the lazy optimizer state
+        is created through the same path as in a full ``step()``.
+        """
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
-        for optimizer in optimizers:
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
-                optimizer.step()
-            optimizer.zero_grad()
+        if not fsdp_runtime.run_unit_pipelined_step(
+                optimizers,
+                self.model,
+                dispatch_no_skip={torch.zeros_like},
+        ):
+            for optimizer in optimizers:
+                with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+                    optimizer.step()
+                optimizer.zero_grad()
         self.model_integration.after_optimizer()
 
         schedulers = (
@@ -740,7 +885,14 @@ class BaseTrainer(Stateful, ABC):
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        """Execute one optimizer update from the next dataloader batch."""
+        """Execute one optimizer update from the next dataloader batch.
+
+        Args:
+            data_iterator: Iterator providing the next optimizer-step batch.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
         self.state.global_step += 1
 

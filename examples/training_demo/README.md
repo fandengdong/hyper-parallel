@@ -77,6 +77,49 @@ bash examples/training_demo/qwen3_moe/run_parallel_offline.sh \
 
 Logs and generated data are stored under `output/training_demo`.
 
+## Kimi-K2.5/K2.6 multimodal demo
+
+`cropped_kimi_vlm.py` builds the multimodal `KimiK25ForConditionalGeneration`
+with a layer-cropped text tower and the full 27-layer vision tower. It reads the
+top-level native configuration (`trust_remote_code: false`, so the processor
+speaks the `image_grid_thw` protocol instead of the repo's remote-code
+`grid_thws`), crops only the nested text tower, and parallelizes the whole model
+through `HyperAutoModelForImageTextToText.from_config`. The family's TP layout
+(MLA down-projections and the vision path replicated, up-projections colwise) is
+registered by `hyper_parallel/models/kimi_k25/adapter/registration.py`.
+
+The demo consumes a content-list conversation dataset: every record is
+`{"messages": [...], "images": [...]}` where media appear as explicit
+`{"type": "image", "url": ...}` items inside the turn, so their position between
+text spans is preserved. `prepare_kimi_vlm_data.py` writes such a dataset with
+deterministic synthetic images and never downloads anything:
+
+```bash
+python -m examples.training_demo.prepare_kimi_vlm_data \
+    --output-dir ./output/training_demo/kimi_vlm_data --num-samples 8
+```
+
+Pass a local Kimi-K2.5/K2.6 Hugging Face directory containing `config.json` as
+the first argument; the launcher generates the demo data when it is absent:
+
+```bash
+bash examples/training_demo/run_kimi_vlm.sh /path/to/Kimi-K2.6
+```
+
+The default topology is eight devices with FSDP and no TP/CP/PP. The temporary
+VLM batch path replicates the batch across TP ranks, so `tp_size > 1` is usable
+for the text tower, but CP and PP remain unsupported. With `tp_size > 1` the
+template-less vision leaves also need explicit `plan_overrides` parameter specs
+to satisfy FSDP owner coverage. Generated data and logs are stored under
+`output/training_demo`.
+
+A full-scale variant is provided as `train_kimi_vlm_full_1sn.yaml`: the full
+61-layer × 384-expert text tower with the complete vision tower, on one 16-node
+super-node (128 devices). At that size `enable_offload` is required, the
+sequence length is capped at 2048, and the vision-tower leaf specs in
+`plan_overrides` are mandatory (glob keys cannot replace them — see the note in
+the YAML).
+
 ## Full pretrained model
 
 Both full-model launchers load all 48 layers and the complete Hugging Face
@@ -113,6 +156,26 @@ validates both Indexed Dataset files. Missing local assets therefore fail
 explicitly rather than triggering a network download. Additional typed Trainer
 overrides may be appended to either command.
 
+## Performance reproduction package
+
+`examples/training_demo/perf_kimi_k26_2sn/` collects the current best Kimi-K2.6
+VLM configuration at every measured scale, together with the numbers they were
+measured at and the scoreboard:
+
+- `configs/256card_2sn/gbs4096_rbwd_true.yaml` — 256-card (2 super-node) champion;
+  GBS 4096, 18.364 s equivalent GBS-256 step, 113,400 padded tok/s, MFU 28.05%
+- `configs/512card_4sn/`, `configs/384card_3sn/`, `configs/128card_1sn/` — the same
+  at the other scales
+- `configs/realdata_2sn/coco2017_2sn_8k_packed_cap45.yaml` — the real-data 8K
+  packing line (a different measurement basis from the synthetic throughput arms)
+- `reports/CURRENT_BEST.md` — full scoreboard, including the directions that are
+  already closed with measurements
+
+Its `README.md` lists the prerequisites (the model directory and dataset paths are
+absolute and must be edited), the exact `torchrun` invocation, and the criteria for
+confirming a reproduction. Note that these throughput configs read only the model's
+`config.json` and processor files — the 1.9T weights are not loaded unless
+`load_pretrained: true` is added.
 ## DeepSeek-V4.1 Engram and shared compressed attention
 
 `deepseek_v41/train_deepseek_v41_online.yaml` is a four-layer, randomly initialized

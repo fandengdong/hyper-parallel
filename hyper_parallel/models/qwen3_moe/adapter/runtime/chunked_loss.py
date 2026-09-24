@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+__all__ = ["bind_chunk_loss"]
+
 import functools
 from typing import Any
 
@@ -27,6 +29,7 @@ from torch import nn
 
 from hyper_parallel.components.losses.chunked_cross_entropy import (
     ChunkedCausalLMOutput,
+    chunk_loss_tp_mesh,
     chunked_cross_entropy,
 )
 from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: disable=protected-access
@@ -59,6 +62,62 @@ def _align_chunk_loss_inputs(
     return hidden_states, targets
 
 
+def _assemble_qwen3_moe_chunk_loss(
+    model: nn.Module,
+    outputs: Any,
+    chunk_loss_targets: torch.Tensor,
+    chunk_loss_mask: torch.Tensor | None,
+    chunk_loss_chunk_size: int,
+    chunk_loss_ignore_index: int,
+    attention_mask: torch.Tensor | None,
+    output_router_logits: bool,
+) -> ChunkedCausalLMOutput:
+    """Build the chunked loss and optional router loss from decoder outputs."""
+    hidden_states = outputs.last_hidden_state
+    aligned_hidden, aligned_targets = _align_chunk_loss_inputs(
+        hidden_states,
+        chunk_loss_targets,
+        chunk_loss_mask,
+        chunk_loss_ignore_index,
+    )
+    loss_sum = chunked_cross_entropy(
+        aligned_hidden,
+        aligned_targets,
+        model.lm_head.weight,
+        chunk_size=chunk_loss_chunk_size,
+        ignore_index=chunk_loss_ignore_index,
+        tp_mesh=chunk_loss_tp_mesh(model),
+    )
+    valid_token_count = aligned_targets.ne(chunk_loss_ignore_index).sum()
+
+    aux_loss = None
+    if output_router_logits:
+        # Keep the concrete Transformers family import lazy so registry
+        # discovery and CPU-only package import do not load accelerator hooks.
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (  # pylint: disable=import-outside-toplevel
+            load_balancing_loss_func,
+        )
+
+        aux_loss = load_balancing_loss_func(
+            outputs.router_logits,
+            model.num_experts,
+            model.num_experts_per_tok,
+            attention_mask,
+        )
+
+    return ChunkedCausalLMOutput(
+        loss_sum=loss_sum,
+        valid_token_count=valid_token_count,
+        aux_loss=aux_loss,
+        aux_loss_coef=float(getattr(model, "router_aux_loss_coef", 0.0)),
+        logits=None,
+        past_key_values=getattr(outputs, "past_key_values", None),
+        hidden_states=getattr(outputs, "hidden_states", None),
+        attentions=getattr(outputs, "attentions", None),
+        router_logits=getattr(outputs, "router_logits", None),
+    )
+
+
 def _qwen3_moe_chunk_loss_forward(
     model: nn.Module,
     *,
@@ -89,57 +148,24 @@ def _qwen3_moe_chunk_loss_forward(
         if output_router_logits is not None
         else bool(getattr(model.config, "output_router_logits", False))
     )
-    outputs = model.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=None,
-        inputs_embeds=inputs_embeds,
-        use_cache=False,
-        output_router_logits=output_router_logits,
-        **kwargs,
-    )
-    hidden_states = outputs.last_hidden_state
-    aligned_hidden, aligned_targets = _align_chunk_loss_inputs(
-        hidden_states,
+    return _assemble_qwen3_moe_chunk_loss(
+        model,
+        model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=inputs_embeds,
+            use_cache=False,
+            output_router_logits=output_router_logits,
+            **kwargs,
+        ),
         chunk_loss_targets,
         chunk_loss_mask,
+        chunk_loss_chunk_size,
         chunk_loss_ignore_index,
-    )
-    loss_sum = chunked_cross_entropy(
-        aligned_hidden,
-        aligned_targets,
-        model.lm_head.weight,
-        chunk_size=chunk_loss_chunk_size,
-        ignore_index=chunk_loss_ignore_index,
-    )
-    valid_token_count = aligned_targets.ne(chunk_loss_ignore_index).sum()
-
-    aux_loss = None
-    if output_router_logits:
-        # Keep the concrete Transformers family import lazy so registry
-        # discovery and CPU-only package import do not load accelerator hooks.
-        from transformers.models.qwen3_moe.modeling_qwen3_moe import (  # pylint: disable=import-outside-toplevel
-            load_balancing_loss_func,
-        )
-
-        aux_loss = load_balancing_loss_func(
-            outputs.router_logits,
-            model.num_experts,
-            model.num_experts_per_tok,
-            attention_mask,
-        )
-
-    return ChunkedCausalLMOutput(
-        loss_sum=loss_sum,
-        valid_token_count=valid_token_count,
-        aux_loss=aux_loss,
-        aux_loss_coef=float(getattr(model, "router_aux_loss_coef", 0.0)),
-        logits=None,
-        past_key_values=getattr(outputs, "past_key_values", None),
-        hidden_states=getattr(outputs, "hidden_states", None),
-        attentions=getattr(outputs, "attentions", None),
-        router_logits=getattr(outputs, "router_logits", None),
+        attention_mask,
+        output_router_logits,
     )
 
 
@@ -178,6 +204,3 @@ def bind_chunk_loss(model: nn.Module) -> None:
             companion_attrs={"_hp_qwen3_moe_chunk_loss_bound": True},
         )
     )
-
-
-__all__ = ["bind_chunk_loss"]

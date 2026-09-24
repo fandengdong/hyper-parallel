@@ -48,23 +48,30 @@ def enable_full_determinism(seed: int) -> None:
     """
     Helper function for reproducibility in distributed training.
     See https://pytorch.org/docs/stable/notes/randomness.html for details.
+
+    Each numerical-determinism knob is applied with ``os.environ.setdefault``, so
+    a value already exported by the launcher wins. That keeps the default
+    behaviour unchanged while making the knobs individually switchable for
+    profiling, e.g. ``FLASH_ATTENTION_DETERMINISTIC=0``.
     """
 
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    os.environ["NCCL_DETERMINISTIC"] = "1"
-    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    # Ascend wants the literal "true"; CUDA reads "1". Resolve the value once so
+    # the NPU spelling is not masked by the earlier default.
+    os.environ.setdefault("NCCL_DETERMINISTIC", "true" if IS_NPU_AVAILABLE else "1")
+    os.environ.setdefault("FLASH_ATTENTION_DETERMINISTIC", "1")
     if IS_NPU_AVAILABLE:
         # The environment variable required to enable deterministic mode on Ascend NPUs.
-        os.environ["NCCL_DETERMINISTIC"] = "true"
-        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+        os.environ.setdefault("CLOSE_MATMUL_K_SHIFT", "1")
 
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    if os.environ.get("HP_TORCH_DETERMINISTIC", "1") != "0":
+        torch.use_deterministic_algorithms(True, warn_only=True)
     # Enable CUDNN deterministic mode
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False

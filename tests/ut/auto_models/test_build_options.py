@@ -22,7 +22,6 @@ import unittest
 from dataclasses import fields
 from pathlib import Path
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 
@@ -71,7 +70,8 @@ class TestBuildOptionsFields(unittest.TestCase):
             [name for name, _ in _field_snapshot(FSDP2Config)],
             [
                 "dp_shard_size", "edp_shard_size", "replicate_params",
-                "mix_precision", "enable_offload", "reshard_after_forward",
+                "mix_precision", "enable_offload", "offload_pin_memory",
+                "reshard_after_forward",
                 "reshard_after_backward", "requires_grad_sync",
                 "backward_prefetch_depth", "forward_prefetch_depth",
                 "comm_fusion", "comm_fusion_zero_copy",
@@ -253,7 +253,6 @@ class TestBuildOptionsBoundary(unittest.TestCase):
             text=True,
             cwd=_REPO_ROOT,
             timeout=300,
-            env={**os.environ, "HYPER_PARALLEL_PLATFORM": "torch"},
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

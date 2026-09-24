@@ -14,7 +14,7 @@
 # ============================================================================
 """Adamw optimizer."""
 
-from typing import List
+from typing import Any, Iterable, List
 
 import torch
 
@@ -95,6 +95,57 @@ class AdamW(torch.optim.Optimizer):
 
     def step(self, closure=None):
         """Performs a single optimization step."""
+        self.advance_step_counters()
+        return self._step_param_subset(None, closure)
+
+    def advance_step_counters(self) -> None:
+        """Advance every parameter group's step counter by one.
+
+        ``step`` performs this itself. A caller that splits one logical step
+        into several :meth:`step_subset` calls must call this once before the
+        first subset, so that every subset uses the same step value for bias
+        correction and the split stays numerically identical.
+        """
+        for group in self.param_groups:
+            group['step'] = (group.get('step') or 0) + 1
+
+    def step_subset(self, params: Iterable[Any], closure: Any = None) -> Any:
+        """Perform one optimization step over ``params`` only.
+
+        Parameters this optimizer does not own -- for example the private
+        parameters of another optimizer in a chain -- and parameters without a
+        gradient are skipped, so the caller may pass a model-side subset.
+
+        The group step counters are not advanced here: one logical optimizer
+        step may be split into several subset calls, and every call must use
+        the same step value. Call :meth:`advance_step_counters` once first.
+
+        Args:
+            params: Iterable of parameters to update.
+            closure: Optional callable that reevaluates the model. Unlike in
+                :meth:`step` it runs once per subset call.
+
+        Returns:
+            The closure result when a closure is given, otherwise ``None``.
+
+        Raises:
+            RuntimeError: When :meth:`advance_step_counters` has not run yet.
+        """
+        for group in self.param_groups:
+            if group.get('step') is None:
+                raise RuntimeError(
+                    'AdamW.step_subset needs advance_step_counters() before the first subset step'
+                )
+        return self._step_param_subset({id(param) for param in params}, closure)
+
+    def _step_param_subset(self, param_ids, closure):
+        """Run the AdamW update for the parameters selected by ``param_ids``.
+
+        Args:
+            param_ids: Ids of the parameters to update, or ``None`` to update
+                every parameter of this optimizer.
+            closure: Optional callable that reevaluates the model.
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -109,10 +160,11 @@ class AdamW(torch.optim.Optimizer):
 
             amsgrad = group['amsgrad']
             beta1, beta2 = group['betas']
-            group['step'] = (group.get('step') or 0) + 1
 
             current_rank_params = group['params']
             for p in current_rank_params:
+                if param_ids is not None and id(p) not in param_ids:
+                    continue
                 if p.grad is None:
                     continue
 

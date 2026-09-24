@@ -19,7 +19,7 @@ class names, fields and defaults are unchanged.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from hyper_parallel.components.quantization.config import LowPrecisionConfig
 
@@ -48,6 +48,20 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    # Per-device peak dense throughput in TFLOPS (e.g. 376.0 for Ascend 910B
+    # BF16). Never guessed — MFU stays unreported while unset. FLOPs per
+    # token are not configured here; they are derived from the model config
+    # by ``hyper_parallel.models.flops`` (a model's own ``hp_flops_per_token``
+    # wins when present). Recompute from activation checkpointing is not
+    # counted as useful FLOPs.
+    peak_tflops: Optional[float] = None
+    # Reserved for the hardware-utilisation view: HFU counts *every* FLOP the device
+    # executes, so the activation-checkpoint recomputation forward has to be added to the
+    # model FLOPs that MFU uses (recompute doubles one forward: 6N -> 8N, i.e. x4/3 when
+    # every layer is checkpointed).  Leave unset to derive it from
+    # ``activation_checkpoint.mode``; set it explicitly for a selective schedule, where the
+    # recomputed fraction is a policy detail the callback cannot see.
+    hfu_recompute_factor: Optional[float] = None
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 
@@ -102,4 +116,14 @@ class ProfilingConfig:
     profile_memory: bool = False
     with_stack: bool = False
     with_modules: bool = False
-    rank: int = 0
+    # One rank (int) or several (list of ints). Recording more than one rank is what
+    # separates a straggler from a local barrier: a single rank cannot show whether an
+    # exposed collective is the slowest participant or every participant waiting.
+    rank: Union[int, List[int]] = 0
+    # Skip the synchronous in-process parse that torch_npu's trace handler runs when the
+    # profiling window closes. That parse happens inside ``profiler.step()``, blocks the
+    # host process for its whole duration, and stalls the peers waiting in a collective
+    # (HCCL_EXEC_TIMEOUT). With this on, the raw trace is still collected untouched and
+    # must be parsed afterwards with ``msprof --export=on --output=<trace_dir>``.
+    # It removes the blocking only -- not the trace size or the eventual parse cost.
+    offline_parse: bool = False

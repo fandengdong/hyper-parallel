@@ -40,6 +40,14 @@ from hyper_parallel.models.build_options import (
     ModelBuildOptions,
     normalize_build_options,
 )
+from hyper_parallel.models.flops import (
+    VisionFlopsEstimate,
+    batch_seq_len,
+    estimate_flops_per_token,
+    estimate_vision_flops,
+    resolve_flops_per_token,
+    resolve_vision_flops,
+)
 
 if TYPE_CHECKING:
     from hyper_parallel.models._transformers import (
@@ -121,12 +129,18 @@ __all__ = [
     "SharedStateValidationSpec",
     "StateInvariantSpec",
     "TopologyConstraint",
+    "VisionFlopsEstimate",
+    "batch_seq_len",
+    "estimate_flops_per_token",
+    "estimate_vision_flops",
     "get_model_adapter",
     "normalize_build_options",
     "rebuild_materialized_state",
     "register_materialized_state_hook",
     "register_model_adapter",
     "register_rebuildable_buffer",
+    "resolve_flops_per_token",
+    "resolve_vision_flops",
 ]
 
 
