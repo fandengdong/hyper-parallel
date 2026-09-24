@@ -156,7 +156,9 @@ class PlanOverride:
             It receives ``module``, ``module_fqn``, and a read-only context,
             and must return a structure-preserving replacement. A list
             ``match`` is supported only for replacement-only entries.
-        match: fqn or fqn glob. Globs first merge matching planner boundaries;
+        match: fqn, fqn glob, or ``re:``-prefixed regular expression
+            (``re.fullmatch``), so one anchored regex can replace many entries
+            of the same shape. Globs first merge matching planner boundaries;
             a glob with a concrete params/I/O contract also expands against
             the final model's ``named_modules`` and creates missing boundaries.
             A merge-only glob fails if it matches a real module that has no

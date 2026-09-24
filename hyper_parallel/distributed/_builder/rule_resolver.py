@@ -25,6 +25,7 @@ import fnmatch
 import functools
 import inspect
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from hyper_parallel.core.dtensor.placement_types import Placement
@@ -48,10 +49,43 @@ def _last_segment(fqn: str) -> str:
 
 
 _GLOB_CHARS = ("*", "?", "[")
+# Prefix that marks a plan_overrides key as a regular expression instead of a glob.
+# A regex may itself contain "*"/"?"/"[" (e.g. ".*", "(q|k|v)"), so the prefix is
+# checked first and wins over glob detection.
+_REGEX_PREFIX = "re:"
+
+
+def _is_regex_key(key: str) -> bool:
+    """Return whether ``key`` is a ``re:``-prefixed regular expression."""
+    return key.startswith(_REGEX_PREFIX)
 
 
 def _is_glob_key(key: str) -> bool:
-    return any(c in key for c in _GLOB_CHARS)
+    """Return whether ``key`` is a glob pattern (``*``/``?``/``[``, not a regex)."""
+    return not _is_regex_key(key) and any(c in key for c in _GLOB_CHARS)
+
+
+def _is_pattern_key(key: str) -> bool:
+    """Return whether ``key`` selects modules by pattern rather than exactly."""
+    return _is_glob_key(key) or _is_regex_key(key)
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_regex(pattern: str) -> "re.Pattern[str]":
+    """Compile and cache one ``re:`` pattern, failing fast on a bad expression."""
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(
+            f"[HP-PLAN-001] invalid plan_overrides regex {_REGEX_PREFIX}{pattern!r}: {exc}"
+        ) from exc
+
+
+def _matches_fqn(fqn: str, key: str) -> bool:
+    """Match one module FQN against a glob key or a ``re:`` regex key."""
+    if _is_regex_key(key):
+        return _compile_regex(key[len(_REGEX_PREFIX):]).fullmatch(fqn) is not None
+    return fnmatch.fnmatchcase(fqn, key)
 
 
 def _can_insert_glob(user_spec: ModuleShardingSpec) -> bool:
@@ -93,6 +127,12 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
       to inherit/clear). Nesting (ancestor/descendant
       FQNs) is **allowed** since D-14 (05 §13), subject only to the
       param-uniqueness invariant (``_check_param_uniqueness``);
+    - **regex keys** (``re:``-prefixed, e.g. ``re:.*\\.attn\\.(q|k|v)_proj``):
+      identical semantics to glob keys below, but the FQN is matched with
+      ``re.fullmatch`` against the pattern after the prefix. The prefix is
+      checked first, so a regex containing ``*``/``?``/``[`` is still a regex;
+      an invalid expression fails fast as ``[HP-PLAN-001]``. One anchored regex
+      can replace many near-identical glob entries.
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to
       every matching derived/previously inserted boundary (fnmatchcase,
       ``*`` spans dots). A glob declaring at least one concrete contract
@@ -126,7 +166,7 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
                 f"got {type(user_spec).__name__}"
             )
         _validate_override_axes(key, user_spec, source, plan)
-        if not _is_glob_key(key) and key not in module_name_set:
+        if not _is_pattern_key(key) and key not in module_name_set:
             raise ValueError(
                 f"[HP-PLAN-001] {source} FQN not found in the model's "
                 f"named_modules: {key!r} (check spelling; in PP "
@@ -134,12 +174,11 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
             )
 
     for key, user_spec, source in entries:
-        if _is_glob_key(key):
-            hits = [fqn for fqn in plan.modules
-                    if fnmatch.fnmatchcase(fqn, key)]
+        if _is_pattern_key(key):
+            hits = [fqn for fqn in plan.modules if _matches_fqn(fqn, key)]
             model_hits = [
                 fqn for fqn in module_names
-                if fqn not in plan.modules and fnmatch.fnmatchcase(fqn, key)
+                if fqn not in plan.modules and _matches_fqn(fqn, key)
             ]
             inserted = []
             can_insert = _can_insert_glob(user_spec)

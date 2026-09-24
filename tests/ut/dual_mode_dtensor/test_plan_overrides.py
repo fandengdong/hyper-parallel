@@ -1322,3 +1322,51 @@ def test_preflight_fail_fast(tiny_llama, tiny_hf_native_moe, tiny_moe,
     msg = str(exc.value)
     assert "recipes.qwen2moe_ep_compute_fn" in msg, f"case: {case}"
     assert "region_dispatch" in msg, f"case: {case}"
+
+
+def test_regex_key_takes_precedence_over_glob_detection():
+    """Feature: plan_overrides ``re:`` regex keys.
+
+    Description: A regular expression may itself contain glob metacharacters
+        (``.*``, ``[0-9]``).
+    Expectation: The ``re:`` prefix wins, so such a key is a regex and never a glob;
+        plain globs and exact keys keep their previous classification.
+    """
+    from hyper_parallel.distributed._builder.rule_resolver import (
+        _is_glob_key, _is_pattern_key, _is_regex_key,
+    )
+    key = r"re:model\.layers\.\d+\.attn\.(q|k|v)_proj"
+    assert _is_regex_key(key)
+    assert not _is_glob_key(key)
+    assert _is_pattern_key(key)
+    assert _is_pattern_key("model.layers.*.q_proj")
+    assert not _is_glob_key(key)
+    assert not _is_pattern_key("model.layers.0.q_proj")
+
+
+def test_regex_key_matches_anchored_fqns_only():
+    """Feature: anchored regex matching.
+
+    Description: One anchored regex covering every decoder layer.
+    Expectation: Every intended projection matches, neighbours do not, and the match
+        is anchored rather than a substring search.
+    """
+    from hyper_parallel.distributed._builder.rule_resolver import _matches_fqn
+    key = r"re:model\.language_model\.layers\.\d+\.self_attn\.(q_a|kv_a)_proj"
+    assert _matches_fqn("model.language_model.layers.0.self_attn.q_a_proj", key)
+    assert _matches_fqn("model.language_model.layers.60.self_attn.kv_a_proj", key)
+    assert not _matches_fqn("model.language_model.layers.0.self_attn.kv_a_layernorm", key)
+    assert not _matches_fqn("prefix.model.language_model.layers.0.self_attn.q_a_proj", key)
+    assert not _matches_fqn("model.language_model.layers.0.self_attn.q_a_proj.suffix", key)
+
+
+def test_invalid_regex_fails_fast():
+    """Feature: regex validation.
+
+    Description: A malformed expression in a ``re:`` key.
+    Expectation: ``ValueError`` naming the key, so a config typo surfaces at plan time
+        instead of silently matching no module.
+    """
+    from hyper_parallel.distributed._builder.rule_resolver import _matches_fqn
+    with pytest.raises(ValueError, match="invalid plan_overrides regex"):
+        _matches_fqn("model.layers.0.q_proj", "re:model.layers.[")
