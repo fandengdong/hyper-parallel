@@ -300,12 +300,18 @@ class TestCpWrapperContracts(unittest.TestCase):
                 target.config = SimpleNamespace(
                     num_attention_heads=4, num_key_value_heads=2
                 )
-                sentinel_interface = lambda *args, **kwargs: None  # noqa: E731
+                def sentinel_interface(*args, **kwargs):
+                    """Stand in for the attention interface the wrapper replaces."""
+                    del args, kwargs
+                    return None
+
                 target.attention_interface = sentinel_interface
                 calls = []
 
-                def recording_forward(*args, **kwargs):
-                    calls.append((args, kwargs))
+                # ``_calls=calls`` binds this iteration's list explicitly: without it the
+                # closure would read the loop-scoped cell on every call (W0640).
+                def recording_forward(*args, _calls=calls, **kwargs):
+                    _calls.append((args, kwargs))
                     return "sentinel-output"
 
                 target.forward = recording_forward
@@ -469,12 +475,16 @@ class TestEpFactoryContract(unittest.TestCase):
         parameters = list(inspect.signature(factory).parameters.values())
         self.assertEqual(
             [param.name for param in parameters],
-            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm"],
+            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
+             "fix_router"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
-        for param in parameters[:-1]:
+        for param in parameters[:-2]:
             self.assertIs(param.default, inspect.Parameter.empty)
+        # Both switches are opt-in: an existing recipe keeps the real router and the
+        # eager per-expert loop unless it asks otherwise.
+        self.assertIs(parameters[-2].default, False)
         self.assertIs(parameters[-1].default, False)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -505,6 +515,7 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
     """Mask/cache branches of ``run_qwen3_moe_flash_attention`` (Ascend kernel)."""
 
     def _run(self, query, key, value, attention_mask, module=None):
+        """Call the Ascend flash-attention wrapper with a recording ``torch_npu`` stub."""
         stub = _AttentionNpuStub()
         with unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}):
             output, weights = run_qwen3_moe_flash_attention(
